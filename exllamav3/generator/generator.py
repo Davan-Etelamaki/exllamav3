@@ -302,6 +302,16 @@ class Generator:
         # Chunking/partitioning
         self.max_batch_size = max_batch_size
         self.max_chunk_size = max_chunk_size
+        # p26 round-time governor (exllamav3-06): AIMD chunk size for the prefill slice of
+        # each generator round. Ceiling = configured chunk size, floor = PAGE_SIZE.
+        # QWEN_EXL3_ROUND_TARGET_MS sets the slice target in ms (default 150; 0 disables,
+        # restoring pre-patch behavior exactly).
+        self._gov_base = max_chunk_size
+        self._gov_size = max_chunk_size
+        try:
+            self._gov_target_ms = int(os.environ.get("QWEN_EXL3_ROUND_TARGET_MS", "150"))
+        except ValueError:
+            self._gov_target_ms = 150
 
         # Prompt ingestion alongside generating jobs, see iterate()
         if shared_chunk_size is None:
@@ -766,6 +776,22 @@ class Generator:
             # a hinted request arrived and was admitted; stop shrinking
             self.admission_hint = 0
 
+        # p26 round-time governor (GRE35): chunk 2048 restores prefill throughput
+        # (median 3,229 T/s vs 800 T/s measured at 256) but a multi-job prefill round
+        # starves decoders ~0.9 s per pending job (owner: 1-2 tok/s floor). AIMD on the
+        # MEASURED prefill slice: halve (floor PAGE_SIZE) only when a decoder is waiting
+        # AND the slice overshot the target; double (ceiling configured) only when the
+        # slice ran under half the target with no decoder waiting (pure-prefill regime).
+        # Overshoot with no decoders waiting, or undershoot with decoders waiting: hold.
+        # Composes with the p25 admission shrink via min(). Cold-start batches (no
+        # decoders yet) keep the full configured chunk: nobody is starved.
+        gov_on = self._gov_target_ms > 0
+        if gov_on:
+            self.max_chunk_size = min(self._gov_size, self.max_chunk_size)
+
+        # Perform one round of prefill
+        t_slice0 = time.perf_counter() if gov_on else 0.0
+
         # Perform one round of prefill. While some active job is already generating, prompt ingestion shares
         # the GPU with it: at most one job with prompt left to ingest runs a pass per iteration, with the
         # shared chunk size, and only once the cooldown since the previous pass has elapsed, so every call
@@ -798,8 +824,20 @@ class Generator:
             except Exception as e:
                 self.reap_failed_job(job, e, results)
 
+        if gov_on:
+            slice_ms = (time.perf_counter() - t_slice0) * 1000.0
+            decoders_waiting = any(
+                seq.prefill_complete for job in self.active_jobs for seq in job.sequences
+            )
+            if slice_ms > self._gov_target_ms and decoders_waiting:
+                self._gov_size = max(PAGE_SIZE, self._gov_size // 2)
+            elif slice_ms < self._gov_target_ms / 2 and not decoders_waiting:
+                self._gov_size = min(self._gov_base, self._gov_size * 2)
+
         if live_shrink:
             self.max_chunk_size = live_shrink
+        elif gov_on:
+            self.max_chunk_size = self._gov_base
 
         # Recurrent checkpoints
         if self.recurrent_cache is not None:
