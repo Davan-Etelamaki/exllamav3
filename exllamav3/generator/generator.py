@@ -312,6 +312,23 @@ class Generator:
             self._gov_target_ms = int(os.environ.get("QWEN_EXL3_ROUND_TARGET_MS", "150"))
         except ValueError:
             self._gov_target_ms = 150
+        # p26b govstats (exllamav3-08, GRE37/GRE43): piggyback on the governor's slice
+        # timer and log an [GS] govstats epoch every GS_GOVSTATS_ROUNDS prefill rounds
+        # (default 100): rounds, ms_avg/ms_max, tok_computed (kv_position advance minus
+        # cached-page skips), us_per_tok, dec_rounds, gov_size. This is the F+c*n read
+        # back: fixed per-round cost shows as us_per_tok rising as chunks shrink.
+        # GS_GOVSTATS=1 arms it; unset = one bool check per round, byte-identical output.
+        # Requires the governor (QWEN_EXL3_ROUND_TARGET_MS > 0).
+        self._gov_stats = os.environ.get("GS_GOVSTATS", "0") == "1"
+        try:
+            self._gov_stats_every = max(10, int(os.environ.get("GS_GOVSTATS_ROUNDS", "100")))
+        except ValueError:
+            self._gov_stats_every = 100
+        self._gs_n = 0
+        self._gs_ms_sum = 0.0
+        self._gs_ms_max = 0.0
+        self._gs_tok = 0
+        self._gs_dec = 0
 
         # Prompt ingestion alongside generating jobs, see iterate()
         if shared_chunk_size is None:
@@ -792,6 +809,10 @@ class Generator:
         # Perform one round of prefill
         t_slice0 = time.perf_counter() if gov_on else 0.0
 
+        stats_on = gov_on and self._gov_stats
+        if stats_on:
+            gs_kv0 = {id(seq): seq.kv_position for job in self.active_jobs for seq in job.sequences}
+            gs_cp0 = sum(job.cached_pages for job in self.active_jobs)
         # Perform one round of prefill. While some active job is already generating, prompt ingestion shares
         # the GPU with it: at most one job with prompt left to ingest runs a pass per iteration, with the
         # shared chunk size, and only once the cooldown since the previous pass has elapsed, so every call
@@ -833,6 +854,39 @@ class Generator:
                 self._gov_size = max(PAGE_SIZE, self._gov_size // 2)
             elif slice_ms < self._gov_target_ms / 2 and not decoders_waiting:
                 self._gov_size = min(self._gov_base, self._gov_size * 2)
+            if stats_on:
+                gs_committed = 0
+                for job in self.active_jobs:
+                    for seq in job.sequences:
+                        gs_p0 = gs_kv0.get(id(seq))
+                        if gs_p0 is not None:
+                            gs_committed += max(0, seq.kv_position - gs_p0)
+                gs_cached_tok = max(0, sum(job.cached_pages for job in self.active_jobs) - gs_cp0) * PAGE_SIZE
+                gs_computed = max(0, gs_committed - gs_cached_tok)
+                self._gs_n += 1
+                self._gs_ms_sum += slice_ms
+                self._gs_ms_max = max(self._gs_ms_max, slice_ms)
+                self._gs_tok += gs_computed
+                self._gs_dec += 1 if decoders_waiting else 0
+                if self._gs_n >= self._gov_stats_every:
+                    logger.info(
+                        "[GS] govstats {}".format(
+                            {
+                                "rounds": self._gs_n,
+                                "ms_avg": round(self._gs_ms_sum / self._gs_n, 1),
+                                "ms_max": round(self._gs_ms_max, 1),
+                                "tok_computed": self._gs_tok,
+                                "us_per_tok": round(1000.0 * self._gs_ms_sum / max(1, self._gs_tok), 1),
+                                "dec_rounds": self._gs_dec,
+                                "gov_size": self._gov_size,
+                            }
+                        )
+                    )
+                    self._gs_n = 0
+                    self._gs_ms_sum = 0.0
+                    self._gs_ms_max = 0.0
+                    self._gs_tok = 0
+                    self._gs_dec = 0
 
         if live_shrink:
             self.max_chunk_size = live_shrink
