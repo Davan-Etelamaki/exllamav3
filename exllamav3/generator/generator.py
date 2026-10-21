@@ -1,11 +1,24 @@
 from __future__ import annotations
 import logging
+import os
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
+
+_REPLAY_DEBUG = os.environ.get("EXL3_REPLAY_DEBUG", "0") == "1"
+_REPLAY_OPT = os.environ.get("EXL3_REPLAY_OPT", "0") == "1"
+_REPLAY_HYST = os.environ.get("EXL3_REPLAY_HYST", "0") == "1"
+_SD_FASTSYNC = os.environ.get("EXL3_SD_FASTSYNC", "0") == "1"
+# Optional width gate: when > 0, rounds proposing fewer than this many tokens
+# take the serial path (theory: narrow rounds barely amortize the fast path's
+# one full-device sync). MEASURED 2026-10-13 (ABAB quads, interleaved harness,
+# util covariate): gate ON loses (same-session ratios -5.7/-28.8/+12.8/-15.9%),
+# gate OFF holds the only large wins (+64/+101%). Default OFF; knob kept for
+# flagship sweeps where per-step time dwarfs sync cost differently.
+_SD_FAST_MINW = int(os.environ.get("EXL3_SD_FAST_MINW", "0"))
 from ..util import cuda_sync_active
 
 logger = logging.getLogger(__name__)
@@ -14,6 +27,7 @@ from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .disk_cache import DiskPageCache
 from .draft_confidence import DraftConfidenceCalibrator
+from . import depth_telemetry as _dt
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -56,6 +70,8 @@ class Generator:
         record_draft_stats: bool = False,
         ngram_corpus: str | None = None,
         hybrid_draft_tokens: int = 0,
+        replay_max_tokens: int = 0,
+        replay_gate_rounds: int = 2,
         **kwargs
     ):
         """
@@ -261,7 +277,24 @@ class Generator:
         self.ngram_match_min = ngram_match_min
         # The widest verification pass any round can take: the regular drafter's window or a hybrid draft
         self.hybrid_draft_tokens = max(0, hybrid_draft_tokens or 0)
-        self.max_draft_tokens = max(self.num_draft_tokens, self.hybrid_draft_tokens)
+        # Verified replay: hazard-adaptive widening of the hybrid lane past its static
+        # width, gated on fully-accepted hybrid rounds. 0 keeps the lane at H (off).
+        self.replay_max_tokens = max(0, replay_max_tokens or 0)
+        if self.replay_max_tokens:
+            if self.hybrid_draft_tokens <= 0:
+                raise ValueError("replay_max_tokens requires hybrid_draft_tokens > 0")
+            self.replay_max_tokens = max(self.replay_max_tokens, self.hybrid_draft_tokens)
+        self.replay_gate_rounds = max(1, int(os.environ.get("EXL3_REPLAY_GATE", replay_gate_rounds)))
+        self.max_draft_tokens = max(self.num_draft_tokens, self.hybrid_draft_tokens,
+                                    self.replay_max_tokens)
+        # Warm-start (owner fleet evidence 2026-10-13: 707 rounds fully-accepted AT
+        # the cap, while every new request re-paid the 24->48->96->128 ladder from
+        # cold). Generator-level bandit memory: a new job seeds its widen width
+        # from the last width the bandit converged to fleet-side; rejects decay
+        # it exactly like job-local state. Shared across batch rows on purpose -
+        # the fleet workload is one distribution; per-job adaptation still wins
+        # inside a request.
+        self._replay_warm = 0
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
         max_q_size = max(self.max_draft_tokens + 1, max_q_size)
@@ -293,9 +326,17 @@ class Generator:
 
         # Rounds that verified a hybrid (long suffix-match) draft
         self.hybrid_rounds = 0
+        self.replay_rounds = 0
+        self.replay_rejects = 0
 
         # Pinned staging buffer for batched token readback in iterate_gen
         self.sample_pinned = None
+        # SD fast-sync: pinned staging for whole draft windows + liveness counter
+        self.sd_fast_pinned = None
+        self.sd_fast_rounds = 0
+        self.sd_fast_diag = 0
+        self.sd_pen_cache = {}
+        self.sd_pen_buf = None
         self.staging_buffers = {}
 
         # Buffers. Pinned: the draft input ids upload non-blocking from here every round (and
@@ -704,8 +745,26 @@ class Generator:
         assert self.draft_cache is None or self.draft_cache.initialized, \
             "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
 
+        # p25 admission hint: the frontend notes every incoming HTTP request here because a
+        # request handler can only advance between generator rounds. While a long prefill is
+        # in flight, a 2048-row round (~0.9 s on this class of card) starves the event loop:
+        # a short request arriving mid-prefill waited ~4-5 s just to reach enqueue (measured
+        # dot26 2026-10-04). Shrinking hinted rounds to one page keeps prefill progress but
+        # advances the loop in ~0.1 s steps, so the new request is admitted between chunks.
+        live_shrink = 0
+        has_room = sum(len(j.sequences) for j in self.active_jobs) < self.max_batch_size
+        if getattr(self, "admission_hint", 0) > 0 and has_room:
+            # p25: a hinted request is on its way in - shrink to one page so its handler can
+            # finish event-loop passes while a long prefill is in flight.
+            self.admission_hint -= 1
+            live_shrink = self.max_chunk_size
+            self.max_chunk_size = min(live_shrink, PAGE_SIZE)
         results = []
+        n_active_before = len(self.active_jobs)
         self.iterate_start_jobs(results)
+        if len(self.active_jobs) > n_active_before:
+            # a hinted request arrived and was admitted; stop shrinking
+            self.admission_hint = 0
 
         # Perform one round of prefill. While some active job is already generating, prompt ingestion shares
         # the GPU with it: at most one job with prompt left to ingest runs a pass per iteration, with the
@@ -738,6 +797,9 @@ class Generator:
                 job.prefill(results, chunk_size)
             except Exception as e:
                 self.reap_failed_job(job, e, results)
+
+        if live_shrink:
+            self.max_chunk_size = live_shrink
 
         # Recurrent checkpoints
         if self.recurrent_cache is not None:
@@ -1378,36 +1440,77 @@ class Generator:
             return draft_tokens
         rows = []
         fire = False
+        widths = []
+        R = self.replay_max_tokens
         for i, job in enumerate(jobs):
             short = draft_tokens[i : i + 1] if draft_tokens is not None else None
-            long, matched = job.get_hybrid_draft(H)
-            # A qualifying row: a match of at least H tokens, H tokens following it, and no disagreement with
+            # Per-row bandit width: only rows whose copy gate is open aim past H; the
+            # continuation is periodic-tiled by get_hybrid_draft when the match lags.
+            w = H
+            # Hysteresis: once the hazard bandit has promoted the aim (cap > H), the gate
+            # stays open while cap > H even through a reject; cap decay is the hazard
+            # memory, so a true hazard still walks the width back to H. Without this, a
+            # single mid-window reject closes the gate and pure-copy regimes burn 10-20
+            # narrow recovery rounds per divergence point (measured: 142 ok=0 narrow
+            # rounds vs 44 ok=1 in repro2-R32 ingest).
+            if R > H and (getattr(job, "replay_streak", 0) >= self.replay_gate_rounds or
+                          (_REPLAY_HYST and _REPLAY_OPT and getattr(job, "replay_cap", 0) > H)):
+                if _REPLAY_OPT:
+                    # Anchor-chunk: the suffix match anchors the copy; the WHOLE
+                    # continuation past the anchor is the draft. Verification runs to
+                    # the first failed token; hazard memory (replay_cap) halves the
+                    # aim on a mid-draft reject and restores R on a full accept.
+                    w = min(R, max(H, getattr(job, "replay_cap", R)))
+                else:
+                    w = min(R, max(H, getattr(job, "replay_width",
+                                              getattr(self, "_replay_warm", 0) or H)))
+            long, matched = job.get_hybrid_draft(w)
+            # A qualifying row: a match of at least w tokens, w tokens following it, and no disagreement with
             # the regular drafter over the positions it covers
-            ok = matched >= H and long.shape[-1] == H
+            ok = (matched >= H if _REPLAY_OPT else matched >= w) and long.shape[-1] == w
             if ok and short is not None and short.shape[-1] and not torch.equal(long[:, :short.shape[-1]], short):
                 ok = False
             fire = fire or ok
             rows.append((ok, short, long))
+            widths.append(w if ok else H)
+            if _REPLAY_DEBUG and R > 0:
+                print(f"REPLAYDBG gate R={R} H={H} streak={getattr(job, 'replay_streak', 0)} "
+                      f"w={widths[-1]} ok={int(ok)} matched={matched}", flush = True)
         if not fire:
             return draft_tokens
 
-        out = torch.empty((len(jobs), H), dtype = torch.long)
+        # Rectangular pass: the widest fired row sets the round width; fired rows narrower
+        # than W, and every unfired row, pad with last-token repeats that verification
+        # rejects at the first mismatch (lossless).
+        W = max(widths)
+        out = torch.empty((len(jobs), W), dtype = torch.long)
+        replay_row = False
         for i, (ok, short, long) in enumerate(rows):
+            job = jobs[i]
             if ok:
-                out[i] = long[0]
+                wi = widths[i]
+                out[i, :wi] = long[0, :wi]
+                if wi < W:
+                    out[i, wi:] = long[0, wi - 1]
+                job._replay_pending = wi
+                if wi > H:
+                    replay_row = True
                 continue
+            job._replay_pending = None
             parts = []
             if short is not None and short.shape[-1]:
                 parts.append(short[0])
             if long.shape[-1]:
                 parts.append(long[0])
             fill = torch.cat(parts) if parts else jobs[i].sequences[0].sequence_ids.torch()[0, -1:]
-            fill = fill[:H]
+            fill = fill[:W]
             out[i, : fill.shape[-1]] = fill
             out[i, fill.shape[-1] :] = fill[-1]
         # The regular drafter's confidence record no longer describes the verified window
         self._draft_conf_round = None
         self.hybrid_rounds += 1
+        if replay_row:
+            self.replay_rounds += 1
         return out
 
 
@@ -1641,17 +1744,152 @@ class Generator:
         # position n gates position n+1, and constrained-decoding masks and sampling past IDs
         # must advance between positions.
         else:
+            draft_cpu = None
             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
                 accepted_length = 1
                 rejected = 0
 
+                # --- SD fast-sync path (EXL3_SD_FASTSYNC) --------------------------------
+                # When nothing couples sampled tokens to evolving job state (no filters,
+                # masks, forced tokens or healing; sampler declares it ignores past-IDs
+                # and the RNG seed; single sequence; no probability reporting), every
+                # per-position sampler launch is independent of the others. Launch the
+                # whole window asynchronously, stage all sampled tokens through one
+                # pinned buffer and take a SINGLE synchronize, then feed receive_sample
+                # CPU slices exactly like the proven single-token path above. receive_
+                # sample's next_token.cpu() becomes a no-op and the per-position D2H
+                # sync storm collapses to one round trip. Any violated precondition
+                # falls back to the serial path verbatim. Losslessness is unchanged:
+                # the same sampled tokens, the same draft comparison, the same
+                # receive_sample state machine.
+                sd_fast = False
+                sd_pen_K = 0
+                if _SD_FASTSYNC and draft_tokens is not None:
+                    sd_fast = (
+                        draft_tokens.shape[1] >= _SD_FAST_MINW
+                        and job.new_tokens >= 0
+                        and job.forced_ids is None
+                        and job.device_logit_mask is None
+                        and len(job.filters) == 0
+                        and len(job.sequences) == 1
+                        and not job.return_probs
+                        and job.return_top_tokens == 0
+                        and not job.sampler.reqs_torch_seed
+                    )
+                    if sd_fast:
+                        # Past-ID steps are allowed when every one of them is a windowed
+                        # penalty (SS_RepP / SS_PresFreqP): both kernels skip tokens older
+                        # than sustain+decay and measure distance from the row end, so the
+                        # penalty at position i depends only on the LAST K tokens of
+                        # committed ++ draft[:i]. Feeding each position its own sliding
+                        # window of width K reproduces the serial path exactly. Any other
+                        # past-ID consumer (DRY, fused chains) still falls back to serial.
+                        from .sampler.custom import SS_RepP, SS_PresFreqP
+                        _pk = id(job.sampler)
+                        _pe = self.sd_pen_cache.get(_pk)
+                        if _pe is None or _pe[0] is not job.sampler:
+                            _ok, _kk = True, 0
+                            for st in getattr(job.sampler, "steps", ()):
+                                if not st.reqs_past_ids():
+                                    continue
+                                if isinstance(st, (SS_RepP, SS_PresFreqP)):
+                                    _sk = int(st.sustain_range) + int(st.decay_range)
+                                    if _sk > 4096:
+                                        _ok = False
+                                        break
+                                    _kk = max(_kk, _sk)
+                                else:
+                                    _ok = False
+                                    break
+                            self.sd_pen_cache[_pk] = (job.sampler, _ok, _kk)
+                        else:
+                            _ok, _kk = _pe[1], _pe[2]
+                        sd_fast, sd_pen_K = _ok, _kk
+                    if not sd_fast and self.sd_fast_diag < 3:
+                        self.sd_fast_diag += 1
+                        print("SDFAST off:",
+                              "new_tokens", job.new_tokens,
+                              "forced", job.forced_ids is not None,
+                              "mask", job.device_logit_mask is not None,
+                              "filters", len(job.filters),
+                              "seqs", len(job.sequences),
+                              "probs", job.return_probs, job.return_top_tokens,
+                              "steps", [type(st).__name__ for st in getattr(job.sampler, "steps", ())],
+                              "seed", job.sampler.reqs_torch_seed, flush = True)
+                sd_tokens = None
+                if sd_fast:
+                    Wp = batch_logits.shape[1]
+                    pinned_f = self.sd_fast_pinned
+                    if pinned_f is None or pinned_f.shape[0] < Wp:
+                        self.sd_fast_pinned = pinned_f = torch.empty(
+                            (max(Wp, 256), 1), dtype = torch.long, pin_memory = True
+                        )
+                    launched_f = []
+                    sd_fast_sid = None
+                    if sd_pen_K > 0:
+                        # Sliding penalty windows: row i = last K tokens of
+                        # committed ++ draft[:i], a true suffix of the serial
+                        # path's past_ids at position i. Both penalty kernels
+                        # ignore anything older than K and count distance from
+                        # the row end, so the fast path sees exactly the serial
+                        # penalty state. Built from device tensors only: no
+                        # sync, all ops enqueue ahead of the sampler launches.
+                        K = sd_pen_K
+                        n_now = job.current_device_ids.shape[1]
+                        # draft row j carries Wp - 1 proposals (position Wp is
+                        # the bonus sample); row Wp - 1 consumes draft[:Wp-1].
+                        if n_now < K + Wp or draft_tokens.shape[1] < Wp - 1:
+                            sd_fast = False
+                        else:
+                            need = K + 2 * Wp
+                            buf = self.sd_pen_buf
+                            if buf is None or buf.shape[0] < need:
+                                self.sd_pen_buf = buf = torch.empty(
+                                    need, dtype = torch.long, device = batch_logits.device
+                                )
+                            buf[:K + Wp].copy_(
+                                job.current_device_ids[0, n_now - (K + Wp):n_now]
+                            )
+                            buf[K + Wp:K + Wp + Wp - 1].copy_(draft_tokens[j, :Wp - 1])
+                            sd_fast_sid = (
+                                buf[:K + Wp + Wp].unfold(0, K, 1)[Wp:Wp + Wp].contiguous()
+                            )
+                    if sd_fast:
+                        for i in range(Wp):
+                            launched_f.append(job.sampler.forward(
+                                job_logits[:, i:i + 1, :],
+                                sd_fast_sid[i:i + 1] if sd_fast_sid is not None else job.current_device_ids,
+                                job.rng.randint(0, (1<<32)-1),
+                                self.tokenizer,
+                                logit_mask = None,
+                            ))
+                    torch.cuda.synchronize(batch_logits.device)
+                    for i, nt in enumerate(launched_f):
+                        pinned_f[i:i + 1].copy_(nt.view(1, 1), non_blocking = True)
+                    torch.cuda.synchronize(batch_logits.device)
+                    sd_tokens = pinned_f[:Wp].view(-1).tolist()
+                    if draft_cpu is None:
+                        draft_cpu = draft_tokens.tolist()
+                    self.sd_fast_rounds += 1
+                    if self.sd_fast_rounds == 1:
+                        print(f"SDFAST armed: first fast round, W={Wp}"
+                              + (f", pen window K={sd_pen_K}" if sd_pen_K else ""), flush = True)
+                    elif self.sd_fast_rounds % 500 == 0:
+                        print(f"SDFAST rounds={self.sd_fast_rounds}", flush = True)
+
                 for i in range(batch_logits.shape[1]):
                     token_logits = job_logits[:, i:i + 1, :]
-                    next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
-                        token_logits,
-                    )
+                    if sd_fast:
+                        next_token = self.sd_fast_pinned[i:i + 1]
+                        next_k_tokens = None
+                        next_k_probs = None
+                        next_prob = None
+                    else:
+                        next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
+                            token_logits,
+                        )
                     eos, sampled_token, rq = job.receive_sample(
                         token_logits,
                         next_token,
@@ -1706,7 +1944,11 @@ class Generator:
                     # draft acceptance so state can be stashed at an exact page boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
-                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
+                        if sd_fast:
+                            mismatch = draft_cpu[j][i] != sd_tokens[i]
+                        else:
+                            mismatch = draft_tokens[j, i].item() != sampled_token.item()
+                        if mismatch or cp_boundary:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
 
@@ -1738,6 +1980,50 @@ class Generator:
                 # Record per-round draft stats. Skip abandoned windows (banned-string rewind);
                 # checkpoint-boundary truncations are rare enough to count as ordinary rejections.
                 if draft_tokens is not None and rejected != -1:
+                    pend = getattr(job, "_replay_pending", None)
+                    if pend is not None:
+                        if _REPLAY_DEBUG:
+                            print(f"REPLAYDBG pend={pend} acc={accepted_length - 1} "
+                                  f"streak={getattr(job, 'replay_streak', 0)}", flush = True)
+                        # Hazard-adaptive width bandit: full accept doubles the aim
+                        # (capped at replay_max_tokens), a mid-window reject halves it and
+                        # closes the gate; steady state rides ~1/h for per-position
+                        # rejection hazard h. Rejection sampling keeps every round lossless.
+                        job._replay_pending = None
+                        if accepted_length - 1 >= pend:
+                            job.replay_streak = getattr(job, "replay_streak", 0) + 1
+                            job.replay_width = min(self.replay_max_tokens,
+                                                   max(pend * 2, self.hybrid_draft_tokens))
+                            self._replay_warm = job.replay_width
+                            # Aggressive recovery: a full accept quadruples the aim.
+                            job.replay_cap = min(self.replay_max_tokens,
+                                                 max(getattr(job, "replay_cap", self.hybrid_draft_tokens) * 4,
+                                                     pend * 2))
+                        else:
+                            if pend > self.hybrid_draft_tokens:
+                                self.replay_rejects += 1
+                            job.replay_streak = 0
+                            job.replay_width = max(self.hybrid_draft_tokens, pend // 2)
+                            self._replay_warm = job.replay_width
+                            # Quarter rule: only an UNPRODUCTIVE miss (acc < pend/4)
+                            # halves the aim; a productive partial grab keeps it.
+                            if accepted_length - 1 < pend // 4:
+                                job.replay_cap = max(self.hybrid_draft_tokens, pend // 2)
+                            else:
+                                job.replay_cap = max(self.hybrid_draft_tokens, pend)
+                    if job._depth_rec is not None:
+                        _dt.record(job._depth_rec, draft_tokens.shape[-1], accepted_length - 1)
+                        pt = getattr(self, "_pool_tick", 0) + 1
+                        self._pool_tick = pt
+                        rc = getattr(self, "recurrent_cache", None)
+                        if rc is not None and pt % 512 == 0:
+                            # [POOL] witness (law 5): the eviction-graceful claim for
+                            # widened replay on recurrent models rests on these counters;
+                            # silent metrics are unfalsifiable. Every 512 recorded rounds.
+                            m = rc.metrics
+                            print(f"[POOL] stashed={len(rc)} size={rc.current_size / 2**30:.2f}GiB "
+                                  f"evict={m['stash_evictions']} stranded={m['stash_evictions_stranded']} "
+                                  f"livekv={m['stash_evictions_live_kv']} pruned={m['stash_pruned']}")
                     if self.record_draft_stats:
                         job.draft_stats.append((
                             job.new_tokens,
@@ -1746,7 +2032,7 @@ class Generator:
                         ))
 
                 # The last sampled token leads the next forward
-                self.model.prefetch_tokens([sampled_token.item()])
+                self.model.prefetch_tokens([sd_tokens[i] if sd_fast else sampled_token.item()])
 
                 accepted_lengths.append(accepted_length)
                 j += 1

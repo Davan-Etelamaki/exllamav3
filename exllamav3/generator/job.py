@@ -10,6 +10,7 @@ from .filter import Filter
 import random
 import time
 from ..ext import exllamav3_ext as ext
+from . import depth_telemetry as _dt
 from .loop_detect import LoopDetector
 from .sampler import Sampler, DefaultSampler
 from ..util.tensor import SeqTensor
@@ -275,6 +276,7 @@ class Job:
         self.time_generate = rq_state.get("time_generate", 0.0)
         self.accepted_draft_tokens = rq_state.get("accepted_draft_tokens", 0)
         self.rejected_draft_tokens = rq_state.get("rejected_draft_tokens", 0)
+        self._depth_rec = _dt.new_rec(rq_state)
         self.rq_prompt_tokens = rq_state.get("prompt_tokens")
         self.rq_cached = rq_state.get("cached")
         self.draft_stats = []
@@ -943,6 +945,8 @@ class Job:
                         "accepted_draft_tokens": self.accepted_draft_tokens,
                         "rejected_draft_tokens": self.rejected_draft_tokens
                     })
+                    if self._depth_rec is not None:
+                        r["draft_depth"] = _dt.export(self._depth_rec)
                 if eos_reason == "stop_string":
                     self.held_text = rem_held_text
                 rh = {}
@@ -1225,6 +1229,7 @@ class Job:
             "rq_new_tokens": self.rq_new_tokens + self.new_tokens,
             "accepted_draft_tokens": self.accepted_draft_tokens,
             "rejected_draft_tokens": self.rejected_draft_tokens,
+            "draft_depth": _dt.export(self._depth_rec),
             "prompt_tokens": self.rq_prompt_tokens or len(seq.input_ids),
             "cached": self.rq_cached if self.rq_cached is not None else (
                 self.cached_pages, self.cached_pages * PAGE_SIZE + self.cached_tokens),

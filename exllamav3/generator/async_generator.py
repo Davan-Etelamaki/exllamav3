@@ -8,6 +8,11 @@ import torch
 # exits, rather than waiting forever for results that will no longer be produced
 _CANCELLED_SENTINEL = object()
 
+import os as _ag_os, time as _ag_time
+_AG_DEC = float(_ag_os.environ.get("EXL3_SCHED_DEC", "0.001"))
+_AG_TH = float(_ag_os.environ.get("EXL3_SCHED_TH", "0.010"))
+_AG_FILE = _ag_os.environ.get("EXL3_SCHED_DEC_FILE", "")
+
 class AsyncGenerator:
     """
     Async wrapper for dynamic generator. See definition of Generator.
@@ -44,12 +49,31 @@ class AsyncGenerator:
                 # Delivery must never block: this single task serves every job, so waiting on one stalled
                 # consumer (e.g. a disconnected client that stopped draining its queue) would wedge the whole
                 # generator (issue #227).
+                _ag_t = _ag_time.perf_counter()
                 results = self.generator.iterate()
                 self.deliver_results(results)
+                _ag_dur = _ag_time.perf_counter() - _ag_t
 
                 # Yield back to the event loop so result consumers and cancellation requests can run between
                 # generator iterations, even if the synchronous generator immediately has more work available.
-                await asyncio.sleep(0)
+                # NOTE(sched-probe 2026-10-04): sleep(0) re-appends this task to the ready queue. While any
+                # job has work, the loop never blocks in the selector with a positive timeout, so a NEW
+                # incoming HTTP request starves behind one engine round per await (a 2048-row prefill chunk
+                # ~= 0.9 s): a short request arriving mid-prefill waited ~4 s just to reach its handler.
+                # A 1 ms sleep forces a real selector pass every round; new requests are admitted between
+                # chunks. Cost: <=1 ms per round, invisible against ~30 ms decode rounds, 0.1% of a chunk.
+                # EXL3_SCHED_DEC_FILE: optional per-round override of the decay value, read
+                # fresh every round so an A/B harness can flip arms WITHOUT rebooting (kills the
+                # load-plateau confound, GRE21f). Unset (prod default) => zero syscalls, byte-
+                # equivalent behavior to the env-only knob. Malformed/missing file => env value.
+                _ag_eff = _AG_DEC
+                if _AG_FILE:
+                    try:
+                        with open(_AG_FILE) as _ag_fh:
+                            _ag_eff = float(_ag_fh.read().strip() or _AG_DEC)
+                    except (OSError, ValueError):
+                        pass
+                await asyncio.sleep(_ag_eff if _ag_dur < _AG_TH else 0.001)
 
         except asyncio.CancelledError:
             # Silently return on cancel
