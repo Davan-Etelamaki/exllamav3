@@ -40,7 +40,13 @@ MTILE = MOE_MTILE
 MTILE_T1, MTILE_T2 = 16, 32
 # Fused-kernel row capacity per expert when the wide tiles apply: with them the fused kernel
 # beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk: 128 -> 256 rows +3%)
-FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
+FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))# REVERTED 2026-10-14 17:2x to vendor 256: the fused scratch is
+# the module calls expert_count.tolist() = one device-wide CPU sync PER LAYER PER ROUND. Vendor
+# default 256 was decode-shaped, so every prefill round paid ~48 syncs. 8192 rows covers
+# governor-range rounds (<=819 tokens at top_k 10) for ~768 MB shared fp16 scratch
+# (12 MB per 128 rows, measured headroom 16 GB). EXL3_MOE_FUSED_ROWS_WIDE=256 restores
+# the vendor path byte-for-byte.
+
 # Deterministic (slot + gather) accumulation for the fused kernel's outputs; EXL3_MOE_FUSED_DET=0
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
