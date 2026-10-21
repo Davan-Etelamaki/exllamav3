@@ -33,6 +33,14 @@ def _bc_stats_record(bsz, seqlen, history):
         print("[GS] bcstats recapture=%d hist=%d shapes=%d top=%s" % (
             s["recapture"], s["hist"], len(s["shapes"]), top), flush = True)
 
+# [GS] bckeep: opt-in BC CUDA-graph keep (GS_BC_KEEP=1). Vendor configure_slot ends
+# with stage_key=0, so needs_configure re-fires EVERY save_history call and discards the
+# slot's CUDA graph. KEEP assigns a per-shape GENERATION counter bumped only when the
+# staging storage the graph bakes (spec_conv/beta/g data_ptr triple) changes; stage_key=gen
+# so a steady request keeps its graph (0 recapture) and a buffer move forces exactly one.
+# Default ON (opt out GS_BC_KEEP=0): vendor path byte-identical when off.
+_BC_KEEP_ON = os.environ.get("GS_BC_KEEP", "1") != "0"
+
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
 # one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
 # (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
@@ -1270,6 +1278,15 @@ class GatedDeltaNet(Module):
             not spec_step
         ):
             stage_key = id(rsl) if save_history else 0
+            if _BC_KEEP_ON and save_history:
+                _bc_ptrs = self.__dict__.setdefault("_bc_staged_ptr", {})
+                _bc_gen  = self.__dict__.setdefault("_bc_gen", {})
+                _bc_shape = (bsz, seqlen)
+                _bc_sp = (rsl.spec_conv.data_ptr(), rsl.spec_beta.data_ptr(), rsl.spec_g.data_ptr())
+                if _bc_ptrs.get(_bc_shape) != _bc_sp:
+                    _bc_gen[_bc_shape] = _bc_gen.get(_bc_shape, 0) + 1
+                    _bc_ptrs[_bc_shape] = _bc_sp
+                stage_key = _bc_gen[_bc_shape]
             if self.bc.needs_configure(bsz, seqlen, save_history, stage_key):
                 if _BC_STATS_ON:
                     _bc_stats_record(bsz, seqlen, save_history)

@@ -28,10 +28,6 @@ def _bc_stats_record(bsz, seqlen, history):
         s["hist"] += 1
     k = "%dx%d" % (bsz, seqlen)
     s["shapes"][k] = s["shapes"].get(k, 0) + 1
-    if s["recapture"] % 100 == 0:
-        top = sorted(s["shapes"].items(), key = lambda kv: -kv[1])[:6]
-        print("[GS] bcstats recapture=%d hist=%d shapes=%d top=%s" % (
-            s["recapture"], s["hist"], len(s["shapes"]), top), flush = True)
 
 # [GS] bckeep: opt-in BC CUDA-graph keep (GS_BC_KEEP=1). Vendor configure_slot ends
 # with stage_key=0, so needs_configure re-fires EVERY save_history call and discards the
