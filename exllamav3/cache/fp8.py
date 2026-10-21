@@ -92,8 +92,8 @@ class CacheLayer_fp8(CacheLayer):
             page_idx = rows // PAGE_SIZE
             page_off = rows - page_idx * PAGE_SIZE
             phys = block_table[b].index_select(0, page_idx)
-            self.k[phys, page_off] = k[b, : length].to(torch.float8_e4m3fn)
-            self.v[phys, page_off] = v[b, : length].to(torch.float8_e4m3fn)
+            self.k[phys, page_off] = k[b, : length].to(torch.float8_e4m3fn).clone()
+            self.v[phys, page_off] = v[b, : length].to(torch.float8_e4m3fn).clone()
 
     @override
     def update_kv_direct(

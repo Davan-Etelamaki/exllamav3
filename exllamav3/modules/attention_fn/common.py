@@ -32,6 +32,10 @@ class AttnArgs(NamedTuple):
     staging_pages: int | None = None    # pages the quantized-cache prefill staging scratch is sized to
                                         # (a per-layer constant: the pool, or QSA's bounded window)
 
+    k_scales: torch.Tensor | None = None   # per-group scales for a quantized k_cache (unused by
+                                        # dispatch: quant-direct calls carry q_cache instead)
+    v_scales: torch.Tensor | None = None   # companion of k_scales
+
     def sanity_check(self):
         # Cache must be paged
         if self.q_cache is not None:

@@ -1,5 +1,5 @@
 import torch
-from ...cache import CacheLayer, Cache, CacheLayer_quant
+from ...cache import CacheLayer, Cache, CacheLayer_quant, CacheLayer_fp8, CacheLayer_nvfp4
 from .common import AttnArgs, AttnFn
 from .bighead_scalar import fn_bighead_scalar_attn
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
@@ -32,6 +32,15 @@ _fns_triton_fast: list[AttnFn] = [
 _fns_qc: list[AttnFn] = [
     fn_triton_paged_attn_decode_qc,
     fn_triton_paged_attn_prefill_qc,
+]
+
+# NVFP4/FP8 cache layers hand their raw paged tensors (packed uint8 + E4M3 scales for
+# nvfp4, plain fp8 pages for fp8) to the general Triton paged kernels, which append the
+# new K/V in-kernel and dequantize online. Other backends only ever see these modes
+# through full dequantized fp16 copies, so such calls dispatch over these two only
+_fns_fp8: list[AttnFn] = [
+    fn_triton_paged_attn,
+    fn_triton_paged_attn_longq,
 ]
 
 # Quantized caches feed the attention kernels directly (online dequant or prefill staging by
@@ -115,6 +124,9 @@ def attn_dispatch(
     # kernels when possible: new K/V are quantized into the cache up front and never
     # materialized as full fp16 cache-sized temporaries
     q_cache = None
+    fp8_fast = False
+    k_scales = None
+    v_scales = None
     if cache is not None:
         assert block_table is not None
         assert cache_seqlens is not None
@@ -130,8 +142,37 @@ def attn_dispatch(
             layer.update_kv_direct(cache_seqlens, block_table, k, v, q_len)
             q_cache = layer.get_qkv()
             k_cache, v_cache = None, None
+        elif (
+            isinstance(layer, CacheLayer_nvfp4) and
+            layer.k is not None and
+            q.dtype == torch.float16 and
+            cu_seqlens is None
+        ):
+            # NVFP4 path: new K/V are quantized (E2M1 + E4M3 scale/16) and appended in-kernel
+            # by the nvfp4 update kernel; attention reads the packed pages with online dequant
+            k_cache, v_cache = layer.k, layer.v
+            k_scales, v_scales = layer.ks, layer.vs
+            fp8_fast = True
+        elif (
+            isinstance(layer, CacheLayer_fp8) and
+            layer.k is not None and
+            q.dtype == torch.float16 and
+            cu_seqlens is None
+        ):
+            # Raw fp8 pages straight into the Triton kernels; new K/V are appended in-kernel
+            # (dtype-aware update kernel), same flow as fp16 caches
+            k_cache, v_cache = layer.k, layer.v
+            fp8_fast = True
         else:
             k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, window_size if window_size is not None else -1)
+            if isinstance(layer, CacheLayer_fp8) and k_cache is not None:
+                # No Triton fast path: give the generic backends dequantized fp16 copies. They
+                # append the new K/V into these temporaries; the post-hook writes fp8 pages back
+                k_cache = k_cache.to(torch.half)
+                v_cache = v_cache.to(torch.half)
+            elif isinstance(layer, CacheLayer_nvfp4) and k_cache is not None:
+                # Generous fp16 copies; the post-hook re-quantizes the new K/V into the pages
+                k_cache, v_cache = layer.dequant_full()
     else:
         k_cache, v_cache = None, None
 
@@ -158,12 +199,21 @@ def attn_dispatch(
         window_right = window_right,
         sink_key0 = sink_key0,
         staging_pages = staging_pages,
+        k_scales = k_scales,
+        v_scales = v_scales,
     )
     # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache
     # and would accept them as cache-less)
-    candidates = _fns_qc if q_cache is not None else attn_fns
-    hint_key = "fn_qc" if q_cache is not None else "fn"
+    if fp8_fast:
+        candidates = _fns_fp8
+        hint_key = "fn_fp8"
+    elif q_cache is not None:
+        candidates = _fns_qc
+        hint_key = "fn_qc"
+    else:
+        candidates = attn_fns
+        hint_key = "fn"
 
     # Retry the backend that matched last time for this caller before scanning the full list.
     # Candidate functions return None on incompatible arguments, so a stale hint self-corrects
@@ -182,8 +232,9 @@ def attn_dispatch(
         if dispatch_cache is not None:
             dispatch_cache[hint_key] = fn
 
-    # Update cache (quant-direct mode already wrote the new K/V before the attention call)
-    if cache is not None and q_cache is None:
+    # Update cache (quant-direct mode wrote the new K/V before the attention call; the
+    # nvfp4/fp8 Triton mode appended them in-kernel during it)
+    if cache is not None and q_cache is None and not fp8_fast:
         if isinstance(cache, CacheLayer):
             cache.update_kv(cache_seqlens, block_table, k_cache, v_cache, q_len)
         elif isinstance(cache, Cache):
