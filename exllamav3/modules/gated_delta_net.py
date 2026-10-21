@@ -14,6 +14,25 @@ from ..util.tensor import g_tensor_cache
 from .multilinear import SlicedMultiLinear
 import os
 
+# [GS] bcstats: opt-in BC CUDA-graph recapture counter (GS_BCSTATS=1).
+# Off by default: the vendor decode path runs byte-identical. Recapture = full
+# GraphCapture per GDN layer per slot rotation (gated_delta_net.cpp needs_configure),
+# keyed on id(recurrent-layer-state); this counts how often slots churn.
+_BC_STATS_ON = os.environ.get("GS_BCSTATS", "") == "1"
+_bc_stats = {"recapture": 0, "hist": 0, "shapes": {}}
+
+def _bc_stats_record(bsz, seqlen, history):
+    s = _bc_stats
+    s["recapture"] += 1
+    if history:
+        s["hist"] += 1
+    k = "%dx%d" % (bsz, seqlen)
+    s["shapes"][k] = s["shapes"].get(k, 0) + 1
+    if s["recapture"] % 100 == 0:
+        top = sorted(s["shapes"].items(), key = lambda kv: -kv[1])[:6]
+        print("[GS] bcstats recapture=%d hist=%d shapes=%d top=%s" % (
+            s["recapture"], s["hist"], len(s["shapes"]), top), flush = True)
+
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
 # one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
 # (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
@@ -1309,6 +1328,8 @@ class GatedDeltaNet(Module):
         ):
             stage_key = id(rsl) if save_history else 0
             if self.bc.needs_configure(bsz, seqlen, save_history, stage_key):
+                if _BC_STATS_ON:
+                    _bc_stats_record(bsz, seqlen, save_history)
                 if self.kda:
                     self._bc_configure_slot_kda(bsz, seqlen, save_history, rsl)
                 else:
