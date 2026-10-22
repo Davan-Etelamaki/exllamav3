@@ -689,6 +689,8 @@ class QSAIndexer(Module):
         """
         from .attention_fn.qsa_triton import qsa_sparse_attend_rows
         from ..cache.quant import CacheLayer_quant
+        from ..cache.nvfp4 import CacheLayer_nvfp4
+        from ..cache.fp8 import CacheLayer_fp8
         bsz, seq = q.shape[:2]
         indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
         bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
@@ -697,14 +699,31 @@ class QSAIndexer(Module):
             # Packed pages, dequantized online by the gather kernel
             qk, sk, qv, sv, kb, vb = layer.get_qkv()
             k_arg, v_arg, qc, page_size = qk, qv, (sk, sv, kb, vb), qk.shape[1]
+            kv_format, k_scales, v_scales = "int", None, None
+        elif isinstance(layer, CacheLayer_nvfp4):
+            # Packed NVFP4 pages (E2M1 nibbles + per-16 E4M3 scales), dequantized online
+            k4, ks, v4, vs = layer.get_paged()
+            k_arg = k4.view(-1, attn.num_kv_heads, attn.head_dim // 2)
+            v_arg = v4.view(-1, attn.num_kv_heads, attn.head_dim // 2)
+            qc, page_size = None, k4.shape[1]
+            kv_format, k_scales, v_scales = "nvfp4", ks, vs
+        elif isinstance(layer, CacheLayer_fp8):
+            # Raw E4M3 pages, cast to fp16 online (no scales); K/V are unrotated
+            kf, vf = layer.get_paged()
+            k_arg = kf.view(-1, attn.num_kv_heads, attn.head_dim)
+            v_arg = vf.view(-1, attn.num_kv_heads, attn.head_dim)
+            qc, page_size = None, kf.shape[1]
+            kv_format, k_scales, v_scales = "fp8", None, None
         else:
             k_arg = layer.k.view(-1, attn.num_kv_heads, attn.head_dim)
             v_arg = layer.v.view(-1, attn.num_kv_heads, attn.head_dim)
             qc, page_size = None, layer.k.shape[1]
+            kv_format, k_scales, v_scales = "fp16", None, None
         o = qsa_sparse_attend_rows(
             q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous(),
             k_arg, v_arg, indices, attn.sm_scale,
             block_table = bt_rows, page_size = page_size,
             qc = qc, n_kv_heads = attn.num_kv_heads,
+            kv_format = kv_format, k_scales = k_scales, v_scales = v_scales,
         )
         return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)

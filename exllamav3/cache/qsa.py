@@ -5,6 +5,8 @@ import torch
 from .cache import CacheLayer
 from .fp16 import CacheLayer_fp16
 from .quant import CacheLayer_quant
+from .nvfp4 import CacheLayer_nvfp4
+from .fp8 import CacheLayer_fp8
 from ..constants import PAGE_SIZE
 
 
@@ -109,5 +111,57 @@ class CacheLayer_qsa_quant(QSAPlanes, CacheLayer_quant):
                 "max_num_tokens": self.max_num_tokens,
                 "k_bits": self.k_bits,
                 "v_bits": self.v_bits,
+            }
+        }
+
+
+class CacheLayer_qsa_nvfp4(QSAPlanes, CacheLayer_nvfp4):
+    """NVFP4 KV cache layer (packed E2M1 + E4M3 per-16 scales, dequantized online by the dense
+    paged kernels and by the QSA gathered sparse kernel) with the fp16 QSA indexer planes."""
+
+    def __init__(
+        self,
+        config,
+        attention,
+        cache_id: int,
+        max_num_tokens: int,
+        **kwargs,
+    ):
+        super().__init__(config, attention, cache_id, max_num_tokens, **kwargs)
+        self._init_planes(attention, max_num_tokens)
+
+    @override
+    def tp_export(self, plan):
+        return {
+            "cls": CacheLayer_qsa_nvfp4,
+            "args": {
+                "cache_id": self.cache_id,
+                "max_num_tokens": self.max_num_tokens,
+            }
+        }
+
+
+class CacheLayer_qsa_fp8(QSAPlanes, CacheLayer_fp8):
+    """FP8 (E4M3) KV cache layer, raw pages with no scales, dequantized online by the dense
+    paged kernels and by the QSA gathered sparse kernel, plus the fp16 QSA indexer planes."""
+
+    def __init__(
+        self,
+        config,
+        attention,
+        cache_id: int,
+        max_num_tokens: int,
+        **kwargs,
+    ):
+        super().__init__(config, attention, cache_id, max_num_tokens, **kwargs)
+        self._init_planes(attention, max_num_tokens)
+
+    @override
+    def tp_export(self, plan):
+        return {
+            "cls": CacheLayer_qsa_fp8,
+            "args": {
+                "cache_id": self.cache_id,
+                "max_num_tokens": self.max_num_tokens,
             }
         }

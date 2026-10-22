@@ -34,7 +34,10 @@ import torch
 import triton
 import triton.language as tl
 
-from .triton_paged import combine_subtiles, _qc_load_kt, _qc_load_v, _rot_h32, _get_h32
+from .triton_paged import (
+    combine_subtiles, _qc_load_kt, _qc_load_v, _rot_h32, _get_h32,
+    _nvfp4_kt_tile, _nvfp4_v_tile,
+)
 
 @triton.jit(do_not_specialize = ["R"])
 def _qsa_stage_kernel(
@@ -170,6 +173,8 @@ def _qsa_sparse_split_kernel(
     PAGED: tl.constexpr = 1,
     QCK: tl.constexpr = 0,   # packed quantized K pages (bits), 0 = fp16
     QCV: tl.constexpr = 0,   # packed quantized V pages (bits), 0 = fp16
+    KFMT: tl.constexpr = 0,  # K page storage: 0 = fp16, 1 = fp8 E4M3, 2 = NVFP4 (QCK unused)
+    VFMT: tl.constexpr = 0,  # V page storage: 0 = fp16, 1 = fp8 E4M3, 2 = NVFP4 (QCV unused)
 ):
     """Gathered GQA flash-decoding phase 1 over an index list, q_len == 1: one program per
     (batch, kv_head, h_block, split), iterating the row's indices instead of the sequential
@@ -216,11 +221,17 @@ def _qsa_sparse_split_kernel(
         else:
             tok = idx_c
 
-        if QCK > 0:
+        if KFMT == 2:
+            # NVFP4 pages: nibble decode + per-16 E4M3 scales, no H32 rotation (raw domain)
+            k_tile = _nvfp4_kt_tile(k_cache, k_scales, tok // page_size, tok % page_size, valid_n,
+                                    kv_head, n_kv_heads, page_size, head_dim, BLOCK_N)
+        elif QCK > 0:
             k_tile = _qc_load_kt(k_cache, k_scales, tok, kv_head, offs_d, valid_n, QCK, n_kv_heads, head_dim, head_dim)
         else:
             k_ptrs = k_cache + ((tok[None, :] * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
             k_tile = tl.load(k_ptrs, mask = valid_n[None, :], other = 0.0)
+            if KFMT == 1:
+                k_tile = k_tile.to(tl.float16)
         scores = tl.dot(q_tile, k_tile) * scale
 
         valid = valid_row[:, None] & valid_n[None, :]
@@ -233,12 +244,18 @@ def _qsa_sparse_split_kernel(
         alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
         l = l * alpha + tl.sum(p, axis = 1)
 
-        if QCV > 0:
+        if VFMT == 2:
+            # NVFP4 pages: nibble decode + per-16 E4M3 scales, unrotated (combine does not rotate)
+            v_tile = _nvfp4_v_tile(v_cache, v_scales, tok // page_size, tok % page_size, valid_n,
+                                   kv_head, 0, n_kv_heads, page_size, head_dim, BLOCK_N, head_dim)
+        elif QCV > 0:
             # Rotated-domain values: the partials stay rotated, the combine rotates back
             v_tile = _qc_load_v(v_cache, v_scales, tok, kv_head, offs_d, valid_n, QCV, n_kv_heads, head_dim, head_dim)
         else:
             v_ptrs = v_cache + ((tok[:, None] * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
             v_tile = tl.load(v_ptrs, mask = valid_n[:, None], other = 0.0)
+            if VFMT == 1:
+                v_tile = v_tile.to(tl.float16)
         acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
         m = m_new
 
@@ -270,6 +287,9 @@ def qsa_sparse_attend_rows(
     qc: tuple | None = None,       # (k_scales, v_scales, k_bits, v_bits): k / v are the packed
                                    # int32 pages (CacheLayer_quant), dequantized online
     n_kv_heads: int | None = None, # required with qc (the packed rows carry no head axis)
+    kv_format: str = "fp16",       # "fp16" | "fp8" | "nvfp4" page storage (ignored with qc)
+    k_scales: torch.Tensor | None = None,   # NVFP4 per-16 E4M3 scales (kv_format = "nvfp4")
+    v_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Eager gathered GQA attention, one index list per query row: the sparse prefill /
     eager-fallback form of the BC sparse decode kernels. block_table = None runs the flat
@@ -278,12 +298,32 @@ def qsa_sparse_attend_rows(
     rows (decode fallback) still fill the device. Returns (R, n_q_heads, head_dim) fp16."""
     from .triton_paged import _paged_attn_decode_combine_kernel
     R, H, hd = q.shape
+    kfmt = vfmt = 0
     if qc is not None:
         k_scales, v_scales, k_bits, v_bits = qc
         assert n_kv_heads is not None and block_table is not None, \
             "qsa_sparse_attend_rows: packed K/V requires n_kv_heads and a block table"
         kvh = n_kv_heads
         h32 = _get_h32(q.device)
+    elif kv_format == "nvfp4":
+        assert k_scales is not None and v_scales is not None and block_table is not None, \
+            "qsa_sparse_attend_rows: nvfp4 K/V requires k_scales/v_scales and a block table"
+        kfmt = vfmt = 2
+        k_bits = v_bits = 0
+        kvh = k.shape[1] if n_kv_heads is None else n_kv_heads
+        assert k.shape[1] == kvh and v.shape[1] == kvh, \
+            "qsa_sparse_attend_rows: nvfp4 K/V rows must carry the kv-head axis"
+        h32 = q
+    elif kv_format == "fp8":
+        assert block_table is not None, \
+            "qsa_sparse_attend_rows: fp8 K/V requires a block table"
+        kfmt = vfmt = 1
+        k_bits = v_bits = 0
+        k_scales = v_scales = q
+        kvh = k.shape[1] if n_kv_heads is None else n_kv_heads
+        assert k.shape[1] == kvh and v.shape[1] == kvh, \
+            "qsa_sparse_attend_rows: fp8 K/V rows must carry the kv-head axis"
+        h32 = q
     else:
         k_scales, v_scales, k_bits, v_bits = q, q, 0, 0
         kvh = k.shape[1]
@@ -317,7 +357,7 @@ def qsa_sparse_attend_rows(
             n_q_heads = H, n_kv_heads = kvh, page_size = page_size if paged else 1,
             head_dim = hd, K_pad = K_pad, scale = float(sm_scale),
             BLOCK_H = BLOCK_H, BLOCK_N = BLOCK_N, PAGED = 1 if paged else 0,
-            QCK = k_bits, QCV = v_bits,
+            QCK = k_bits, QCV = v_bits, KFMT = kfmt, VFMT = vfmt,
             num_warps = 4, num_stages = 2,
         )
         rows_sub, d_sub = combine_subtiles(BLOCK_H, hd)

@@ -985,12 +985,20 @@ class Attention(Module):
 
     def cache_layer_type(self, default, kwargs: dict):
         """QSA modules need the indexer side planes on their cache layer: map the requested
-        K/V layer type to its planes-carrying variant (fp16 or quantized)."""
+        K/V layer type to its planes-carrying variant (fp16, int-quant, NVFP4 or FP8)."""
         if self.qsa_indexer is None:
             return default, kwargs
         from ..cache.fp16 import CacheLayer_fp16
         from ..cache.quant import CacheLayer_quant
-        from ..cache.qsa import CacheLayer_qsa, CacheLayer_qsa_quant
+        from ..cache.nvfp4 import CacheLayer_nvfp4
+        from ..cache.fp8 import CacheLayer_fp8
+        from ..cache.qsa import (
+            CacheLayer_qsa, CacheLayer_qsa_quant, CacheLayer_qsa_nvfp4, CacheLayer_qsa_fp8,
+        )
+        if issubclass(default, CacheLayer_nvfp4):
+            return CacheLayer_qsa_nvfp4, kwargs
+        if issubclass(default, CacheLayer_fp8):
+            return CacheLayer_qsa_fp8, kwargs
         if issubclass(default, CacheLayer_quant):
             return CacheLayer_qsa_quant, kwargs
         assert issubclass(default, CacheLayer_fp16), \
