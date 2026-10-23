@@ -122,6 +122,29 @@ class CacheLayer_nvfp4(CacheLayer):
         return self.k, self.v
 
 
+    def stage_range(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor, extra: int) -> tuple:
+        """Dequantize only the pages each sequence uses (+ ``extra`` rows of new K/V, which the
+        caller has just written) into a contiguous fp16 staging pool with a remapped block_table.
+        O(used) work and allocation instead of O(pool); the resulting (k_stage, v_stage, bt_stage)
+        triple has the pool layout the generic-tier backends already understand."""
+        bsz = block_table.shape[0]
+        nblocks = [max(1, (int(cache_seqlens[b]) + extra + PAGE_SIZE - 1) // PAGE_SIZE) for b in range(bsz)]
+        total = sum(nblocks)
+        h, half_d = self.shape4[2], self.shape4[3]
+        ks = torch.empty((total, PAGE_SIZE, h, half_d * 2), dtype = torch.float16, device = self.k.device)
+        vs = torch.empty_like(ks)
+        bt_stage = torch.zeros((bsz, max(nblocks)), dtype = torch.int32, device = block_table.device)
+        slot = 0
+        for b in range(bsz):
+            nb = nblocks[b]
+            phys = block_table[b, :nb].long()
+            ks[slot:slot + nb] = nvfp4_dequantize(self.k[phys].int(), self.ks[phys].half())
+            vs[slot:slot + nb] = nvfp4_dequantize(self.v[phys].int(), self.vs[phys].half())
+            bt_stage[b, :nb] = torch.arange(slot, slot + nb, dtype = torch.int32, device = block_table.device)
+            slot += nb
+        return ks, vs, bt_stage
+
+
     def dequant_full(self) -> tuple:
         k = nvfp4_dequantize(self.k.int(), self.ks.half()) if self.k is not None else None
         v = nvfp4_dequantize(self.v.int(), self.vs.half()) if self.v is not None else None

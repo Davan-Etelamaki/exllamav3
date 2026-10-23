@@ -127,6 +127,7 @@ def attn_dispatch(
     fp8_fast = False
     k_scales = None
     v_scales = None
+    nvfp4_generic = False
     if cache is not None:
         assert block_table is not None
         assert cache_seqlens is not None
@@ -171,8 +172,20 @@ def attn_dispatch(
                 k_cache = k_cache.to(torch.half)
                 v_cache = v_cache.to(torch.half)
             elif isinstance(layer, CacheLayer_nvfp4) and k_cache is not None:
-                # Generous fp16 copies; the post-hook re-quantizes the new K/V into the pages
-                k_cache, v_cache = layer.dequant_full()
+                # Bounded staging: pre-write quantizes the new K/V into the pages, then only the
+                # used pages are dequantized into a contiguous staging pool. The generic backends
+                # get the pool-shaped coherent triple (k_stage, v_stage, bt_stage); the post-hook
+                # is suppressed since the pages already carry the appended rows. q is cast at the
+                # edge: the downstream fp16-only gates were the hard crash for bf16-engine mode
+                nvfp4_generic = True
+                if q.dtype != torch.float16:
+                    q = q.half()
+                if k is not None and k.dtype != torch.float16:
+                    k = k.half()
+                if v is not None and v.dtype != torch.float16:
+                    v = v.half()
+                layer.update_kv(cache_seqlens, block_table, k, v, q_len)
+                k_cache, v_cache, block_table = layer.stage_range(cache_seqlens, block_table, q_len)
     else:
         k_cache, v_cache = None, None
 
@@ -234,7 +247,7 @@ def attn_dispatch(
 
     # Update cache (quant-direct mode wrote the new K/V before the attention call; the
     # nvfp4/fp8 Triton mode appended them in-kernel during it)
-    if cache is not None and q_cache is None and not fp8_fast:
+    if cache is not None and q_cache is None and not fp8_fast and not nvfp4_generic:
         if isinstance(cache, CacheLayer):
             cache.update_kv(cache_seqlens, block_table, k_cache, v_cache, q_len)
         elif isinstance(cache, Cache):
