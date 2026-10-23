@@ -2629,18 +2629,20 @@ def _paged_kv_update_nvfp4_kernel(
 
 @triton.jit
 def _nvfp4_decode(codes, scale):
-    """int32 code tile x fp16 scale tile -> fp16 value tile"""
-    idx = codes & 7
-    sgn = codes >> 3
-    mag = tl.zeros(idx.shape, dtype = tl.float16)
-    mag = tl.where(idx == 1, 0.5, mag)
-    mag = tl.where(idx == 2, 1.0, mag)
-    mag = tl.where(idx == 3, 1.5, mag)
-    mag = tl.where(idx == 4, 2.0, mag)
-    mag = tl.where(idx == 5, 3.0, mag)
-    mag = tl.where(idx == 6, 4.0, mag)
-    mag = tl.where(idx == 7, 6.0, mag)
-    return tl.where(sgn > 0, -mag, mag) * scale
+    """int32 code tile x fp16 scale tile -> fp16 value tile.
+
+    Exact f16 bit-assembly of the E2M1 lattice: for magnitude index m = code & 7
+    the positive values {0, .5, 1, 1.5, 2, 3, 4, 6} are f16 patterns
+    ((14+(m>>1))<<10)|((m&1)<<9) for m>=2, with m==1 -> 0x3800 (0.5) and m==0 ->
+    0 handled by two SELs; sign is one XOR. Bit-identical to the previous
+    seven-SEL cascade (exhaustive over all 16 codes:
+    tests/kernels/attention/test_nvfp4_kv_decode.py), ~3x fewer int ops."""
+    m = codes & 7
+    bits = ((14 + (m >> 1)) << 10) | ((m & 1) << 9)
+    bits = tl.where(m == 1, 0x3800, bits)
+    bits = tl.where(m == 0, 0, bits)
+    bits = bits ^ ((codes >> 3) << 15)
+    return bits.to(tl.int16).to(tl.float16, bitcast = True) * scale
 
 @triton.jit
 def _nvfp4_kt_tile(k4, ks, phys, page_off, mask_n, kv_head,
