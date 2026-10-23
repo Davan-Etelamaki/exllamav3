@@ -143,6 +143,59 @@ def t_arith_v1_paired_bench():
           f"arith-median {m2:.1f}us ({mb / (m2 * 1e-3):.0f} GB/s)  arith/gather {m2 / m1:.2f}")
 
 
+def t_prmt_full_code_coverage_bitwise():
+    if not hasattr(fmt, "decode_weights_gpu_prmt"):
+        raise AssertionError("decode_weights_gpu_prmt missing")       # test-first gate
+    torch.manual_seed(7)
+    # (a) every finite E4M3 scale code, random payloads — bitwise vs oracle
+    sf = torch.arange(0x7F, dtype=torch.uint8).unsqueeze(1).repeat(1, 256)
+    packed = torch.randint(0, 256, (127, 256 * 8), dtype=torch.uint8)
+    ref = fmt.decode_weights(packed, sf, 1.0, torch.float32)
+    v3 = fmt.decode_weights_gpu_prmt(packed.cuda(), sf.cuda(), 1.0, torch.float32).cpu()
+    assert torch.equal(ref, v3)
+    assert ref.abs().unique().numel() > 100, "scale sweep collapsed"  # positive control
+    # (b) localization control: forcing one byte then flipping its lo-sign bit must
+    # move EXACTLY ONE column, at the predicted index — proves the comparison bites
+    packed3 = packed[:1, :64].clone()
+    sf3 = torch.full((1, 8), 0x38, dtype=torch.uint8)                 # scale 1.0
+    packed3[0, 5] = 0x01                                              # lo=+0.5, hi=+0.0
+    base = fmt.decode_weights_gpu_prmt(packed3.cuda(), sf3.cuda(), 1.0, torch.float32).cpu()
+    packed3[0, 5] ^= 0x08                                             # negate lo nibble
+    sab = fmt.decode_weights_gpu_prmt(packed3.cuda(), sf3.cuda(), 1.0, torch.float32).cpu()
+    assert base[0, 10] == 0.5 and sab[0, 10] == -0.5
+    d = (base != sab).nonzero(as_tuple=True)
+    assert d[0].tolist() == [0] and d[1].tolist() == [10], (d[0].tolist(), d[1].tolist())
+    # (c) every packed byte 0x00..0xFF, scale pinned to 1.0 — bitwise vs oracle
+    packed2 = torch.arange(256, dtype=torch.uint8).unsqueeze(1).repeat(1, 32)
+    sf2 = torch.full((256, 4), 0x38, dtype=torch.uint8)
+    ref2 = fmt.decode_weights(packed2, sf2, 1.0, torch.float32)
+    v2 = fmt.decode_weights_gpu_prmt(packed2.cuda(), sf2.cuda(), 1.0, torch.float32).cpu()
+    assert torch.equal(ref2, v2)
+    assert ref2.unique().numel() == 15, ref2.unique().numel()
+
+
+def t_prmt_triple_paired_bench():
+    p, s, g = _case(*_PROD, seed=42)
+    pc, sc = p.cuda(), s.cuda()
+    a = fmt.decode_weights_gpu(pc, sc, g)                             # fence on SAME run
+    b = fmt.decode_weights_gpu_arith(pc, sc, g)
+    c = fmt.decode_weights_gpu_prmt(pc, sc, g)
+    assert torch.equal(a, b) and torch.equal(a, c)
+    import statistics
+    t1, t2, t3 = [], [], []
+    for _ in range(5):                                                # interleaved triples
+        t1.append(_bench(lambda: fmt.decode_weights_gpu(pc, sc, g), iters=10, warmup=0))
+        t2.append(_bench(lambda: fmt.decode_weights_gpu_arith(pc, sc, g), iters=10, warmup=0))
+        t3.append(_bench(lambda: fmt.decode_weights_gpu_prmt(pc, sc, g), iters=10, warmup=0))
+    m1, m2, m3 = statistics.median(t1), statistics.median(t2), statistics.median(t3)
+    mb = pc.numel() * 5.125 / 1e6
+    print(f"  [{_PROD[0]}x{_PROD[1]} device={torch.cuda.get_device_name(0)} sm120 "
+          f"regime=shared-GPU-serving] gather {m1:.1f}us ({mb / (m1 * 1e-3):.0f} GB/s) "
+          f"arith {m2:.1f}us ({mb / (m2 * 1e-3):.0f} GB/s) "
+          f"prmt {m3:.1f}us ({mb / (m3 * 1e-3):.0f} GB/s)  prmt/gather {m3 / m1:.2f}  "
+          f"gather-spread {max(t1) - min(t1):.1f}us")
+
+
 def main() -> int:
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_") and callable(v)]
     assert tests

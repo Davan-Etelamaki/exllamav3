@@ -236,6 +236,67 @@ if _HAS_TRITON:
 
 
 
+# Byte-permute decode: the eight E2M1 magnitudes are exactly representable in f16 as
+# {0x0000} ∪ {high-byte 0x38,0x3C,0x3E,0x40,0x42,0x44,0x46, low-byte 0}. A data-driven
+# byte permute over two b32 registers holding those eight LUT bytes replaces the whole
+# magnitude select chain; the sign nibble costs one XOR on the f16 sign bit. Derived
+# directly from the lattice in this file — no table, no gather.
+if _HAS_TRITON:
+    _PRMT_ASM = tl.constexpr("""
+{
+.reg .b32 cc, aa, bb, dd, ss, v1, v2;
+.reg .b16 l1, h2;
+mov.u32 cc, $2;
+mov.u32 aa, 0x3E3C3800;
+mov.u32 bb, 0x46444240;
+and.b32 ss, cc, 7;
+prmt.b32 dd, aa, bb, ss;
+shl.b32 v1, dd, 8;
+and.b32 dd, cc, 8;
+shl.b32 dd, dd, 12;
+xor.b32 v1, v1, dd;
+shr.u32 ss, cc, 4;
+and.b32 ss, ss, 7;
+prmt.b32 dd, aa, bb, ss;
+shl.b32 v2, dd, 8;
+and.b32 dd, cc, 0x80;
+shl.b32 dd, dd, 8;
+xor.b32 v2, v2, dd;
+mov.b32 {l1, h2}, v1;
+mov.b16 $0, l1;
+mov.b32 {l1, h2}, v2;
+mov.b16 $1, l1;
+}
+""")
+
+    @triton.jit
+    def _decode_kernel_prmt(packed_ptr, sf_ptr, e2m1_ptr, e4m3_ptr, out_ptr,
+                            g, cols, in_bytes, nb_sf, n_blk,
+                            BLOCK: tl.constexpr):
+        """Byte-granular PRMT decode: both nibbles of one packed byte decode per
+        permute pair, joined back into column order. E4M3 scale stays arithmetic.
+        Table args kept for the shared launch signature; intentionally unused."""
+        pid = tl.program_id(0)
+        row = pid // n_blk
+        blk = pid % n_blk
+        NB: tl.constexpr = BLOCK // 2
+        ob = blk * NB + tl.arange(0, NB)
+        mask_b = ob < in_bytes
+        p = tl.load(packed_ptr + row * in_bytes + ob, mask=mask_b, other=0).to(tl.int32)
+        vlo, vhi = tl.inline_asm_elementwise(_PRMT_ASM, "=h,=h,r", [p],
+                                             dtype=(tl.float16, tl.float16),
+                                             is_pure=True, pack=1)
+        v = tl.reshape(tl.join(vlo, vhi), (BLOCK,)).to(tl.float32)   # [lo0 hi0 lo1 ...]
+        offs = blk * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < cols
+        sb = tl.load(sf_ptr + row * nb_sf + offs // 16, mask=mask, other=0).to(tl.int32) & 0x7F
+        e4m3_bits = ((120 + (sb >> 3)) << 23) | ((sb & 7) << 20)
+        sf = tl.where(sb < 8, (sb & 7).to(tl.float32) * 0.001953125,
+                      e4m3_bits.to(tl.float32, bitcast=True))
+        w = (v * sf) * g
+        tl.store(out_ptr + row * cols + offs, w.to(out_ptr.dtype.element_ty), mask=mask)
+
+
 def _decode_launch(packed: torch.Tensor, scale_bytes: torch.Tensor, global_scale: float,
                    out_dtype: torch.dtype, kernel, num_warps: int, block_cols: int) -> torch.Tensor:
     """Shared validation + launch contract for every GPU decode kernel variant."""
@@ -282,3 +343,13 @@ def decode_weights_gpu_arith(packed: torch.Tensor, scale_bytes: torch.Tensor, gl
     patterns instead of two dependent table lookups. Same bitwise output contract."""
     return _decode_launch(packed, scale_bytes, global_scale, out_dtype,
                           _decode_kernel_arith, num_warps, block_cols)
+
+
+def decode_weights_gpu_prmt(packed: torch.Tensor, scale_bytes: torch.Tensor, global_scale: float,
+                            out_dtype: torch.dtype = torch.float16, num_warps: int = 4,
+                            block_cols: int = 512) -> torch.Tensor:
+    """Byte-permute variant: E2M1 magnitudes come from a register-resident LUT driven by
+    the nibble itself (two permutes per packed byte), sign by one XOR; f16 magnitudes are
+    exact in f32 so the downstream products are bit-identical to the other variants."""
+    return _decode_launch(packed, scale_bytes, global_scale, out_dtype,
+                          _decode_kernel_prmt, num_warps, block_cols)
