@@ -6,6 +6,7 @@ import numpy as np
 from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
+from .quant.nvfp4_tensor import Nvfp4PackedWeight
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
 from ..ext import exllamav3_ext as ext
@@ -193,6 +194,33 @@ class Linear(Module):
         return w.half()
 
 
+    # NVFP4 packed triple spelling (ours): U8 payload [rows, cols/2] with two e2m1 nibbles per
+    # byte, U8 E4M3 block scales [rows, cols/16], f32 scalar global scale at {key}.weight_scale_2.
+    # Geometry is the discriminator: an exact (rows, cols_packed/8) scale grid is the 16-element
+    # NVFP4 block grid; coarser grids (E8M0 128x128 / 1x32) and 1-D per-tensor spellings are not
+    # NVFP4 and fall through to their existing paths. Returns (packed, scales, g) or None.
+    @staticmethod
+    def nvfp4_triple(stc, key: str, dev) -> tuple[torch.Tensor, torch.Tensor, float] | None:
+        if not (stc.has_tensor(key + ".weight") and stc.has_tensor(key + ".weight_scale") and
+                stc.has_tensor(key + ".weight_scale_2")):
+            return None
+        w = stc.get_tensor(key + ".weight", dev, optional = True, no_defer = True)
+        s = stc.get_tensor(key + ".weight_scale", dev, optional = True, no_defer = True)
+        g = stc.get_tensor(key + ".weight_scale_2", dev, optional = True, no_defer = True)
+        if w is None or s is None or g is None:
+            return None
+        if w.dim() != 2 or w.dtype != torch.uint8:
+            return None
+        if s.dim() != 2 or s.dtype != torch.uint8:
+            return None
+        if g.numel() != 1 or not g.is_floating_point():
+            return None
+        rows, half_cols = w.shape
+        if half_cols % 8 != 0 or s.shape != (rows, half_cols // 8):
+            return None
+        return w, s, float(g.reshape(-1)[0].item())
+
+
     def load_fp16(self, key: str | list[str]) -> bool:
 
         if self.config.stc.has_tensor_group(key, ["weight"]):
@@ -213,35 +241,53 @@ class Linear(Module):
                 dev = "cpu" if self.is_sliced else self.device
                 pad1 = (self.out_features,) if not self.is_sliced else None
                 pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
-                scale_q = self.config.stc.get_tensor(key + ".scale", dev, optional = True, no_defer = True)
-                if scale_q is None and self.config.stc.has_tensor(key + ".weight_scale"):
-                    # MiMo-V2 routed experts: same E8M0 block grid, named "weight_scale" and
-                    # stored as U8 exponent bytes. Only 2D uint8 scales route here; float
-                    # "weight_scale" tensors keep the per-row/per-tensor fp8 path below. Fetched
-                    # untransposed because the dequant runs in checkpoint (out, in) orientation
-                    ws_q = self.config.stc.get_tensor(key + ".weight_scale", dev, optional = True, no_defer = True)
-                    if ws_q is not None and ws_q.dim() == 2 and ws_q.dtype == torch.uint8:
-                        scale_q = ws_q
-                if scale_q is not None and scale_q.dim() == 2:
-                    # DeepSeek-V4 style: fp8/fp4 blocks + E8M0 scale grid, checkpoint
-                    # orientation (out, in); dequant first, then orient/pad like a plain load
-                    w_raw = self.config.stc.get_tensor(key + ".weight", dev, no_defer = True, arena = False)
-                    weight = self.dequant_e8m0_blocks_(w_raw, scale_q)
+                nv = Linear.nvfp4_triple(self.config.stc, key, dev) \
+                    if isinstance(key, str) and not self.is_sliced else None
+                if nv is not None:
+                    # NVFP4 packed triple (U8 nibble payload, U8 E4M3 block scales, f32 global
+                    # scale): decode through the validating container, then orient/pad exactly
+                    # like a plain fp16 load. Scale-grid geometry was checked at detection, so
+                    # coarse E8M0 grids never land here.
+                    packed, nv_scales, nv_g = nv
+                    weight = Nvfp4PackedWeight(packed.contiguous(), nv_scales.contiguous(),
+                                               nv_g).decode(torch.float16)
                     if self.transposed_load:
                         weight = weight.T
                     weight = weight.contiguous() if self.is_sliced else self.pad_out(weight.contiguous())
-                    bias = None
+                    weight = weight.to(self.device)
+                    bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True,
+                                                      optional = True, pad_to = pad1, no_defer = True)
                     scale = scale_inv = None
                 else:
-                    scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
-                    scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
-                    assert scale is None or scale_inv is None
-                    # Scaled loads are rewritten into a new tensor below: keep the raw load out of
-                    # the loader's slab blocks, where the dead copy would otherwise stay resident
-                    rescaled = scale is not None or scale_inv is not None or self.weight_scale != 1.0
-                    no_defer = rescaled
-                    weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer, arena = not rescaled)
-                    bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer, arena = not rescaled)
+                    scale_q = self.config.stc.get_tensor(key + ".scale", dev, optional = True, no_defer = True)
+                    if scale_q is None and self.config.stc.has_tensor(key + ".weight_scale"):
+                        # MiMo-V2 routed experts: same E8M0 block grid, named "weight_scale" and
+                        # stored as U8 exponent bytes. Only 2D uint8 scales route here; float
+                        # "weight_scale" tensors keep the per-row/per-tensor fp8 path below. Fetched
+                        # untransposed because the dequant runs in checkpoint (out, in) orientation
+                        ws_q = self.config.stc.get_tensor(key + ".weight_scale", dev, optional = True, no_defer = True)
+                        if ws_q is not None and ws_q.dim() == 2 and ws_q.dtype == torch.uint8:
+                            scale_q = ws_q
+                    if scale_q is not None and scale_q.dim() == 2:
+                        # DeepSeek-V4 style: fp8/fp4 blocks + E8M0 scale grid, checkpoint
+                        # orientation (out, in); dequant first, then orient/pad like a plain load
+                        w_raw = self.config.stc.get_tensor(key + ".weight", dev, no_defer = True, arena = False)
+                        weight = self.dequant_e8m0_blocks_(w_raw, scale_q)
+                        if self.transposed_load:
+                            weight = weight.T
+                        weight = weight.contiguous() if self.is_sliced else self.pad_out(weight.contiguous())
+                        bias = None
+                        scale = scale_inv = None
+                    else:
+                        scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
+                        scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
+                        assert scale is None or scale_inv is None
+                        # Scaled loads are rewritten into a new tensor below: keep the raw load out of
+                        # the loader's slab blocks, where the dead copy would otherwise stay resident
+                        rescaled = scale is not None or scale_inv is not None or self.weight_scale != 1.0
+                        no_defer = rescaled
+                        weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer, arena = not rescaled)
+                        bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer, arena = not rescaled)
                 if scale is not None:
                     weight = self.apply_fp8_scales_(weight, scale)
                 elif scale_inv is not None:
