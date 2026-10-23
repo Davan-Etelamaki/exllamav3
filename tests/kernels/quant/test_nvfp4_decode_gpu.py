@@ -107,6 +107,42 @@ def t_prod_shape_latency_fence():
           f"{t_base:.1f}us  speedup {t_base / t_k:.2f}x")
 
 
+def t_arith_full_code_coverage_bitwise():
+    # (a) every finite E4M3 scale code 0x00..0x7E as a full row, random payloads
+    sf = torch.arange(0x7F, dtype=torch.uint8).unsqueeze(1).repeat(1, 256)      # 127 x 256
+    packed = torch.randint(0, 256, (127, 256 * 8), dtype=torch.uint8)
+    ref = fmt.decode_weights(packed, sf, 1.0, torch.float32)
+    v1 = fmt.decode_weights_gpu(packed.cuda(), sf.cuda(), 1.0, torch.float32).cpu()
+    v2 = fmt.decode_weights_gpu_arith(packed.cuda(), sf.cuda(), 1.0, torch.float32).cpu()
+    assert torch.equal(ref, v1) and torch.equal(ref, v2)
+    assert ref.abs().unique().numel() > 100, "scale sweep collapsed"          # positive control
+    # (b) every packed byte 0x00..0xFF as a full row, scale pinned to 1.0 (0x38)
+    packed2 = torch.arange(256, dtype=torch.uint8).unsqueeze(1).repeat(1, 32)  # 256 x 32 bytes
+    sf2 = torch.full((256, 4), 0x38, dtype=torch.uint8)                    # 32 bytes = 4 blocks
+    ref2 = fmt.decode_weights(packed2, sf2, 1.0, torch.float32)
+    v1b = fmt.decode_weights_gpu(packed2.cuda(), sf2.cuda(), 1.0, torch.float32).cpu()
+    v2b = fmt.decode_weights_gpu_arith(packed2.cuda(), sf2.cuda(), 1.0, torch.float32).cpu()
+    assert torch.equal(ref2, v1b) and torch.equal(ref2, v2b)
+    assert ref2.unique().numel() == 15, ref2.unique().numel()                  # 14 signed + one zero
+
+
+def t_arith_v1_paired_bench():
+    p, s, g = _case(*_PROD, seed=42)
+    pc, sc = p.cuda(), s.cuda()
+    assert torch.equal(fmt.decode_weights_gpu(pc, sc, g),
+                       fmt.decode_weights_gpu_arith(pc, sc, g))               # fence on SAME run
+    import statistics
+    t1, t2 = [], []
+    for _ in range(7):                                                        # interleaved pairs
+        t1.append(_bench(lambda: fmt.decode_weights_gpu(pc, sc, g), iters=10, warmup=0))
+        t2.append(_bench(lambda: fmt.decode_weights_gpu_arith(pc, sc, g), iters=10, warmup=0))
+    m1, m2 = statistics.median(t1), statistics.median(t2)
+    mb = pc.numel() * 5.125 / 1e6
+    print(f"  [{_PROD[0]}x{_PROD[1]} device={torch.cuda.get_device_name(0)} sm120 "
+          f"regime=shared-GPU-serving] gather-median {m1:.1f}us ({mb / (m1 * 1e-3):.0f} GB/s) "
+          f"arith-median {m2:.1f}us ({mb / (m2 * 1e-3):.0f} GB/s)  arith/gather {m2 / m1:.2f}")
+
+
 def main() -> int:
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_") and callable(v)]
     assert tests

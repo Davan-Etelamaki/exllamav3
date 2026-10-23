@@ -206,11 +206,39 @@ if _HAS_TRITON:
         tl.store(out_ptr + row * cols + offs, w.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-def decode_weights_gpu(packed: torch.Tensor, scale_bytes: torch.Tensor, global_scale: float,
-                       out_dtype: torch.dtype = torch.float16, num_warps: int = 4,
-                       block_cols: int = 512) -> torch.Tensor:
-    """Fused GPU twin of decode_weights; same geometry/scale validation, bitwise-equal
-    output for identical inputs (guaranteed by the conformance suite, not assumed)."""
+if _HAS_TRITON:
+
+    @triton.jit
+    def _decode_kernel_arith(packed_ptr, sf_ptr, e2m1_ptr, e4m3_ptr, out_ptr,
+                             g, cols, in_bytes, nb_sf, n_blk,
+                             BLOCK: tl.constexpr):
+        """Decode without table gathers: E2M1 and E4M3 magnitudes are assembled from
+        exact f32 bit patterns (finite lattice ⇒ integer-assembled significands).
+        Table args kept for the shared launch signature; intentionally unused."""
+        pid = tl.program_id(0)
+        row = pid // n_blk
+        blk = pid % n_blk
+        offs = blk * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < cols
+        p = tl.load(packed_ptr + row * in_bytes + offs // 2, mask=mask, other=0).to(tl.int32)
+        nib = tl.where((offs % 2) == 0, p & 0xF, (p >> 4) & 0xF)   # low nibble first
+        m = nib & 0x07
+        e2m1_bits = ((126 + (m >> 1)) << 23) | ((m & 1) << 22)     # codes>=2: exact normals
+        mag = tl.where(m >= 2, e2m1_bits.to(tl.float32, bitcast=True),
+              tl.where(m == 1, 0.5, 0.0))                          # 0.5 subnormal; zero
+        val = tl.where((nib >> 3) != 0, -mag, mag)
+        sb = tl.load(sf_ptr + row * nb_sf + offs // 16, mask=mask, other=0).to(tl.int32) & 0x7F
+        e4m3_bits = ((120 + (sb >> 3)) << 23) | ((sb & 7) << 20)   # codes>=8: exact normals
+        sf = tl.where(sb < 8, (sb & 7).to(tl.float32) * 0.001953125,   # subnormals c*2^-9
+                      e4m3_bits.to(tl.float32, bitcast=True))
+        w = (val * sf) * g
+        tl.store(out_ptr + row * cols + offs, w.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+
+def _decode_launch(packed: torch.Tensor, scale_bytes: torch.Tensor, global_scale: float,
+                   out_dtype: torch.dtype, kernel, num_warps: int, block_cols: int) -> torch.Tensor:
+    """Shared validation + launch contract for every GPU decode kernel variant."""
     if not _HAS_TRITON:
         raise RuntimeError("triton unavailable on this host")
     if packed.ndim != 2 or scale_bytes.ndim != 2:
@@ -231,8 +259,26 @@ def decode_weights_gpu(packed: torch.Tensor, scale_bytes: torch.Tensor, global_s
     e2m1_tab, e4m3_tab = _gpu_tables(packed.device)
     out = torch.empty((out_, cols), dtype=out_dtype, device=packed.device)
     n_blk = (cols + block_cols - 1) // block_cols
-    _decode_kernel[(out_ * n_blk,)](
+    kernel[(out_ * n_blk,)](
         packed, u, e2m1_tab, e4m3_tab, out,
         float(global_scale), cols, inc2, u.shape[1], n_blk,
         BLOCK=block_cols, num_warps=num_warps)
     return out
+
+
+def decode_weights_gpu(packed: torch.Tensor, scale_bytes: torch.Tensor, global_scale: float,
+                       out_dtype: torch.dtype = torch.float16, num_warps: int = 4,
+                       block_cols: int = 512) -> torch.Tensor:
+    """Fused GPU twin of decode_weights; same geometry/scale validation, bitwise-equal
+    output for identical inputs (guaranteed by the conformance suite, not assumed)."""
+    return _decode_launch(packed, scale_bytes, global_scale, out_dtype,
+                          _decode_kernel, num_warps, block_cols)
+
+
+def decode_weights_gpu_arith(packed: torch.Tensor, scale_bytes: torch.Tensor, global_scale: float,
+                             out_dtype: torch.dtype = torch.float16, num_warps: int = 4,
+                             block_cols: int = 512) -> torch.Tensor:
+    """Gather-free variant: both lattices assembled arithmetically from exact f32 bit
+    patterns instead of two dependent table lookups. Same bitwise output contract."""
+    return _decode_launch(packed, scale_bytes, global_scale, out_dtype,
+                          _decode_kernel_arith, num_warps, block_cols)
