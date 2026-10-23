@@ -101,7 +101,8 @@ def t_prod_shape_latency_fence():
                        fmt.decode_weights(pc, sc, g, torch.float16))   # fence on SAME run
     mb = pc.numel() * 5.125 / 1e6                      # bytes/elem: packed 1 + sf 1/8 + f16 out 4 per packed byte
     assert t_k < t_base, (t_k, t_base)
-    print(f"  [{_PROD[0]}x{_PROD[1]} regime=shared-GPU-serving] fused {t_k:.1f}us "
+    print(f"  [{_PROD[0]}x{_PROD[1]} device={torch.cuda.get_device_name(0)} sm{torch.cuda.get_device_capability(0)[0]}{torch.cuda.get_device_capability(0)[1]}"
+          f" regime=shared-GPU-serving] fused {t_k:.1f}us "
           f"({mb / (t_k * 1e-3):.0f} GB/s incl-out) vs torch-baseline "
           f"{t_base:.1f}us  speedup {t_base / t_k:.2f}x")
 
