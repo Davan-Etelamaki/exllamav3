@@ -111,22 +111,36 @@ if _HAVE_TRITON:
         tl.atomic_add(Out + rm[:, None] * N + rn[None, :], acc, mask=mmask[:, None])
 
 
-def _validate_triple(packed, scales, global_scale):
+def validate_triple(packed, scales, global_scale):
+    """Full admission check (runs E4M3 illegal-byte scan; call once at load).
+
+    Returns (rows, cols, g). Hot paths below trust already-validated tensors;
+    this scan touches every scale byte and must not run per forward.
+    """
+    rows, cols, g = _triple_dims(packed, scales, global_scale)
+    bad = bool(((scales & 0x7F) == 0x7F).any().item()) or bool((scales & 0x80).any().item())
+    if bad:
+        raise ValueError("illegal E4M3 scale byte (NaN pattern or sign bit) in scales")
+    return rows, cols, g
+
+
+def _triple_dims(packed, scales, global_scale):
+    """Cheap host-side consistency checks only (dtypes/geometry); no device sync."""
     if packed.dtype is not torch.uint8 or packed.ndim != 2:
         raise ValueError("packed must be a 2-D uint8 tensor [rows, cols//2]")
     rows, half = packed.shape
     if half % 8:
         raise ValueError("packed row length must be a multiple of 8")
     cols = half * 2
-    if scales.dtype is not torch.uint8 or scales.shape != (rows, cols // 16):
+    if scales.dtype is not torch.uint8 or scales.ndim != 2 or scales.shape != (rows, cols // 16):
         raise ValueError(f"scales must be uint8 {(rows, cols // 16)}")
-    bad = bool(((scales & 0x7F) == 0x7F).any().item()) or bool((scales & 0x80).any().item())
-    if bad:
-        raise ValueError("illegal E4M3 scale byte (NaN pattern or sign bit) in scales")
     g = float(global_scale)
     if not (g > 0.0) or not (g == g and g < float("inf")):
         raise ValueError("global scale must be a positive finite scalar")
     return rows, cols, g
+
+
+_validate_triple = _triple_dims   # hot paths: geometry-only, scan-free
 
 
 def _direct_shape_ok(x, rows, cols, bn, bk, sk):

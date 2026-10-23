@@ -89,8 +89,68 @@ def main():
     ok, err, den = rel_ok(y, ref)
     step("cpu_fallback", ok, f"maxerr={err:.4f} den={den:.1f}")
 
-    npass = 5 if not fails else 5 - len(fails)
-    print(f"W4A16-STEPS steps=5 pass={npass} fail={len(fails)} "
+    # ---- inner-class lane (engine wiring surface) -----------------------------
+    from exllamav3.modules.quant.nvfp4_linear import LinearNVFP4Packed, pad_triple
+
+    dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    pkd, scd = pk.to(dev), sc.to(dev)
+    bias = (torch.randn(N, device=dev) * 0.1).half()
+    lin = LinearNVFP4Packed(K, N, pkd, scd, gs, bias, key="blk.mlp.test")
+
+    # ---- 6: inner.forward numerics + shape/dtype handling ---------------------
+    ref_dec = fmt.decode_weights(pkd, scd, gs, torch.float32)
+    x3 = (torch.randn(2, 3, K, device=dev) * 0.5)
+    y = lin.forward(x3.half(), {})
+    ref = x3.float() @ ref_dec.t() + bias.float()
+    ok, err, den = rel_ok(y, ref)
+    ok = ok and y.shape == (2, 3, N) and y.dtype is torch.float16
+    y_f = lin.forward(x3.half(), {}, out_dtype=torch.float32)
+    ok = ok and y_f.dtype is torch.float32
+    step("inner_forward", ok, f"3-D x + bias + out_dtype vs oracle (den={den:.1f})")
+
+    # ---- 7: engine duck-type surface ------------------------------------------
+    surf = all(hasattr(lin, a) for a in
+               ("quant_type", "forward", "unload", "get_tensors", "get_weight_tensor",
+                "get_bias_tensor", "swap_cpu", "unswap_cpu", "bc", "bias",
+                "in_features", "out_features"))
+    ok = surf and lin.quant_type == "nvfp4"
+    wt = lin.get_weight_tensor()
+    ok = ok and wt.shape == (K, N) and torch.equal(lin.get_bias_tensor(), bias)
+    ts = lin.get_tensors("blk.mlp.test")
+    ok = ok and ("blk.mlp.test.weight" in ts
+                 and ts["blk.mlp.test.weight"].shape == (N, K))
+    lin.unload()
+    step("inner_surface", ok, "engine .inner.* consumers find every attribute they call")
+
+    # ---- 8: swap_cpu / unswap_cpu round trip ----------------------------------
+    dev_before = pkd.device
+    lin.swap_cpu()
+    mid_ok = lin.packed.device.type == "cpu"
+    lin.unswap_cpu()
+    ok = mid_ok and lin.packed.device == dev_before and lin.scales.device == dev_before
+    if ok:
+        y2 = lin.forward(x3.half(), {})
+        ok, err, den = rel_ok(y2, ref)
+    step("inner_swap_roundtrip", ok, "cpu park + VRAM restore keeps outputs on-oracle")
+
+    # ---- 9: packed-space padding helper ----------------------------------------
+    rp, cp = N + 32, K + 64
+    pk_p, sc_p = pad_triple(pkd, scd, rp, cp)
+    ok = pk_p.shape == (rp, cp // 2) and sc_p.shape == (rp, cp // 16)
+    dec_p = fmt.decode_weights(pk_p, sc_p, gs, torch.float32)
+    ok = (ok and torch.equal(dec_p[:N, :K], ref_dec)
+          and dec_p[N:, :].abs().sum() == 0 and dec_p[:N, K:].abs().sum() == 0)
+    lin_p = LinearNVFP4Packed(cp, rp, pk_p, sc_p, gs, None)
+    xp2 = torch.nn.functional.pad(x3.half(), (0, cp - K))
+    ypl = lin_p.forward(xp2, {})
+    ref_p = torch.nn.functional.pad(x3.float() @ ref_dec.t(), (0, rp - N))
+    okr, _, _ = rel_ok(ypl, ref_p)
+    ok = ok and okr
+    step("pad_triple", ok, f"packed-space pad to ({rp},{cp}): exact head + zeros tail")
+
+    nsteps = 9
+    npass = nsteps if not fails else nsteps - len(fails)
+    print(f"W4A16-STEPS steps={nsteps} pass={npass} fail={len(fails)} "
           f"{'DONE-PASS' if not fails else 'DONE-FAIL ' + ','.join(fails)}")
     return 0 if not fails else 1
 

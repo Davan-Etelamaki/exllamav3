@@ -7,6 +7,7 @@ from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
 from .quant.nvfp4_tensor import Nvfp4PackedWeight
+from .quant.nvfp4_linear import LinearNVFP4Packed, pad_triple
 from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
 from ..ext import exllamav3_ext as ext
@@ -223,6 +224,8 @@ class Linear(Module):
 
     def load_fp16(self, key: str | list[str]) -> bool:
 
+        nv_inner = None
+
         if self.config.stc.has_tensor_group(key, ["weight"]):
 
             self.used_alt_key = key == self.alt_key
@@ -245,19 +248,34 @@ class Linear(Module):
                     if isinstance(key, str) and not self.is_sliced else None
                 if nv is not None:
                     # NVFP4 packed triple (U8 nibble payload, U8 E4M3 block scales, f32 global
-                    # scale): decode through the validating container, then orient/pad exactly
-                    # like a plain fp16 load. Scale-grid geometry was checked at detection, so
-                    # coarse E8M0 grids never land here.
+                    # scale). Checkpoint orientation is (out, in) — the packed lane's native
+                    # domain — so transposed loads stay packed resident: pad in packed space
+                    # (zero payload x zero scale contributes exactly zero) and the inner decodes
+                    # inside the matvec. Other orientations take the container decode path
+                    # (orient, then pad) and land as fp16 as before. Scale-grid geometry was
+                    # checked at detection, so coarse E8M0 grids never land here.
                     packed, nv_scales, nv_g = nv
-                    weight = Nvfp4PackedWeight(packed.contiguous(), nv_scales.contiguous(),
-                                               nv_g).decode(torch.float16)
-                    if self.transposed_load:
-                        weight = weight.T
-                    weight = weight.contiguous() if self.is_sliced else self.pad_out(weight.contiguous())
-                    weight = weight.to(self.device)
                     bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True,
                                                       optional = True, pad_to = pad1, no_defer = True)
                     scale = scale_inv = None
+                    if self.transposed_load:
+                        packed, nv_scales = pad_triple(packed, nv_scales,
+                                                       self.out_features, self.in_features)
+                        nv_inner = LinearNVFP4Packed(
+                            self.in_features,
+                            self.out_features,
+                            packed,
+                            nv_scales,
+                            nv_g,
+                            bias,
+                            self.out_dtype,
+                            key = self.key
+                        )
+                    else:
+                        weight = Nvfp4PackedWeight(packed.contiguous(), nv_scales.contiguous(),
+                                                   nv_g).decode(torch.float16)
+                        weight = self.pad_out(weight.contiguous())
+                        weight = weight.to(self.device)
                 else:
                     scale_q = self.config.stc.get_tensor(key + ".scale", dev, optional = True, no_defer = True)
                     if scale_q is None and self.config.stc.has_tensor(key + ".weight_scale"):
@@ -296,6 +314,11 @@ class Linear(Module):
                     weight = (weight.float() * self.weight_scale).to(weight.dtype)
                     if bias is not None:
                         bias = (bias.float() * self.weight_scale).to(bias.dtype)
+
+            if nv_inner is not None:
+                self.inner = nv_inner
+                self.quant_type = nv_inner.quant_type
+                return True
 
             self.inner = LinearFP16(
                 self.in_features,
