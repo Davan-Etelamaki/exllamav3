@@ -22,6 +22,13 @@ from __future__ import annotations
 
 import torch
 
+try:  # soft dependency: the CPU paths and conformance tests work without triton
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except ImportError:      # pragma: no cover - exercised only on triton-less hosts
+    _HAS_TRITON = False
+
 # ---------------------------------------------------------------------------
 # Lattice generation from the FORMAT DEFINITION (generic IEEE-style float bits)
 # ---------------------------------------------------------------------------
@@ -158,3 +165,74 @@ def quantize_weights(w: torch.Tensor, global_scale: float | None = None) -> tupl
     codes = codes.view(out_, inc)
     packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
     return packed, idx, float(global_scale)
+
+# ---------------------------------------------------------------------------
+# GPU decode (fused). v1 is deliberately table-gather and arithmetically
+# identical to decode_weights ((elem * sf) * g, fp32, RN to out dtype) so the
+# conformance suite can demand BITWISE equality against the CPU oracle.
+# Multiply-free lattice variants land only after this fence holds.
+# ---------------------------------------------------------------------------
+
+_GPU_TABLE_CACHE: dict = {}
+
+
+def _gpu_tables(device) -> tuple:
+    key = getattr(device, "index", None)
+    t = _GPU_TABLE_CACHE.get(key)
+    if t is None:
+        t = (_E2M1_TABLE.to(device).contiguous(), _E4M3_TABLE.to(device).contiguous())
+        _GPU_TABLE_CACHE[key] = t
+    return t
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _decode_kernel(packed_ptr, sf_ptr, e2m1_ptr, e4m3_ptr, out_ptr,
+                       g, cols, in_bytes, nb_sf, n_blk,
+                       BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        row = pid // n_blk
+        blk = pid % n_blk
+        offs = blk * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < cols
+        p = tl.load(packed_ptr + row * in_bytes + offs // 2, mask=mask, other=0).to(tl.int32)
+        nib = tl.where((offs % 2) == 0, p & 0xF, (p >> 4) & 0xF)   # low nibble first
+        mag = tl.load(e2m1_ptr + (nib & 0x07), mask=mask, other=0.0)
+        val = tl.where((nib >> 3) != 0, -mag, mag)
+        sb = tl.load(sf_ptr + row * nb_sf + offs // 16, mask=mask, other=0).to(tl.int32) & 0x7F
+        sf = tl.load(e4m3_ptr + sb, mask=mask, other=0.0)
+        w = (val * sf) * g
+        tl.store(out_ptr + row * cols + offs, w.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def decode_weights_gpu(packed: torch.Tensor, scale_bytes: torch.Tensor, global_scale: float,
+                       out_dtype: torch.dtype = torch.float16, num_warps: int = 4,
+                       block_cols: int = 512) -> torch.Tensor:
+    """Fused GPU twin of decode_weights; same geometry/scale validation, bitwise-equal
+    output for identical inputs (guaranteed by the conformance suite, not assumed)."""
+    if not _HAS_TRITON:
+        raise RuntimeError("triton unavailable on this host")
+    if packed.ndim != 2 or scale_bytes.ndim != 2:
+        raise ValueError("2-D tensors expected")
+    out_, inc2 = packed.shape
+    if scale_bytes.shape != (out_, inc2 // 8):
+        raise ValueError("scale/weight geometry mismatch")
+    if not (global_scale > 0):
+        raise ValueError("global scale must be positive")
+    u = scale_bytes.to(torch.uint8)
+    if torch.any((u & 0x7F) == _E4M3_NAN):
+        raise ValueError("E4M3 NaN pattern in block scale")
+    if torch.any(u >> 7):
+        raise ValueError("negative block scale byte")
+    packed = packed.contiguous()
+    u = u.contiguous()
+    cols = inc2 * 2
+    e2m1_tab, e4m3_tab = _gpu_tables(packed.device)
+    out = torch.empty((out_, cols), dtype=out_dtype, device=packed.device)
+    n_blk = (cols + block_cols - 1) // block_cols
+    _decode_kernel[(out_ * n_blk,)](
+        packed, u, e2m1_tab, e4m3_tab, out,
+        float(global_scale), cols, inc2, u.shape[1], n_blk,
+        BLOCK=block_cols, num_warps=num_warps)
+    return out

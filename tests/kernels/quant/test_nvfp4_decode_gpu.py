@@ -1,0 +1,128 @@
+"""GPU conformance for decode_weights_gpu: bitwise vs CPU oracle + guards + sabotage + bench.
+
+Runs bare: `python test_nvfp4_decode_gpu.py`. Requires CUDA + triton; if absent the runner
+reports SKIP for GPU steps (positive control: it must state so, never silently pass zero).
+Baseline comparison: fused kernel vs the module's own torch-vectorized GPU decode — the fair
+same-semantics baseline, regime-labelled in the printed line.
+"""
+from __future__ import annotations
+
+import importlib.util
+import pathlib
+import sys
+import time
+
+_ROOT = pathlib.Path(__file__).resolve().parents[3]
+_spec = importlib.util.spec_from_file_location("nvfp4_fmt", _ROOT / "exllamav3" / "modules" / "quant" / "nvfp4_fmt.py")
+fmt = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(fmt)
+
+import torch
+
+_SHAPES = [(70, 4112), (128, 4096), (256, 12288)]       # ragged / square / prod-ish wide
+_PROD = (4096, 12288)
+
+GPU_OK = torch.cuda.is_available() and fmt._HAS_TRITON
+
+
+def _case(rows, cols, seed):
+    torch.manual_seed(seed)
+    w = torch.randn(rows, cols) * 10 ** (2 * torch.randn(rows, 1))
+    p, s, g = fmt.quantize_weights(w)
+    return p, s, g
+
+
+def t_bitwise_vs_cpu_oracle():
+    n = 0
+    for i, (r, c) in enumerate(_SHAPES):
+        p, s, g = _case(r, c, seed=100 + i)
+        ref = fmt.decode_weights(p, s, g, torch.float16)
+        got = fmt.decode_weights_gpu(p.cuda(), s.cuda(), g, torch.float16).cpu()
+        assert torch.equal(ref, got), (r, c, int((ref != got).sum()))
+        n += ref.numel()
+    assert n > 1_000_000, n                              # positive control: real coverage
+    print(f"  (elements compared bitwise: {n})")
+
+
+def t_dtypes_and_global_variants():
+    p, s, g = _case(64, 256, seed=7)
+    for dt in (torch.float16, torch.bfloat16, torch.float32):
+        assert torch.equal(fmt.decode_weights(p, s, g, dt),
+                           fmt.decode_weights_gpu(p.cuda(), s.cuda(), g, dt).cpu()), dt
+    for gg in (1.0, 2.0 ** -30, 2.0 ** 17):
+        assert torch.equal(fmt.decode_weights(p, s, gg, torch.float16),
+                           fmt.decode_weights_gpu(p.cuda(), s.cuda(), gg, torch.float16).cpu()), gg
+
+
+def t_gpu_guards_raise():
+    p, s, g = _case(8, 32, seed=8)
+    bad = s.clone().cuda(); bad[0, 0] = 0x7F
+    try:
+        fmt.decode_weights_gpu(p.cuda(), bad, g); assert False, "NaN scale accepted"
+    except ValueError:
+        pass
+    bad2 = s.clone().cuda(); bad2[0, 0] |= 0x80
+    try:
+        fmt.decode_weights_gpu(p.cuda(), bad2, g); assert False, "negative scale accepted"
+    except ValueError:
+        pass
+
+
+def t_sabotage_detected():
+    p, s, g = _case(16, 256, seed=9)
+    d0 = fmt.decode_weights_gpu(p.cuda(), s.cuda(), g, torch.float16)
+    p_bad = p.clone().cuda(); p_bad[3, 9] ^= 0x11
+    d1 = fmt.decode_weights_gpu(p_bad, s.cuda(), g, torch.float16)
+    diff = (d1 != d0)
+    assert diff.sum().item() == 2 and diff[3, 18:20].all(), diff.nonzero()
+    s_bad = s.clone().cuda(); s_bad[0, 2] -= 1
+    d2 = (fmt.decode_weights_gpu(p.cuda(), s_bad, g, torch.float16) != d0)
+    assert d2.sum().item() == 16 and d2[0, 32:48].all(), d2.nonzero()
+
+
+def _bench(fn, iters=20, warmup=3):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    ev0, ev1 = torch.cuda.Event(True), torch.cuda.Event(True)
+    ev0.record()
+    for _ in range(iters):
+        fn()
+    ev1.record(); torch.cuda.synchronize()
+    return ev0.elapsed_time(ev1) / iters * 1e3           # µs
+
+
+def t_prod_shape_latency_fence():
+    p, s, g = _case(*_PROD, seed=42)
+    pc, sc = p.cuda(), s.cuda()
+    t_k = _bench(lambda: fmt.decode_weights_gpu(pc, sc, g, torch.float16))
+    t_base = _bench(lambda: fmt.decode_weights(pc, sc, g, torch.float16))
+    assert torch.equal(fmt.decode_weights_gpu(pc, sc, g, torch.float16),
+                       fmt.decode_weights(pc, sc, g, torch.float16))   # fence on SAME run
+    mb = pc.numel() * 5.125 / 1e6                      # bytes/elem: packed 1 + sf 1/8 + f16 out 4 per packed byte
+    assert t_k < t_base, (t_k, t_base)
+    print(f"  [{_PROD[0]}x{_PROD[1]} regime=shared-GPU-serving] fused {t_k:.1f}us "
+          f"({mb / (t_k * 1e-3):.0f} GB/s incl-out) vs torch-baseline "
+          f"{t_base:.1f}us  speedup {t_base / t_k:.2f}x")
+
+
+def main() -> int:
+    tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_") and callable(v)]
+    assert tests
+    failed = skipped = 0
+    for name, fn in tests:
+        if not GPU_OK:
+            skipped += 1; print(f"SKIP {name} (no CUDA/triton — GPU steps NOT verified)")
+            continue
+        try:
+            fn(); print(f"PASS {name}")
+        except Exception as exc:                          # noqa: BLE001
+            failed += 1; print(f"FAIL {name}: {exc!r}")
+    status = "DONE-PASS" if failed == 0 and not skipped else ("DONE-SKIP-GPU" if not failed else "DONE-FAIL")
+    print(f"GPU-CONFORMANCE steps={len(tests)} pass={len(tests) - failed - skipped} "
+          f"fail={failed} skip={skipped} {status}")
+    return 1 if failed else (2 if skipped else 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
