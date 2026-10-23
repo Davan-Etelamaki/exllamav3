@@ -148,7 +148,18 @@ def main():
     ok = ok and okr
     step("pad_triple", ok, f"packed-space pad to ({rp},{cp}): exact head + zeros tail")
 
-    nsteps = 9
+    # ---- 10: direct lane above BM: row-tiled grid must cover every row -----
+    if torch.cuda.is_available():
+        ok10 = True
+        for m in (17, 64, 256):
+            x = (torch.randn(m, K, device="cuda") * 0.5).half()
+            y = lane.matmul_direct(x, pk, sc, gs)
+            ref = x.float() @ w_dec.t()
+            ok, err, den = rel_ok(y, ref)
+            ok10 &= ok
+        step("direct_large_m", ok10, "M=17,64,256 rows all computed vs oracle")
+
+    nsteps = 10
     npass = nsteps if not fails else nsteps - len(fails)
     print(f"W4A16-STEPS steps={nsteps} pass={npass} fail={len(fails)} "
           f"{'DONE-PASS' if not fails else 'DONE-FAIL ' + ','.join(fails)}")

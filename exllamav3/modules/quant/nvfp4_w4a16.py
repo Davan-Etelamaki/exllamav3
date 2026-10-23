@@ -36,7 +36,10 @@ except ImportError:       # pragma: no cover — CPU-only installs
 
 from . import nvfp4_fmt
 
-DIRECT_MAX_M = 8          # inclusive bound: M <= 8 takes the direct lane
+DIRECT_MAX_M = 256        # inclusive bound: M <= 256 takes the direct lane;
+                          # swept 2026-10-23 (engine-live, 4 projection classes,
+                          # M=1..256): direct wins every cell, worst ratio 0.67
+                          # at M=256; larger M falls to the scratch lane
 DEFAULT_BK = 128          # tile depth in columns (scale groups per tile: BK // 16)
 DEFAULT_BN = 32           # tile width in output rows
 DEFAULT_SK = 4            # K splits (atomically reduced F32 partials)
@@ -86,7 +89,8 @@ if _HAVE_TRITON:
                               BN: tl.constexpr, BK: tl.constexpr):
         pid_n = tl.program_id(0)
         pid_s = tl.program_id(1)
-        rm = tl.arange(0, BM)
+        pid_m = tl.program_id(2)
+        rm = pid_m * BM + tl.arange(0, BM)
         rn = pid_n * BN + tl.arange(0, BN)
         rk = tl.arange(0, BK // 2)
         mmask = rm < M
@@ -166,7 +170,7 @@ def matmul_direct(x: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor,
         raise ValueError("shape/dtype outside direct-lane domain (need cuda fp16 "
                          "[M,K] with K%%BK==0, N%%BN==0, K//BK %% SK == 0)")
     out = torch.zeros((x.shape[0], rows), dtype=torch.float32, device=x.device)
-    _direct_splitk_kernel[(rows // bn, sk)](
+    _direct_splitk_kernel[(rows // bn, sk, (x.shape[0] + bm - 1) // bm)](
         x, packed, scales, out, g, x.shape[0], rows, cols, sk,
         x.stride(0), packed.stride(0),
         BM=bm, BN=bn, BK=bk, num_warps=num_warps, num_stages=num_stages)
