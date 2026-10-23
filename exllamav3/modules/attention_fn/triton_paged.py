@@ -991,6 +991,35 @@ def _qc_load_v(qwords, scales, tok_rows, kv_head, offs_d, mask_n,
 
 
 @triton.jit
+def _nvfp4_decode_tile(codes_pool, scales_pool, tok_rows, kv_head, mask_n,
+                       n_kv_heads: tl.constexpr, head_dim: tl.constexpr, HD_PAD: tl.constexpr):
+    """(BLOCK_N, HD_PAD) fp16 tile from the nvfp4 paged cache: one byte per two elements (low
+    nibble = even d), E4M3 scale per 16. Exact f16 mantissa rebuild: m>=2 -> exp bias 14+(m>>1),
+    bit 0 adds 0x200 (mantissa .5); m==1 -> 0x3800 (0.5); m==0 -> 0; sign from bit 3. The
+    3-bit-mantissa x 4-bit-scale product fits f16's 11-bit significand exactly. Same maths as
+    the committed bit-assembly decode kernel (2f943ce1) and the nvfp4_dequantize oracle."""
+    BYTES_PER_ROW: tl.constexpr = n_kv_heads * head_dim // 2
+    PAIRS_PER_HEAD: tl.constexpr = head_dim // 2
+    SCALES_PER_ROW: tl.constexpr = n_kv_heads * head_dim // 16
+    SCALE_BLOCKS: tl.constexpr = head_dim // 16
+    PP: tl.constexpr = HD_PAD // 2
+    SS: tl.constexpr = HD_PAD // 16
+    pidx = tl.arange(0, PP)
+    sidx = tl.arange(0, SS)
+    b = tl.load(codes_pool + tok_rows[:, None] * BYTES_PER_ROW + kv_head * PAIRS_PER_HEAD + pidx[None, :],
+                mask=mask_n[:, None] & (pidx < PAIRS_PER_HEAD)[None, :], other=0).to(tl.int32)
+    code = tl.reshape(tl.join(b & 0xF, b >> 4), (b.shape[0], HD_PAD))
+    m = code & 7
+    bits = (((m >> 1) + 14) << 10) | ((m & 1) << 9)
+    bits = tl.where(m == 0, 0, bits ^ ((code >> 3) << 15))
+    v = bits.to(tl.int16).to(tl.float16, bitcast=True)
+    sc = tl.load(scales_pool + tok_rows[:, None] * SCALES_PER_ROW + kv_head * SCALE_BLOCKS + sidx[None, :],
+                 mask=mask_n[:, None] & (sidx < SCALE_BLOCKS)[None, :], other=0.0).to(tl.float16)
+    scx = tl.reshape(tl.broadcast_to(sc[:, :, None], (sc.shape[0], SS, 16)), (sc.shape[0], HD_PAD))
+    return v * scx
+
+
+@triton.jit
 def _paged_attn_decode_split_kernel(
     q,
     k_cache,
@@ -1025,6 +1054,7 @@ def _paged_attn_decode_split_kernel(
     HAS_SINKS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NVFP4: tl.constexpr,
 ):
     """Flash-decoding phase 1: one program per (batch, kv_head, row block, kv split). The rows of a
     kv head are its (query position, sibling q head) pairs packed densely (decode_row_layout), so a
@@ -1084,7 +1114,10 @@ def _paged_attn_decode_split_kernel(
             other=0,
         )
 
-        if QCK > 0:
+        if NVFP4:
+            tok_rows = phys * page_size + page_off
+            k_tile = tl.trans(_nvfp4_decode_tile(k_cache, k_scales, tok_rows, kv_head, offs_n < n_end, n_kv_heads, head_dim, HD_PAD))
+        elif QCK > 0:
             tok_rows = phys * page_size + page_off
             k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, offs_n < n_end, QCK, n_kv_heads, head_dim, HD_PAD)
         else:
@@ -1114,7 +1147,9 @@ def _paged_attn_decode_split_kernel(
         alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
         l_new = l * alpha + tl.sum(p, axis=1)
 
-        if QCV > 0:
+        if NVFP4:
+            v_tile = _nvfp4_decode_tile(v_cache, v_scales, phys * page_size + page_off, kv_head, offs_n < n_end, n_kv_heads, head_dim, HD_PAD)
+        elif QCV > 0:
             tok_rows_v = phys * page_size + page_off
             v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n < n_end, QCV, n_kv_heads, head_dim, HD_PAD)
         else:
@@ -1299,6 +1334,7 @@ def paged_attn_triton_decode(
     _check_tensor("cache_seqlens", cache_seqlens, None)
 
     bsz, q_len, n_q_heads, head_dim = q.shape
+    nvfp4 = qc is not None and qc[2] < 0   # sentinel bits=-1: packed uint8 + E4M3 planes
     if qc is None:
         _check_tensor("k_cache", k_cache)
         _check_tensor("v_cache", v_cache)
@@ -1311,7 +1347,7 @@ def paged_attn_triton_decode(
             raise ValueError("q and cache head dimensions must match")
     else:
         page_size = k_cache.shape[1]
-        n_kv_heads = n_kv_heads_override
+        n_kv_heads = k_cache.shape[2] if nvfp4 else n_kv_heads_override
     if not _same_device(q, k_cache, v_cache, block_table, cache_seqlens):
         raise ValueError("q, caches, block_table and cache_seqlens must be on the same CUDA device")
     if n_q_heads % n_kv_heads != 0:
@@ -1344,6 +1380,8 @@ def paged_attn_triton_decode(
 
     if qc is not None:
         k_scales, v_scales, qck, qcv = qc
+        if qck < 0:
+            qck, qcv = 0, 0
         h32 = _get_h32(q.device)
     else:
         k_scales, v_scales, qck, qcv = q, q, 0, 0
@@ -1394,13 +1432,13 @@ def paged_attn_triton_decode(
             qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
             page_size, head_dim, hd_pad, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            splits == 1, has_sinks, block_rows, block_n,
+            splits == 1, has_sinks, block_rows, block_n, nvfp4,
         )
         return args, splits, partial_o, partial_ml
 
     with torch.cuda.device(q.device):
         pick_key = (head_dim, hd_pad, qck, qcv, q_len, block_rows, h_blocks, bool(causal), window_left >= 0,
-                    window_right >= 0, has_sinks, num_warps, num_stages, candidates[0])
+                    window_right >= 0, has_sinks, num_warps, num_stages, candidates[0], nvfp4)
         block_n = pick_config(
             q.device, "paged_attn_decode", pick_key, candidates,
             lambda bn: shared_bytes(_paged_attn_decode_split_kernel, prepare(bn)[0],
@@ -1408,8 +1446,17 @@ def paged_attn_triton_decode(
         args, num_splits, partial_o, partial_ml = prepare(block_n)
 
         if k is not None and kv_append_len:
-            _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
-                             n_kv_heads, page_size, head_dim)
+            if nvfp4:
+                _paged_kv_update_nvfp4_kernel[(bsz * kv_append_len, n_kv_heads)](
+                    k, v, k_cache, v_cache, k_scales, v_scales,
+                    block_table, cache_seqlens,
+                    num_pages_per_seq, kv_append_len,
+                    n_kv_heads, page_size, head_dim,
+                    num_warps = 4,
+                )
+            else:
+                _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
+                                 n_kv_heads, page_size, head_dim)
 
         _paged_attn_decode_split_kernel[(programs, num_splits)](
             *args, num_warps = num_warps, num_stages = num_stages,
@@ -1454,6 +1501,39 @@ def fn_triton_paged_attn_decode(args: AttnArgs) -> torch.Tensor | None:
         window_size=args.get_window_size(),
         softcap=args.softcap,
         sinks=args.sinks,
+    )
+
+
+def fn_nvfp4_paged_decode(args: AttnArgs) -> torch.Tensor | None:
+    """Dedicated flash-decoding lane for NVFP4 caches: reads the packed uint8 pages and E4M3
+    scales directly through the split/combine decode kernels instead of routing the short-query
+    case onto the general splitdv kernel (which measured 26.7x the qc-6,6 decode cost at 32k)."""
+    if (
+        args.is_varlen() or
+        not args.has_kv_cache() or
+        args.q_len > 16 or
+        args.dim > 512 or
+        args.dim % 32 != 0 or
+        args.q.dtype != torch.float16 or
+        args.k_cache.dtype != torch.uint8 or
+        args.k_scales is None or
+        args.non_causal_spans
+    ):
+        return None
+    return paged_attn_triton_decode(
+        q=args.q,
+        k=args.k,
+        v=args.v,
+        k_cache=args.k_cache,
+        v_cache=args.v_cache,
+        block_table=args.block_table,
+        cache_seqlens=args.cache_seqlens,
+        causal=args.causal,
+        softmax_scale=args.sm_scale,
+        window_size=args.get_window_size(),
+        softcap=args.softcap,
+        sinks=args.sinks,
+        qc=(args.k_scales, args.v_scales, -1, -1),
     )
 
 
@@ -1990,6 +2070,8 @@ def paged_attn_triton_prefill(
 
     if qc is not None:
         k_scales, v_scales, qck, qcv = qc
+        if qck < 0:
+            qck, qcv = 0, 0
         h32 = _get_h32(q.device)
 
         # Two-pass quantized-cache prefill: dequantize the referenced window once into a compact

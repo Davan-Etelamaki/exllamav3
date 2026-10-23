@@ -8,6 +8,7 @@ from .triton_paged import (
     _qc_staging,
     fn_triton_paged_attn,
     fn_triton_paged_attn_longq,
+    fn_nvfp4_paged_decode,
     fn_triton_paged_attn_decode,
     fn_triton_paged_attn_prefill,
     fn_triton_varlen_attn,
@@ -39,6 +40,7 @@ _fns_qc: list[AttnFn] = [
 # new K/V in-kernel and dequantize online. Other backends only ever see these modes
 # through full dequantized fp16 copies, so such calls dispatch over these two only
 _fns_fp8: list[AttnFn] = [
+    fn_nvfp4_paged_decode,
     fn_triton_paged_attn,
     fn_triton_paged_attn_longq,
 ]
