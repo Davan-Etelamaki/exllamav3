@@ -115,12 +115,21 @@ class SlicedMultiLinear:
     def c_ptrs(self, outputs: list[torch.Tensor]) -> torch.Tensor:
         """Per-slice output pointers: outputs[i] is linear i's contiguous (rows, out_features) output"""
         assert len(outputs) == self.num_src
+        # [GS] memoize on the pointer tuple: the caching allocator reuses the same blocks
+        # for same-size decode allocations, so the table rarely changes; rebuilding it was a
+        # pageable (sync) H2D per call, hot in live py-spy. Table is read-only downstream.
+        key = tuple(o.data_ptr() for o in outputs) + tuple(o.shape[-1] for o in outputs)
+        last = getattr(self, "_cptr_last", None)
+        if last is not None and last[0] == key:
+            return last[1]
         ptrs = []
         for t, n0 in zip(self.slice_targets, self.slice_offsets):
             o = outputs[t]
             assert o.is_contiguous() and o.shape[-1] == self.linears[t].out_features
             ptrs.append(o.data_ptr() + n0 * o.element_size())
-        return torch.tensor(ptrs, dtype = torch.long, device = self.device)
+        out = torch.tensor(ptrs, dtype = torch.long, device = self.device)
+        self._cptr_last = (key, out)
+        return out
 
     def q_cb(self):
         return self.mcg, self.mul1
