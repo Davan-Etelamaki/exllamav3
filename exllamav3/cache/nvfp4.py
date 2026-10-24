@@ -115,6 +115,62 @@ def nvfp4_dequantize(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
     return (val * sc).contiguous()
 
 
+@triton.jit
+def _nvfp4_quant_append_kernel(
+        k_ptr, v_ptr, bk_ptr, bs_ptr, bv_ptr, vs_ptr, bt_ptr, cs_ptr,
+        L, stride_bt_b,
+        H: tl.constexpr, G: tl.constexpr,   # kv heads; groups of 16 per head (head_dim = 16 * G)
+        PAGE: tl.constexpr):
+    # One program per (sequence, token): quantizes one new K/V row to NVFP4 (E2M1 codes +
+    # E4M3 scale per 16) and scatters it into its physical page. Mirrors nvfp4_quantize and
+    # the update_kv scatter op-for-op (including the f16 rounding of the /6 scale before
+    # the e4m3 cast) so packed bytes and scales are bit-identical to the Python reference;
+    # cache_seqlens/block_table are read on-device — no host syncs, no eager-op swarm.
+    pid = tl.program_id(0)
+    b = pid // L
+    t = pid % L
+    pos = tl.load(cs_ptr + b).to(tl.int32) + t
+    page = pos // PAGE
+    off = pos % PAGE
+    phys = tl.load(bt_ptr + b * stride_bt_b + page).to(tl.int64)
+    dst = (phys * PAGE + off).to(tl.int64)
+    cg = tl.arange(0, G)
+    c16 = tl.arange(0, 16)
+    c8 = tl.arange(0, 8)
+    for hh in tl.static_range(H):
+        src = ((b * L + t).to(tl.int64) * H + hh) * (G * 16) + cg[:, None] * 16 + c16[None, :]
+        x = tl.load(k_ptr + src).to(tl.float16)
+        amax = tl.max(tl.abs(x), axis = 1)
+        scl = tl.minimum((amax.to(tl.float32) / 6.0).to(tl.float16).to(tl.float32), 448.0).to(tl.float8e4nv)
+        sc16 = scl.to(tl.float16).to(tl.float32)
+        den = tl.where(sc16 == 0.0, 1.0, sc16)
+        vq = tl.minimum(tl.abs(x.to(tl.float32) / den[:, None]), 6.0).to(tl.float16).to(tl.float32)
+        idx = tl.zeros((G, 16), dtype = tl.uint8)
+        for bb in tl.static_range(7):
+            bd = tl.where(bb == 0, 0.25, tl.where(bb == 1, 0.75, tl.where(bb == 2, 1.25,
+                 tl.where(bb == 3, 1.75, tl.where(bb == 4, 2.5, tl.where(bb == 5, 3.5, 5.0))))))
+            idx += (vq > bd).to(tl.uint8)
+        code = idx | ((x < 0).to(tl.uint8) << 3)
+        lo, hi = tl.split(tl.reshape(code, (G, 8, 2)))
+        tl.store(bk_ptr + dst * (H * G * 8) + hh * (G * 8) + cg[:, None] * 8 + c8[None, :], lo | (hi << 4))
+        tl.store(bs_ptr + dst * (H * G) + hh * G + cg, scl)
+        x = tl.load(v_ptr + src).to(tl.float16)
+        amax = tl.max(tl.abs(x), axis = 1)
+        scl = tl.minimum((amax.to(tl.float32) / 6.0).to(tl.float16).to(tl.float32), 448.0).to(tl.float8e4nv)
+        sc16 = scl.to(tl.float16).to(tl.float32)
+        den = tl.where(sc16 == 0.0, 1.0, sc16)
+        vq = tl.minimum(tl.abs(x.to(tl.float32) / den[:, None]), 6.0).to(tl.float16).to(tl.float32)
+        idx = tl.zeros((G, 16), dtype = tl.uint8)
+        for bb in tl.static_range(7):
+            bd = tl.where(bb == 0, 0.25, tl.where(bb == 1, 0.75, tl.where(bb == 2, 1.25,
+                 tl.where(bb == 3, 1.75, tl.where(bb == 4, 2.5, tl.where(bb == 5, 3.5, 5.0))))))
+            idx += (vq > bd).to(tl.uint8)
+        code = idx | ((x < 0).to(tl.uint8) << 3)
+        lo, hi = tl.split(tl.reshape(code, (G, 8, 2)))
+        tl.store(bv_ptr + dst * (H * G * 8) + hh * (G * 8) + cg[:, None] * 8 + c8[None, :], lo | (hi << 4))
+        tl.store(vs_ptr + dst * (H * G) + hh * G + cg, scl)
+
+
 class CacheLayer_nvfp4(CacheLayer):
     """KV cache stored in the NVFP4 format: E2M1 elements + E4M3 block scales (16 elems/
     block), 4.5 bits per element. Reads take the Triton online-dequant path; the generic
@@ -224,7 +280,24 @@ class CacheLayer_nvfp4(CacheLayer):
 
 
     @override
-    def update_kv(
+    def update_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor,
+                  k: torch.Tensor, v: torch.Tensor, length: int):
+        # Fast path: one Triton launch, no host syncs. Falls back to the Python reference
+        # for CPU caches, odd dtypes/dims, non-contiguous inputs and non-pow2 group counts.
+        if (self.k is not None and k.is_cuda
+                and k.dtype in (torch.float16, torch.bfloat16)
+                and k.shape[2] == self.shape4[2] and k.shape[3] == self.shape4[3] * 2
+                and k.is_contiguous() and v.is_contiguous()
+                and (g := k.shape[3] // 16) & (g - 1) == 0):
+            _nvfp4_quant_append_kernel[(k.shape[0] * length,)](
+                k, v, self.k, self.ks, self.v, self.vs, block_table, cache_seqlens,
+                length, block_table.stride(0),
+                H = k.shape[2], G = g, PAGE = PAGE_SIZE, num_warps = 4)
+            return
+        self._update_kv_python(cache_seqlens, block_table, k, v, length)
+
+
+    def _update_kv_python(
         self,
         cache_seqlens: torch.Tensor,
         block_table: torch.Tensor,
