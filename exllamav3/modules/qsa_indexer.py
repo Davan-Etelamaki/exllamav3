@@ -678,7 +678,6 @@ class QSAIndexer(Module):
         cr = self.compress_ratio
         epp = layer.pooled.shape[1]
         pool_flat = layer.pooled.view(-1, self.head_dim)
-        bt = block_table.int()
         out = torch.empty((bsz * seq, self.k_pad()), dtype = torch.int32, device = q_idx.device)
         if bsz > 1:
             t_max = (int(cache_seqlens_cpu[:bsz].max()) + seq) // cr
@@ -691,6 +690,7 @@ class QSAIndexer(Module):
                 a_pos, a_T, out, bt_job, epp, q_idx.device, t_max, seq,
             )
             return out
+        bt = block_table if block_table.dtype == torch.int32 else block_table.int()
         for b in range(bsz):
             pos0 = int(cache_seqlens_cpu[b])
             self._select_rows(
