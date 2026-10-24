@@ -38,6 +38,7 @@ def test_architecture_is_registered():
 def test_prepare_inputs_sets_anchor_and_uses_dflash_attention_setup():
     import exllamav3.architecture.dflash2 as arch
     model = object.__new__(DFlash2Model)
+    model.recurrent_state_cls = None  # __init__ default; the bypass constructor must mirror it
     input_ids = torch.tensor([[42]])
     prepared = object()
 
@@ -74,16 +75,25 @@ def test_input_embedding_scale_is_applied():
 
 
 @pytest.mark.nogpu
-def test_tp_target_is_rejected_during_attach():
+def test_tp_target_is_accepted_during_attach():
+    # The old attach-time rejection of tensor-parallel targets was replaced by TP support in
+    # sample_from_state (tp_producer/tp_dispatch_lm_head_topk), so attach_to must now accept
+    # a TP target and only the vocab/hidden/head/layer-id compatibility checks remain
     model = object.__new__(DFlash2Model)
-    target = SimpleNamespace(loaded_tp = True)
+    model.config = SimpleNamespace(
+        vocab_size = 10, hidden_size = 4, mask_token_id = 9,
+        target_layer_ids = [0], )
+    model.input_layer = SimpleNamespace()
+    class Target:  # weakref-able, unlike SimpleNamespace
+        loaded_tp = True
+        logit_layer_idx = 0
+        config = SimpleNamespace(vocab_size = 10, hidden_size = 4, num_hidden_layers = 2)
+    target = Target()
 
-    try:
-        model.attach_to(target)
-    except NotImplementedError as exc:
-        assert "tensor-parallel targets" in str(exc)
-    else:
-        raise AssertionError("DFlash2 attached to a tensor-parallel target")
+    model.attach_to(target)
+
+    assert model.attached_model() is target
+    assert model.input_layer.attached_model() is target
 
 
 @pytest.mark.nogpu
