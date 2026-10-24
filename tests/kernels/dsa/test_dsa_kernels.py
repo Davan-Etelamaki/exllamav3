@@ -356,7 +356,7 @@ def test_workspaces_kept_only_for_decode_rows(device, monkeypatch, R, n_splits, 
     bt = torch.arange(pages, dtype = torch.int32, device = device).unsqueeze(0).expand(R, pages).contiguous()
     monkeypatch.setattr(g_tensor_cache, "cache", {})
     dsa_attn(q, pool_c, pool_r, bt, pool_len = n_keys, q_pos0 = n_keys * 4 - R, compress_rate = 4, n_splits = n_splits)
-    kept_tags = {k.rsplit("/", 1)[-1] for k in g_tensor_cache.cache}
+    kept_tags = {(k[3] if isinstance(k, tuple) else k).rsplit("/", 1)[-1] for k in g_tensor_cache.cache}  # tuple key (device, shape, dtype, tag) since ec08c9c1
     if kept:
         assert {"dsa_out", "dsa_ws_ml", "dsa_ws_acc"} <= kept_tags, f"decode-class call kept only {sorted(kept_tags)}"
     else:
