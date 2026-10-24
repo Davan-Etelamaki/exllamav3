@@ -1092,7 +1092,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # f_threshold-1 instead of MAX_BSZN). Expert-range shards (CPU split, TP) are masked
         # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run
         # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
-        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
+        # run_bszN launches its own CUDA graph, illegal under an outer (forward-graph)
+        # capture; decline the fused tier while capturing so eager kernel tiers get recorded
+        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN and not torch.cuda.is_current_stream_capturing()
 
         # Routing
         if self.router_pre_norm:

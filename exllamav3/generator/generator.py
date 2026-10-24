@@ -1708,8 +1708,10 @@ class Generator:
         if all(ids.shape[-1] == ids_width for ids in input_ids_list):
             ids_staging = self._staging("batch_ids", len(input_ids_list), ids_width, torch.long)
             batch_ids = torch.cat(input_ids_list, dim = 0, out = ids_staging)
+            ids_staged = True
         else:
             batch_ids = torch.cat(input_ids_list, dim = 0)
+            ids_staged = False
 
         # Collect recurrent states for batch
         # Recurrent models carry mutable state beside the K/V cache; pass one state object per compact batch job so
@@ -1744,10 +1746,62 @@ class Generator:
         }
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
-        batch_logits = self.model.forward(
-            input_ids = batch_ids,
-            params = params,
-        )
+        # fwd-graph: replay the steady-state decode forward (fwd_graph.py). Eligible:
+        # uniform-width staged ids, no indexed embeddings. K/V writes are idempotent at
+        # the same positions; the two warmup executions' recurrent advances are undone
+        # with the engine's own rewind primitive (same semantics as reject_remainder).
+        fwd_graph = getattr(self, "_fwd_graph", None)
+        if fwd_graph is None:
+            from exllamav3.generator.fwd_graph import ForwardGraphRunner
+            fwd_graph = self._fwd_graph = ForwardGraphRunner()
+        if (fwd_graph.enabled and fwd_graph.disabled_reason is None
+                and ids_staged and not active_embeddings
+                # MoE experts hosted on the CPU decide their work with host-side, data-
+                # dependent logic per token; that orchestration cannot be replayed, so
+                # such models stay eager until a graph-aware host-MoE design lands.
+                and not getattr(self.model.config, "moe_cpu_hosts", None)):
+            # The CPU embedding's host-side gather cannot be replayed, so the generator
+            # re-runs it eagerly every round: it refills the module's reused pinned
+            # staging buffer (stable address, keyed by shape), which is the graph's
+            # recorded H2D source. Without this, replays re-feed the capture round's
+            # embeddings.
+            if not hasattr(self, "_fwd_emb"):
+                from exllamav3.modules.embedding import Embedding
+                self._fwd_emb = next(
+                    ((m, i) for m, i, _ in self.model.fwd_modules
+                     if isinstance(m, Embedding)), None,
+                )
+            emb_pair = self._fwd_emb
+            if emb_pair is None:
+                fwd_graph.disabled_reason = "no Embedding module located"
+                batch_logits = self.model.forward(
+                    input_ids = batch_ids, params = params,
+                )
+            else:
+                emod, einst = emb_pair
+                params["layer_instance"] = einst
+                ein = emod.prepare_for_device(batch_ids, params)
+                emod.forward(ein, params)
+                params.pop("layer_instance", None)
+                fwd_key = (
+                    batch_ids.shape[0], batch_ids.shape[1], use_offsets,
+                    self.draft_model is not None,
+                    tuple(id(s) for s in batch_states) if batch_states is not None else (),
+                )
+                on_warm = None
+                if batch_states:
+                    def on_warm(states = batch_states):
+                        for st in states:
+                            st.rewind(2)  # exactly the 2 warmup executions
+                batch_logits = fwd_graph.run(
+                    fwd_key, {"input_ids": batch_ids, "params": params},
+                    self.model.forward, on_after_warmup = on_warm,
+                )
+        else:
+            batch_logits = self.model.forward(
+                input_ids = batch_ids,
+                params = params,
+            )
 
         # Keep only the fields needed below for draft-cache updates and drop the params dict so it cannot extend
         # references to recurrent state objects past this iteration.

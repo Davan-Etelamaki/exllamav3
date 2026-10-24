@@ -607,6 +607,12 @@ class BCAttn:
     ) -> torch.Tensor | None:
         bsz, q_len, _ = x.shape
 
+        # An outer CUDA-graph capture (generator forward-graph) cannot contain this module's
+        # own graph launch/reconfigure; decline to the eager path, whose kernels the outer
+        # capture records as plain nodes.
+        if torch.cuda.is_current_stream_capturing():
+            return None
+
         # QSA regime: dense below the sparse threshold (top-k cannot exclude anything there, so
         # dense attention is exact), gathered sparse above it. Sparse slots are decode-only;
         # other shapes fall back to the eager path, which maintains the planes identically

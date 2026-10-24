@@ -865,7 +865,8 @@ class GatedMLP(Module):
 
             for s in r:
 
-                if self.bc is not None and bsz * q_len <= MAX_BSZN:
+                if self.bc is not None and bsz * q_len <= MAX_BSZN \
+                        and not torch.cuda.is_current_stream_capturing():
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     self.bc.run_bszN(xv, d.view(xv.shape))
