@@ -1169,8 +1169,20 @@ class GatedDeltaNet(Module):
             x = torch.nn.functional.pad(x, (0, hidden - x.shape[-1]))
         x = x.contiguous().view(1, m, hidden)
         xh = torch.empty((mq.num_src, m, hidden), dtype = torch.half, device = x.device)
-        qkv = torch.empty((bsz, seqlen, self.qkv_proj.out_features), dtype = torch.float, device = x.device)
-        z = torch.empty((bsz, seqlen, self.z_proj.out_features), dtype = torch.float, device = x.device)
+        # [GS] decode-class static outputs: fresh empties churned mq.c_ptrs's pointer-key
+        # memo under varying fleet batch sizes (c_ptrs 8.4% of prod CPU wall, fleet-on
+        # readback 2026-10-24) and every miss paid a pageable H2D sync. Bucketed statics
+        # (same mechanism as prealloc_qkvz_carrier above) keep pointers stable so the memo
+        # always hits. Consumers (conv/gated-delta/o_proj) finish before the next GDN site
+        # writes these tags on the same stream; mgemm writes all m rows, so no zeroing
+        # contract changes. Prefill sizes keep the per-call path.
+        if m <= 32:
+            dev = x.device
+            qkv = g_tensor_cache.get_bucketed(dev, m * self.qkv_proj.out_features, torch.float, "gdn_qkvz_qkv").view(bsz, seqlen, -1)
+            z = g_tensor_cache.get_bucketed(dev, m * self.z_proj.out_features, torch.float, "gdn_qkvz_z").view(bsz, seqlen, -1)
+        else:
+            qkv = torch.empty((bsz, seqlen, self.qkv_proj.out_features), dtype = torch.float, device = x.device)
+            z = torch.empty((bsz, seqlen, self.z_proj.out_features), dtype = torch.float, device = x.device)
         c_ptrs = mq.c_ptrs([qkv.view(m, -1), z.view(m, -1)])
         ext.exl3_mgemm(
             x,
