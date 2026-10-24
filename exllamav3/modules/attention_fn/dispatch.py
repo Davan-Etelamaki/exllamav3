@@ -17,6 +17,12 @@ from .triton_paged import (
     fn_triton_attn_nocache,
 )
 
+# Shortest q_len for which the nvfp4 online-dequant paged kernels lose to one bulk page
+# dequant into a staging pool: the per-tile online dequant repeats per q tile and measured
+# 2.2-5x the fp16-cache cost at q_len >= 512 (see vault 2026-10-23 prefill decomposition);
+# below it the dedicated decode/splitdv/longq lanes on packed pages win.
+_NVFP4_ONLINE_MAX_Q = 64
+
 # Candidate attn functions in order of preference: the Triton decode/prefill/varlen kernels
 # serve every shape they support (any head_dim <= 512, zero-padded to a power of two), then the
 # older Triton kernels and the torch/xformers fallbacks for the rest
@@ -149,10 +155,16 @@ def attn_dispatch(
             isinstance(layer, CacheLayer_nvfp4) and
             layer.k is not None and
             q.dtype == torch.float16 and
-            cu_seqlens is None
+            cu_seqlens is None and
+            q_len < _NVFP4_ONLINE_MAX_Q
         ):
-            # NVFP4 path: new K/V are quantized (E2M1 + E4M3 scale/16) and appended in-kernel
-            # by the nvfp4 update kernel; attention reads the packed pages with online dequant
+            # NVFP4 online-dequant path (short q only): new K/V are quantized (E2M1 + E4M3
+            # scale/16) and appended in-kernel by the nvfp4 update kernel; attention reads the
+            # packed pages with per-tile online dequant. That dequant repeats per q tile inside
+            # the kernel and measured 2.2-5x the fp16-cache cost at prefill sizes (a config
+            # sweep showed the tile kernel itself is already optimally configured), so
+            # prefill-size calls fall through to the staging branch below: one bulk Triton
+            # dequant of the used pages into a contiguous fp16 pool, then ordinary fp16 kernels.
             k_cache, v_cache = layer.k, layer.v
             k_scales, v_scales = layer.ks, layer.vs
             fp8_fast = True

@@ -8,6 +8,63 @@ if TYPE_CHECKING:
     from ..modules import Attention
     from ..model import Model, Config
 import numpy as np
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _nvfp4_dq_elem(codes, scale):
+    # codes int32 nibbles -> fp32 values, matching nvfp4_dequantize exactly: magnitudes
+    # {0,.5,1,1.5,2,3,4,6} are exact in f16, sign flip exact, so the single f32 product
+    # rounds to the same f16 as torch's f16 multiply
+    idx = codes & 7
+    ge = ((idx >= 1).to(tl.float32) + (idx >= 2).to(tl.float32) + (idx >= 3).to(tl.float32)
+          + (idx >= 4).to(tl.float32)) * 0.5 + (idx == 5).to(tl.float32) \
+         + (idx == 6).to(tl.float32) * 2.0 + (idx == 7).to(tl.float32) * 4.0
+    return ge * tl.where(((codes >> 3) & 1) == 1, -1.0, 1.0) * scale
+
+
+@triton.jit
+def _nvfp4_bulk_dequant_kernel(
+        k4_ptr, ks_ptr, v4_ptr, vs_ptr, ok_ptr, ov_ptr, bt_ptr, cs_ptr,
+        extra, stride_bt_b,
+        H: tl.constexpr, HALF: tl.constexpr, HSC: tl.constexpr, FULL: tl.constexpr,
+        PAGE: tl.constexpr, ROWS: tl.constexpr):
+    # One program per (sequence, page): dequantizes one physical page of K and V into the
+    # contiguous staging pool. Whole pages are staged, including rows past the sequence
+    # length in the last page — the format decodes to finite values for any bit pattern and
+    # attention masks those rows out via cache_seqlens.
+    b = tl.program_id(0)
+    j = tl.program_id(1)
+    eff = tl.load(cs_ptr + b).to(tl.int32) + extra
+    if j >= (eff + PAGE - 1) // PAGE:
+        return
+    base = 0
+    for bb in range(0, b):
+        base += (tl.load(cs_ptr + bb).to(tl.int32) + extra + PAGE - 1) // PAGE
+    phys = tl.load(bt_ptr + b * stride_bt_b + j).to(tl.int64)
+    slot = base + j
+    rows = tl.arange(0, ROWS)
+    hs = tl.arange(0, H)
+    cb = tl.arange(0, HALF)
+    cq = tl.arange(0, HSC)
+    cf = tl.arange(0, FULL)
+    for r0 in range(0, PAGE, ROWS):
+        tok = (phys * PAGE + r0).to(tl.int64) + rows
+        dst_tok = (slot.to(tl.int64) * PAGE + r0) + rows
+        src = tok[:, None, None] * (H * HALF) + hs[None, :, None] * HALF + cb[None, None, :]
+        src_s = tok[:, None, None] * (H * HSC) + hs[None, :, None] * HSC + cq[None, None, :]
+        dst = dst_tok[:, None, None] * (H * FULL) + hs[None, :, None] * FULL + cf[None, None, :]
+        kb = tl.load(k4_ptr + src).to(tl.int32)
+        vb = tl.load(v4_ptr + src).to(tl.int32)
+        ksc = tl.reshape(tl.broadcast_to(tl.load(ks_ptr + src_s).to(tl.float32)[:, :, :, None],
+                                         (ROWS, H, HSC, 8)), (ROWS, H, HALF))
+        vsc = tl.reshape(tl.broadcast_to(tl.load(vs_ptr + src_s).to(tl.float32)[:, :, :, None],
+                                         (ROWS, H, HSC, 8)), (ROWS, H, HALF))
+        ko = tl.interleave(_nvfp4_dq_elem(kb & 15, ksc), _nvfp4_dq_elem((kb >> 4) & 15, ksc))
+        vo = tl.interleave(_nvfp4_dq_elem(vb & 15, vsc), _nvfp4_dq_elem((vb >> 4) & 15, vsc))
+        tl.store(ok_ptr + dst, ko.to(tl.float16))
+        tl.store(ov_ptr + dst, vo.to(tl.float16))
 
 # NVFP4 element format: E2M1 (1 sign, 2 exp, 1 mantissa), 16 levels
 #   code: [s | 2 exp bits | 1 mantissa bit]; positive magnitudes by idx (code & 7):
@@ -137,11 +194,22 @@ class CacheLayer_nvfp4(CacheLayer):
         slot = 0
         for b in range(bsz):
             nb = nblocks[b]
-            phys = block_table[b, :nb].long()
-            ks[slot:slot + nb] = nvfp4_dequantize(self.k[phys].int(), self.ks[phys].half())
-            vs[slot:slot + nb] = nvfp4_dequantize(self.v[phys].int(), self.vs[phys].half())
             bt_stage[b, :nb] = torch.arange(slot, slot + nb, dtype = torch.int32, device = block_table.device)
             slot += nb
+        if self.k.is_cuda:
+            _nvfp4_bulk_dequant_kernel[(bsz, max(nblocks))](
+                self.k, self.ks, self.v, self.vs, ks, vs, block_table, cache_seqlens,
+                extra, block_table.stride(0),
+                H = h, HALF = half_d, HSC = self.ks.shape[3], FULL = half_d * 2,
+                PAGE = PAGE_SIZE, ROWS = 32, num_warps = 4)
+        else:
+            slot = 0
+            for b in range(bsz):
+                nb = nblocks[b]
+                phys = block_table[b, :nb].long()
+                ks[slot:slot + nb] = nvfp4_dequantize(self.k[phys].int(), self.ks[phys].half())
+                vs[slot:slot + nb] = nvfp4_dequantize(self.v[phys].int(), self.vs[phys].half())
+                slot += nb
         return ks, vs, bt_stage
 
 
