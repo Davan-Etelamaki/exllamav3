@@ -50,6 +50,57 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))# REVERTED
 # Deterministic (slot + gather) accumulation for the fused kernel's outputs; EXL3_MOE_FUSED_DET=0
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
+
+# [GS] routegraph: capture the all-fused MoE routing prelude (shift/valid, argsort, gathers,
+# bincount, inv_order, device slot tables) into ONE CUDA graph per (A=top_k*num_tokens, E,
+# first). Live py-spy: block_sparse_mlp routing glue ~8% of generator wall, ~8 tiny eager
+# launches per MoE layer per step. Replay = 2 copy-ins + graph replay. Only used on the
+# all-fused fast path (no host expert counts); any capture failure falls back to eager, sticky.
+_ROUTE_GRAPH = os.environ.get("EXL3_ROUTE_GRAPH", "1") != "0"
+
+class _RoutingGraph:
+    def __init__(self, sel, w, num_tokens, top_k, E, first, device):
+        self.sel_in = torch.empty_like(sel)
+        self.w_in   = torch.empty_like(w)
+        self.num_tokens, self.top_k, self.E, self.first = num_tokens, top_k, E, first
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self.sel_in.copy_(sel)
+                self.w_in.copy_(w)
+                self._prelude()
+        torch.cuda.current_stream().wait_stream(s)
+        self.g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.g):
+            self.outs = self._prelude()
+
+    def _prelude(self):
+        E, first = self.E, self.first
+        if first is None:
+            local = self.sel_in
+        else:
+            local = self.sel_in - first
+            valid = (local >= 0) & (local < E)
+            local = torch.where(valid, local, torch.full_like(local, E))
+        order = local.argsort()
+        ft = buffered_interleaved_arange(self.num_tokens, self.top_k, device = self.sel_in.device)
+        token_sorted  = ft[order]
+        weight_sorted = self.w_in[order]
+        # bincount copies a CPU scalar during graph capture; scatter_add_ is capture-safe
+        expert_count  = torch.zeros(E + 1, dtype = torch.int64, device = local.device)
+        expert_count.scatter_add_(0, local, torch.ones_like(local))
+        A = local.shape[0]
+        inv_order = torch.empty_like(order).scatter_(0, order, torch.arange(A, device = self.sel_in.device))
+        expert_start = torch.cumsum(expert_count, 0) - expert_count
+        tables = torch.stack([expert_start, expert_start, (expert_count > 0).long()])
+        return local, token_sorted, weight_sorted, expert_count, inv_order, tables
+
+    def run(self, sel, w):
+        self.sel_in.copy_(sel, non_blocking = True)
+        self.w_in.copy_(w, non_blocking = True)
+        self.g.replay()
+        return self.outs
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
 @dataclass
@@ -1147,24 +1198,57 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # Token indices corresponding to each flattened assignment
                 flat_token = buffered_interleaved_arange(num_tokens, top_k, device = y.device)
 
-                # Map to local expert ids whenever this module holds a slice (TP shard or
-                # CPU expert split), not only in the multi-device routing case
-                if self.num_local_experts == self.num_experts:
-                    flat_expert_local = flat_expert_global
-                else:
-                    flat_expert_local = flat_expert_global - self.routing_first
-                    valid = (flat_expert_local >= 0) & (flat_expert_local < E)
-                    flat_expert_local = torch.where(valid, flat_expert_local, torch.full_like(flat_expert_local, E))
+                # [GS] routegraph: on the all-fused fast path replay one captured CUDA graph
+                # instead of ~8 tiny eager launches per MoE layer per step (routing glue ~8%
+                # of generator wall in live py-spy). Sticky eager fallback on any failure.
+                graph_route = False
+                A_rt = num_tokens * top_k
+                if (
+                    _ROUTE_GRAPH and self.fused_mode_buffers is not None and
+                    A_rt <= self.fused_rows and self.cpu_split_first is None
+                ):
+                    _rgc = self.__dict__.setdefault("_route_graphs", {})
+                    _rgk = (A_rt, self.num_local_experts, self.routing_first)
+                    rg = _rgc.get(_rgk)
+                    if rg is False:
+                        rg = None
+                    elif rg is None:
+                        try:
+                            _first = None if self.num_local_experts == self.num_experts else self.routing_first
+                            rg = _RoutingGraph(flat_expert_global, flat_weight, num_tokens, top_k,
+                                               E, _first, y.device)
+                            _rgc[_rgk] = rg
+                        except Exception:
+                            _rgc[_rgk] = False
+                            rg = None
+                    if rg is not None:
+                        try:
+                            flat_expert_local, token_sorted, weight_sorted, expert_count, \
+                                inv_order_rg, tables_rg = rg.run(flat_expert_global, flat_weight)
+                            graph_route = True
+                        except Exception:
+                            _rgc[_rgk] = False
+                            rg = None
 
-                # Group once by local expert id (including sentinel for expert-P mode)
-                order = flat_expert_local.argsort()
-                token_sorted = flat_token[order]
-                weight_sorted = flat_weight[order]
+                if not graph_route:
+                    # Map to local expert ids whenever this module holds a slice (TP shard or
+                    # CPU expert split), not only in the multi-device routing case
+                    if self.num_local_experts == self.num_experts:
+                        flat_expert_local = flat_expert_global
+                    else:
+                        flat_expert_local = flat_expert_global - self.routing_first
+                        valid = (flat_expert_local >= 0) & (flat_expert_local < E)
+                        flat_expert_local = torch.where(valid, flat_expert_local, torch.full_like(flat_expert_local, E))
 
-                # Count how many assignments per expert. With few enough total assignments no
-                # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
-                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
-                expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
+                    # Group once by local expert id (including sentinel for expert-P mode)
+                    order = flat_expert_local.argsort()
+                    token_sorted = flat_token[order]
+                    weight_sorted = flat_weight[order]
+
+                    # Count how many assignments per expert. With few enough total assignments no
+                    # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
+                    # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
+                    expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
                 if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
                     expert_count_list = None
                 else:
@@ -1202,15 +1286,19 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 scratch = tables = inv_order = None
                 if FUSED_DET and (fused_total or groups):
                     A = flat_expert_local.shape[0]
-                    inv_order = torch.empty_like(order).scatter_(
-                        0, order, torch.arange(A, device = order.device))
-                    if expert_count_list is None:
+                    if not graph_route:
+                        inv_order = torch.empty_like(order).scatter_(
+                            0, order, torch.arange(A, device = order.device))
+                    if expert_count_list is None and not graph_route:
                         # Row num_ex of expert_count is the sentinel bucket for picks outside this
                         # module's expert slice (TP shard, CPU split). Its slots are never written,
                         # so the gather below is restricted to the first num_ex table rows
                         expert_start = torch.cumsum(expert_count, 0) - expert_count
                         tables = torch.stack([expert_start, expert_start, (expert_count > 0).long()])
                         n_slots = fused_total
+                    elif graph_route:
+                        # [GS] routegraph: inv_order/tables are graph-static outputs
+                        inv_order, tables, n_slots = inv_order_rg, tables_rg, fused_total
                     else:
                         import numpy as np
                         E1 = len(expert_count_list)
