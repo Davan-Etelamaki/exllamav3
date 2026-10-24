@@ -72,6 +72,12 @@ def make_generator(pending, active = (), max_batch_size = 16):
     generator.pending_jobs = list(pending)
     generator.active_jobs = list(active)
     generator.max_batch_size = max_batch_size
+    # Chunk governor attrs set by Generator.__init__ upstream (3a0cc165); target 0 = off,
+    # keeping this suite on the pre-governor path it tests.
+    generator._gov_base = 2048
+    generator._gov_size = 2048
+    generator._gov_target_ms = 0
+    generator._gov_stats = False
     # No disk tier: iterate() consults it after the job stages
     generator.disk_page_cache = None
     generator.disk_cache_write_interval = 0

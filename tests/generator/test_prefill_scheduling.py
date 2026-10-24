@@ -22,6 +22,7 @@ class StubJob:
     def __init__(self, name, generating):
         self.name = name
         self.generating = generating
+        self.sequences = []  # read by Generator.iterate (3a0cc165 admission check)
         self.chunks = []   # chunk_size argument of each prefill() call
 
     def is_prefill_done(self):
@@ -38,6 +39,7 @@ def make_generator(jobs, shared_chunk_size = 2048, prefill_cooldown = 0):
     g.draft_cache = None
     g.pending_jobs = []
     g.active_jobs = list(jobs)
+    g.max_batch_size = 16  # read by Generator.iterate (3a0cc165 admission check)
     g.recurrent_cache = None
     g.draft_model = None
     g.dflash_draft = False
@@ -47,6 +49,12 @@ def make_generator(jobs, shared_chunk_size = 2048, prefill_cooldown = 0):
     g.visualizer = None
     g.disk_page_cache = None
     g.max_chunk_size = 2048
+    # Chunk governor attrs set by Generator.__init__ upstream (3a0cc165); target 0 = off,
+    # keeping this suite on the pre-governor scheduling path it tests.
+    g._gov_base = 2048
+    g._gov_size = 2048
+    g._gov_target_ms = 0
+    g._gov_stats = False
     g.shared_chunk_size = shared_chunk_size
     g.prefill_cooldown = prefill_cooldown
     g.prefill_cooldown_left = 0

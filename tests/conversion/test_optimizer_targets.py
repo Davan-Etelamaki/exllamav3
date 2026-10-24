@@ -109,6 +109,7 @@ def _flatten_measure_targets(
 
 def _split_gdn() -> Any:
     module = _gdn_probe_class()()
+    module.kda_direct = False  # set by __init__ upstream (c0a19b15); probe skips it
     module.qkvz_proj = None
     module.qkv_proj = _linear("gdn.qkv")
     module.z_proj = _linear("gdn.z")
@@ -118,6 +119,7 @@ def _split_gdn() -> Any:
 
 def _fused_gdn() -> Any:
     module = _gdn_probe_class()()
+    module.kda_direct = False  # set by __init__ upstream (c0a19b15); probe skips it
     module.qkvz_proj = _linear("gdn.qkvz")
     module.qkv_proj = None
     module.z_proj = None
@@ -175,6 +177,7 @@ def test_qwen38_optimizer_topology_has_expected_unique_groups_and_linears() -> N
         prefix = f"layers.{layer_idx}"
         if layer_type == "linear_attention":
             attn = gdn_class()
+            attn.kda_direct = False  # set by __init__ upstream (c0a19b15); probe skips it
             attn.qkvz_proj = None
             attn.qkv_proj = linear(f"{prefix}.gdn.qkv")
             attn.z_proj = linear(f"{prefix}.gdn.z")
