@@ -1790,9 +1790,10 @@ class Generator:
                 )
                 on_warm = None
                 if batch_states:
-                    def on_warm(states = batch_states):
+                    from exllamav3.generator import fwd_graph as _fg_mod
+                    def on_warm(states = batch_states, n = _fg_mod._WARMUPS):
                         for st in states:
-                            st.rewind(2)  # exactly the 2 warmup executions
+                            st.rewind(n)  # exactly the warmup executions
                 batch_logits = fwd_graph.run(
                     fwd_key, {"input_ids": batch_ids, "params": params},
                     self.model.forward, on_after_warmup = on_warm,
