@@ -19,9 +19,11 @@ from .triton_paged import (
 
 # Shortest q_len for which the nvfp4 online-dequant paged kernels lose to one bulk page
 # dequant into a staging pool: the per-tile online dequant repeats per q tile and measured
-# 2.2-5x the fp16-cache cost at q_len >= 512 (see vault 2026-10-23 prefill decomposition);
-# below it the dedicated decode/splitdv/longq lanes on packed pages win.
-_NVFP4_ONLINE_MAX_Q = 64
+# 2.2-5x the fp16-cache cost at q_len >= 512 (vault 2026-10-23 prefill decomposition) AND
+# 2.5-5.8x at q_len 17-63 (band sweep 2026-10-24: ctx16k q17 1214us online vs 336us staging,
+# q63 2780us vs 336us; q16 63us online still wins). Below it the dedicated decode/splitdv
+# lanes on packed pages win; the longq tile lane above it loses until the staging crossover.
+_NVFP4_ONLINE_MAX_Q = 17
 
 # Candidate attn functions in order of preference: the Triton decode/prefill/varlen kernels
 # serve every shape they support (any head_dim <= 512, zero-padded to a power of two), then the
