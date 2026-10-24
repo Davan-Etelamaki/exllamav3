@@ -124,7 +124,7 @@ static bool moe_coop_pick_wide(int kslices, int slots, int device)
 // Dynamic shared memory above the 48 KB default needs an opt-in per kernel (once per process)
 static void moe_coop_smem_optin(void* kernel, int smem)
 {
-    if (smem <= 48 * 1024) return;
+    if (smem < 48 * 1024) return;   // static shared counts against the default carveout too: opt in at 48 KB exactly
     static std::map<void*, int> done;
     auto it = done.find(kernel);
     if (it != done.end() && it->second >= smem) return;

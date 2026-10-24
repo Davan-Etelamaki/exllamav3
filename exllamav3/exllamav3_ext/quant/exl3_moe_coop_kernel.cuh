@@ -22,6 +22,7 @@
 // actual run count exit at once.
 
 #include <cuda_fp16.h>
+#include <cuda_pipeline.h>
 #include "../util.h"
 #include "../util.cuh"
 #include "../compat.cuh"
@@ -33,7 +34,8 @@ namespace exl3_moe_coop_ns {
 
 constexpr int WK = 16;                          // k-split (warps per block)
 constexpr int WNT = MOE_COOP_WNT;               // adjacent n-tiles per warp
-constexpr int PF = 4;                           // prefetch ring depth
+constexpr int PF = 4;                           // register prefetch ring depth (non-async paths)
+constexpr int PF_ASYNC = 4;                     // cp.async smem ring depth (measured: 8 is slower, 4 optimal)
 constexpr int FOLD = 4;                         // fp16 -> fp32 fold cadence
 constexpr int THREADS = WK * 32;
 constexpr int COLS = WNT * 16;                  // columns per warp
@@ -44,7 +46,7 @@ template <bool WIDE> constexpr int tile_cols() { return tile_wn<WIDE>() * COLS; 
 template <bool WIDE> constexpr int tile_gpc() { return tile_cols<WIDE>() >= 128 ? 1 : 128 / tile_cols<WIDE>(); }  // block groups per 128-chunk
 template <bool WIDE> constexpr int tile_cpb() { return tile_cols<WIDE>() >= 128 ? tile_cols<WIDE>() / 128 : 1; }  // 128-chunks per block
 constexpr int MAX_SLOTS = 256;                  // MAX_BSZN * top_k bound (top_k <= 32)
-constexpr int STAGE_WORDS = WNT * 8 * 8;        // words per warp per k-slice at 8 bpw
+constexpr int STAGE_WORDS = WNT * 8 * 12;       // words per warp: max(staged 8bpw tile, 3bpw cp.async ring PF_ASYNC*GWORDS)
 constexpr float R_SCALE = 0.088388347648f;      // 1/sqrt(128)
 
 static_assert(THREADS == MOE_COOP_THREADS, "block size mismatch");
@@ -414,6 +416,72 @@ __device__ __forceinline__ void gemv_tile
             return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
     };
 
+    FragC_h ch[WNT][2] = {};
+    float2 acc0[WNT][2] = {};
+    // 3-bpw register path with cp.async staging (Hopper/Blackwell): 16B async copies into a
+    // per-warp smem ring of PF slices, consumed via LDS into the same lane->word mapping the
+    // shuffle dequant expects. Lifts in-flight bytes without spending registers on the ring.
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr bool ASYNC3 = REG && bits == 3 && !HALF;
+    #else
+    constexpr bool ASYNC3 = false;
+    #endif
+    if constexpr (ASYNC3)
+    {
+        const uint32_t* bs = B32 + (size_t) ks0 * slice_stride + (size_t) (group * WN + wn) * GWORDS;
+        uint32_t* ring = stage;                                                 // [PF][GWORDS]
+        auto issue = [&](int i)
+        {
+            if (lane < GWORDS / 4)
+                __pipeline_memcpy_async(ring + (i % PF_ASYNC) * GWORDS + lane * 4,
+                                        bs + (size_t) i * slice_stride + (size_t) lane * 4, 16);
+            __pipeline_commit();
+        };
+        #pragma unroll
+        for (int d = 0; d < PF_ASYNC; ++d)
+            if (d < myn) issue(d);
+        for (int ib = 0; ib < myn; ++ib)
+        {
+            __pipeline_wait_prior((PF_ASYNC - 1 < myn - 1 - ib) ? PF_ASYNC - 1 : myn - 1 - ib);   // slice ib is in the oldest group; at the tail fewer groups exist
+            __syncwarp();                                             // make the async-proxy writes of all lanes visible
+            uint32_t bw[WNT];
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t)
+                bw[t] = ring[(ib % PF_ASYNC) * GWORDS + t * LSTRIDE + lane];
+            if (ib + PF_ASYNC < myn) issue(ib + PF_ASYNC);
+            const size_t a_col = (size_t) (ks0 + ib) * 8 + (lane & 3);
+            FragB a01, a23;
+            a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
+            a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
+            a01[1] = hzero;
+            a23[1] = hzero;
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t)
+            {
+                FragB f0, f1;
+                const uint32_t awv = __shfl_sync(0xffffffffu, bw[t], x_src_a);
+                const uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
+                exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
+                exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
+                exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+            }
+            if ((ib + 1) % FOLD == 0 || ib + 1 == myn)
+            {
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                    #pragma unroll
+                    for (int f = 0; f < 2; ++f)
+                    {
+                        acc0[t][f].x += __low2float(ch[t][f][0]);
+                        acc0[t][f].y += __high2float(ch[t][f][0]);
+                        ch[t][f][0] = hzero;
+                    }
+            }
+        }
+        __pipeline_wait_prior(0);
+    }
+    else
+    {
     uint32_t pf[PF][LOADS];
     #pragma unroll
     for (int d = 0; d < PF; ++d)
@@ -421,9 +489,6 @@ __device__ __forceinline__ void gemv_tile
             #pragma unroll
             for (int l = 0; l < LOADS; ++l)
                 pf[d][l] = ld_b(d, l);
-
-    FragC_h ch[WNT][2] = {};
-    float2 acc0[WNT][2] = {};
 
     for (int ib = 0; ib < myn; ib += PF)
     {
@@ -508,6 +573,7 @@ __device__ __forceinline__ void gemv_tile
                     }
             }
         }
+    }
     }
 
     // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
