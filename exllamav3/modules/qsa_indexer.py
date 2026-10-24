@@ -616,7 +616,8 @@ class QSAIndexer(Module):
         One launch chain for ALL decode rows (seq == 1, one job per row): the few-query
         scorer with per-job T/pos0/bound/block-table row (MULTIROW), one row-wise top-k
         with per-job scan bound, one per-row pool expand. Mirrors the dsv4 batched
-        selection path. Valid for T_max <= SEL_TILE (single score tile).
+        selection path. The score stride follows the block-table capacity and the grid is sized
+        to t_max, so any live context length is served by the single chain.
         """
         import triton
         from .attention_fn.dsa_triton import _dsa_indexer_fewq_kernel, _dsa_pool_expand_kernel, dsa_debug_bounds
@@ -628,9 +629,12 @@ class QSAIndexer(Module):
         cr = self.compress_ratio
         k_sel = self.block_topk
         kp = -(-k_sel // 32) * 32
-        s_stride = -(-self.SEL_TILE // 128) * 128
-        scores = g_tensor_cache.get(dev, (self.SEL_SLAB * s_stride,), torch.half, "dsa_stile") \
-            [: R * s_stride].view(R, s_stride)
+        # Score stride fixed by the block-table capacity (pools addressable per row), so the
+        # kernel compiles once per model config regardless of live context length; the grid
+        # is sized to T_max and programs past each row's T retire (per-job T array).
+        s_stride = -(-block_table.shape[1] // 128) * 128
+        scores = g_tensor_cache.get_bucketed(dev, R * s_stride, torch.half, "qsa_multi_scores") \
+            .view(R, s_stride)
         pool_idx = g_tensor_cache.get_bucketed(dev, R * kp, torch.int32, "qsa_sel_pool") \
             .view(R, kp)
         w = self._sel_weights(R, dev)
@@ -681,16 +685,15 @@ class QSAIndexer(Module):
         out = torch.empty((bsz * seq, self.k_pad()), dtype = torch.int32, device = q_idx.device)
         if seq == 1 and bsz > 1:
             t_max = (int(cache_seqlens_cpu[:bsz].max()) + seq) // cr
-            if t_max <= self.SEL_TILE:
-                bt32 = self._bt_rows_cached(block_table, bsz, seq).view(bsz, -1)
-                a_pos, a_T = self._job_arrays(cache_seqlens_cpu, bsz, seq, q_idx.device)
-                if not q_idx.is_contiguous():
-                    q_idx = q_idx.contiguous()
-                self._select_rows_multi(
-                    q_idx.view(bsz, *q_idx.shape[2:]), pool_flat,
-                    a_pos, a_T, out, bt32, epp, q_idx.device, t_max,
-                )
-                return out
+            bt32 = self._bt_rows_cached(block_table, bsz, seq).view(bsz, -1)
+            a_pos, a_T = self._job_arrays(cache_seqlens_cpu, bsz, seq, q_idx.device)
+            if not q_idx.is_contiguous():
+                q_idx = q_idx.contiguous()
+            self._select_rows_multi(
+                q_idx.view(bsz, *q_idx.shape[2:]), pool_flat,
+                a_pos, a_T, out, bt32, epp, q_idx.device, t_max,
+            )
+            return out
         for b in range(bsz):
             pos0 = int(cache_seqlens_cpu[b])
             self._select_rows(
