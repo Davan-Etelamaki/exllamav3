@@ -66,8 +66,11 @@ bool BC_GatedDeltaNetSplit::needs_configure(int bsz, int seqlen, bool history, i
 {
     TORCH_CHECK(1 <= bsz && bsz <= MAX_BSZ && 1 <= seqlen && seqlen <= MAX_QLEN,
                 "BC_GatedDeltaNetSplit: shape out of range");
+    // [GS] histpool: the pool lookup IS the stage_key check. A configured entry for this
+    // (shape, stage_key) replays its graph; a miss hands out an unconfigured slot.
+    cur_stage_key = history ? stage_key : 0;
     Slot& s = slot(bsz, seqlen, history);
-    return !s.configured || (history && s.stage_key != stage_key);
+    return !s.configured;
 }
 
 void BC_GatedDeltaNetSplit::configure_slot
@@ -129,7 +132,7 @@ void BC_GatedDeltaNetSplit::configure_slot
                 "BC_GatedDeltaNetSplit: statics must be contiguous");
 
     s.graph = std::make_unique<Graph>();
-    s.stage_key = 0;
+    s.stage_key = cur_stage_key;   // [GS] histpool: entry keyed by requested stage_key
     s.configured = true;
 }
 
@@ -180,7 +183,7 @@ void BC_GatedDeltaNetSplit::configure_slot_kda
                 "BC_GatedDeltaNetSplit (KDA): statics must be contiguous");
 
     s.graph = std::make_unique<Graph>();
-    s.stage_key = 0;
+    s.stage_key = cur_stage_key;   // [GS] histpool: entry keyed by requested stage_key
     s.configured = true;
 }
 

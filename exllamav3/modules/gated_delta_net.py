@@ -1157,7 +1157,7 @@ class GatedDeltaNet(Module):
             core_attn_out, core_attn_out_f, qkv_xh, o_xh,
         )
         if history:
-            self.bc.set_stage_key(bsz, seqlen, True, id(rsl))
+            (None if _BC_KEEP_ON else self.bc.set_stage_key(bsz, seqlen, True, id(rsl)))  # [GS] histpool: entry already keyed by stage_key
 
     def project_qkvz_sliced(self, x: torch.Tensor, bsz: int, seqlen: int) -> tuple:
         """qkv and z projections as one sliced mgemm (fp32 outputs, like the Linears); m <= 32"""
@@ -1229,7 +1229,7 @@ class GatedDeltaNet(Module):
             qkv_xh, z_xh, o_xh,
         )
         if history:
-            self.bc.set_stage_key(bsz, seqlen, True, id(rsl))
+            (None if _BC_KEEP_ON else self.bc.set_stage_key(bsz, seqlen, True, id(rsl)))  # [GS] histpool: entry already keyed by stage_key
 
 
     @override
@@ -1332,14 +1332,19 @@ class GatedDeltaNet(Module):
         ):
             stage_key = id(rsl) if save_history else 0
             if _BC_KEEP_ON and save_history:
-                _bc_ptrs = self.__dict__.setdefault("_bc_staged_ptr", {})
-                _bc_gen  = self.__dict__.setdefault("_bc_gen", {})
-                _bc_shape = (bsz, seqlen)
+                # [GS] histpool: stable id per staging buffer TRIPLE (what the graph bakes).
+                # Distinct jobs -> distinct keys -> distinct pooled slots; revisiting a buffer
+                # hits its entry with zero reconfigure. Keys start at 1 (0 reserved for
+                # non-history). Allocator churn clears the map: a forced reconfigure is safe.
+                _bc_sk = self.__dict__.setdefault("_bc_stage_key", {})
                 _bc_sp = (rsl.spec_conv.data_ptr(), rsl.spec_beta.data_ptr(), rsl.spec_g.data_ptr())
-                if _bc_ptrs.get(_bc_shape) != _bc_sp:
-                    _bc_gen[_bc_shape] = _bc_gen.get(_bc_shape, 0) + 1
-                    _bc_ptrs[_bc_shape] = _bc_sp
-                stage_key = _bc_gen[_bc_shape]
+                sk = _bc_sk.get(_bc_sp)
+                if sk is None:
+                    if len(_bc_sk) > 512:
+                        _bc_sk.clear()
+                    sk = len(_bc_sk) + 1
+                    _bc_sk[_bc_sp] = sk
+                stage_key = sk
             if self.bc.needs_configure(bsz, seqlen, save_history, stage_key):
                 if _BC_STATS_ON:
                     _bc_stats_record(bsz, seqlen, save_history)

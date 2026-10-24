@@ -196,7 +196,17 @@ struct BC_GatedDeltaNetSplit
         std::unique_ptr<Graph> graph;
     };
     std::vector<Slot> slots;        // history == false (only seqlen == 1 ever populated)
-    std::vector<Slot> slots_hist;   // history == true
+    std::vector<Slot> slots_hist;   // history == true (kept for layout compat; pool is authoritative)
+    // [GS] histpool: history slots are POOLED per stage_key. Concurrent jobs sharing a
+    // (bsz, seqlen) own distinct staging buffers; the single slot discarded its captured
+    // graph on every alternation (configure_slot rebuilds Graph). Each distinct stage_key
+    // keeps its own slot+graph; LRU cap HIST_POOL. Vendor callers (stage_key==0 + retag via
+    // set_stage_key) degenerate to churn-equivalent behavior, never wrong-data sharing.
+    static constexpr int HIST_POOL = 8;
+    struct HistEntry { int64_t key = 0; uint64_t use = 0; Slot slot; };
+    std::vector<std::vector<HistEntry>> hist_pool;   // [(bsz-1)*MAX_QLEN + (seqlen-1)]
+    uint64_t hist_clock = 0;
+    int64_t cur_stage_key = 0;    // set by needs_configure before slot() use
 
 
     BC_GatedDeltaNetSplit
@@ -235,12 +245,25 @@ struct BC_GatedDeltaNetSplit
     {
         slots.resize(MAX_BSZ * MAX_QLEN);
         slots_hist.resize(MAX_BSZ * MAX_QLEN);
+        hist_pool.resize(MAX_BSZ * MAX_QLEN);
     }
 
     Slot& slot(int bsz, int seqlen, bool history)
     {
-        std::vector<Slot>& v = history ? slots_hist : slots;
-        return v[(bsz - 1) * MAX_QLEN + (seqlen - 1)];
+        if (!history) return slots[(bsz - 1) * MAX_QLEN + (seqlen - 1)];
+        // [GS] histpool: keyed lookup; miss yields an unconfigured slot (needs_configure -> configure)
+        auto& pool = hist_pool[(bsz - 1) * MAX_QLEN + (seqlen - 1)];
+        for (auto& e : pool) if (e.key == cur_stage_key) { e.use = ++hist_clock; return e.slot; }
+        if ((int) pool.size() >= HIST_POOL)
+        {
+            auto lru = std::min_element(pool.begin(), pool.end(),
+                [](const HistEntry& a, const HistEntry& b){ return a.use < b.use; });
+            lru->key = cur_stage_key; lru->use = ++hist_clock; lru->slot = Slot{};
+            return lru->slot;
+        }
+        pool.emplace_back(HistEntry{});
+        auto& e = pool.back(); e.key = cur_stage_key; e.use = ++hist_clock;
+        return e.slot;
     }
 
     // KDA-mode constructor
@@ -288,10 +311,23 @@ struct BC_GatedDeltaNetSplit
     {
         slots.resize(MAX_BSZ * MAX_QLEN);
         slots_hist.resize(MAX_BSZ * MAX_QLEN);
+        hist_pool.resize(MAX_BSZ * MAX_QLEN);
     }
 
     bool needs_configure(int bsz, int seqlen, bool history, int64_t stage_key = 0);
-    void set_stage_key(int bsz, int seqlen, bool history, int64_t stage_key) { slot(bsz, seqlen, history).stage_key = stage_key; }
+    void set_stage_key(int bsz, int seqlen, bool history, int64_t stage_key)
+    {
+        Slot& s = slot(bsz, seqlen, history);
+        s.stage_key = stage_key;
+        if (history)
+        {
+            // [GS] histpool: retag the entry so a later needs_configure(old_key) misses and
+            // reconfigures (vendor semantics), while run_bszN's slot() lookup still hits it.
+            auto& pool = hist_pool[(bsz - 1) * MAX_QLEN + (seqlen - 1)];
+            for (auto& e : pool) if (e.key == cur_stage_key) { e.key = stage_key; break; }
+            cur_stage_key = stage_key;
+        }
+    }
 
     void configure_slot_kda
     (
