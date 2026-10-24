@@ -669,6 +669,24 @@ class QSAIndexer(Module):
                 torch.where(ok, tok, tok.new_full((), -1)).int()
         return out.view(bsz * seq, k_pad)
 
+    def _bt_rows_cached(self, block_table, bsz, seq):
+        """
+        Row-expanded int32 block table for the gather kernel. Identical for every QSA layer
+        within one token, so memoize it: the key carries the source's data_ptr, version and
+        shape plus (bsz, seq); the cache holds a strong reference to the source, so while an
+        entry lives no other tensor can reuse that data_ptr, and any in-place rewrite (which
+        bumps _version through every view) misses. Rebuilds only when the table actually
+        changes: one copy launch per token instead of one per layer.
+        """
+        key = (block_table.data_ptr(), block_table._version, tuple(block_table.shape), bsz, seq)
+        cache = getattr(self, "_bt_rows_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[2]
+        bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
+            .reshape(bsz * seq, -1).contiguous()
+        self._bt_rows_cache = (key, block_table, bt_rows)
+        return bt_rows
+
     def sparse_attend(
         self,
         layer,
@@ -693,8 +711,7 @@ class QSAIndexer(Module):
         from ..cache.fp8 import CacheLayer_fp8
         bsz, seq = q.shape[:2]
         indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
-        bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
-            .reshape(bsz * seq, -1).contiguous()
+        bt_rows = self._bt_rows_cached(block_table, bsz, seq)
         if isinstance(layer, CacheLayer_quant):
             # Packed pages, dequantized online by the gather kernel
             qk, sk, qv, sv, kb, vb = layer.get_qkv()
