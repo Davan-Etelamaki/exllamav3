@@ -1754,12 +1754,21 @@ class Generator:
         if fwd_graph is None:
             from exllamav3.generator.fwd_graph import ForwardGraphRunner
             fwd_graph = self._fwd_graph = ForwardGraphRunner()
+        # MoE models (GPU-resident and CPU-hosted alike) stay eager: under an outer
+        # capture the fused run_bszN tier declines its own graph, and the eager
+        # fallback tiers mix host syncs (expert_count.tolist()) with dynamic-shape
+        # ops (nonzero) whose replay semantics are unfenced. Exclude by module scan
+        # (covers qwen4_exp, whose moe_cpu_hosts never populates) once per generator.
+        if not hasattr(self, "_fwd_moe"):
+            from exllamav3.modules.block_sparse_mlp import BlockSparseMLP
+            from exllamav3.modules.block_sparse_mlp_cpu import BlockSparseMLP_CPU
+            self._fwd_moe = next(
+                (m for m, _, _ in self.model.fwd_modules
+                 if isinstance(m, (BlockSparseMLP, BlockSparseMLP_CPU))), None,
+            )
         if (fwd_graph.enabled and fwd_graph.disabled_reason is None
                 and ids_staged and not active_embeddings
-                # MoE experts hosted on the CPU decide their work with host-side, data-
-                # dependent logic per token; that orchestration cannot be replayed, so
-                # such models stay eager until a graph-aware host-MoE design lands.
-                and not getattr(self.model.config, "moe_cpu_hosts", None)):
+                and self._fwd_moe is None):
             # The CPU embedding's host-side gather cannot be replayed, so the generator
             # re-runs it eagerly every round: it refills the module's reused pinned
             # staging buffer (stable address, keyed by shape), which is the graph's
