@@ -103,6 +103,9 @@ def test_ptx_portable(device, tmp_path):
         name = "ptx_portable_test", cpp_sources = CPP_SRC, cuda_sources = f"// ptx_portable.cuh {digest}\n" + CUDA_SRC,
         functions = ["run"],
         extra_include_paths = [inc], verbose = False,
+        # torch's own headers (ATen/core/List_inl.h) need c++20; -fpermissive matches the repo build recipe
+        extra_cflags = ["-std=c++20", "-fpermissive"],
+        extra_cuda_cflags = ["-std=c++20", "-Xcompiler=-fpermissive"],
     )
     rng = np.random.default_rng(0)
     n = 1 << 16
