@@ -594,6 +594,72 @@ class QSAIndexer(Module):
             pooled_flat[pflat.flatten()[vm]] = pooled.reshape(-1, dk)[vm]
         return q
 
+    def _job_arrays(self, cache_seqlens_cpu, bsz, seq, dev):
+        """
+        Per-job i32 arrays for the MULTIROW selection kernels: q_pos0 and the pool entry
+        count T = (pos0 + seq) // cr (also the top-k scan bound and the causal clamp).
+        Identical for every QSA layer within one token, so memoize on the source CPU
+        tensor's (data_ptr, version, bsz) plus a strong ref, same contract as _bt_rows_cached.
+        """
+        key = (cache_seqlens_cpu.data_ptr(), cache_seqlens_cpu._version, bsz, seq)
+        cache = getattr(self, "_job_arrays_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[2]
+        pos_host = cache_seqlens_cpu[:bsz].to(dtype = torch.int32)
+        t_host = (pos_host + seq) // self.compress_ratio
+        pair = (pos_host.to(device = dev), t_host.to(device = dev))
+        self._job_arrays_cache = (key, cache_seqlens_cpu, pair)
+        return pair
+
+    def _select_rows_multi(self, q_rows, pool_flat, a_pos, a_T, out_rows, block_table, epp, dev, t_max):
+        """
+        One launch chain for ALL decode rows (seq == 1, one job per row): the few-query
+        scorer with per-job T/pos0/bound/block-table row (MULTIROW), one row-wise top-k
+        with per-job scan bound, one per-row pool expand. Mirrors the dsv4 batched
+        selection path. Valid for T_max <= SEL_TILE (single score tile).
+        """
+        import triton
+        from .attention_fn.dsa_triton import _dsa_indexer_fewq_kernel, _dsa_pool_expand_kernel, dsa_debug_bounds
+        from .attention_fn.smem import pick_config, shared_bytes, halving_ladder
+        from ..ext import exllamav3_ext as ext
+        from ..util.tensor import g_tensor_cache
+        R = q_rows.shape[0]
+        H_i, D_i = q_rows.shape[1], q_rows.shape[2]
+        cr = self.compress_ratio
+        k_sel = self.block_topk
+        kp = -(-k_sel // 32) * 32
+        s_stride = -(-self.SEL_TILE // 128) * 128
+        scores = g_tensor_cache.get(dev, (self.SEL_SLAB * s_stride,), torch.half, "dsa_stile") \
+            [: R * s_stride].view(R, s_stride)
+        pool_idx = g_tensor_cache.get_bucketed(dev, R * kp, torch.int32, "qsa_sel_pool") \
+            .view(R, kp)
+        w = self._sel_weights(R, dev)
+
+        def i_args(bn):
+            args = (q_rows, w, pool_flat, scores, a_T, R, a_pos, a_T, block_table, block_table.stride(0))
+            consts = dict(
+                H_i = H_i, H_pad = max(triton.next_power_of_2(H_i), 16), D_i = D_i,
+                S_stride = s_stride, compress_rate = cr, scale = self.scale,
+                BLOCK_N = bn, SEQ = 1, MULTIROW = 1, EPP = epp,
+                DEBUG_BOUNDS = 1 if dsa_debug_bounds else 0,
+                DEBUG_PAGES = pool_flat.shape[0] // epp if dsa_debug_bounds else 0,
+            )
+            return args, consts
+        with torch.cuda.device(dev):
+            def probe(bn):
+                args, consts = i_args(bn)
+                return shared_bytes(_dsa_indexer_fewq_kernel, args, **consts, num_warps = 8, num_stages = 2)
+            bn = pick_config(dev, "qsa_indexer_fewq", (H_i, D_i, s_stride, cr, epp), halving_ladder(128), probe)
+            args, consts = i_args(bn)
+            _dsa_indexer_fewq_kernel[(R, triton.cdiv(max(t_max, 1), bn))](*args, **consts, num_warps = 8, num_stages = 2)
+        ext.dsa_topk(scores, pool_idx, k_sel, a_T, 1)
+        with torch.cuda.device(dev):
+            _dsa_pool_expand_kernel[(R, triton.cdiv(out_rows.shape[1], 256))](
+                pool_idx, out_rows, a_pos, P = cr, SEL = self.block_topk,
+                K_pad = out_rows.shape[1], KP_pool = kp, TAIL = 1,
+                SEQ = 1, MULTIROW = 1, BLOCK = 256,
+            )
+
     def select_indices_paged(
         self,
         layer,
@@ -613,6 +679,18 @@ class QSAIndexer(Module):
         pool_flat = layer.pooled.view(-1, self.head_dim)
         bt = block_table.int()
         out = torch.empty((bsz * seq, self.k_pad()), dtype = torch.int32, device = q_idx.device)
+        if seq == 1 and bsz > 1:
+            t_max = (int(cache_seqlens_cpu[:bsz].max()) + seq) // cr
+            if t_max <= self.SEL_TILE:
+                bt32 = self._bt_rows_cached(block_table, bsz, seq).view(bsz, -1)
+                a_pos, a_T = self._job_arrays(cache_seqlens_cpu, bsz, seq, q_idx.device)
+                if not q_idx.is_contiguous():
+                    q_idx = q_idx.contiguous()
+                self._select_rows_multi(
+                    q_idx.view(bsz, *q_idx.shape[2:]), pool_flat,
+                    a_pos, a_T, out, bt32, epp, q_idx.device, t_max,
+                )
+                return out
         for b in range(bsz):
             pos0 = int(cache_seqlens_cpu[b])
             self._select_rows(
