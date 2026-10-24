@@ -84,6 +84,26 @@ def main():
         print(f"RED parity: maxdiff k={dk} v={dv}"); sys.exit(1)
     print(f"GREEN unit parity: maxdiff k={dk} v={dv} (bit-exact vs torch nvfp4_dequantize)")
 
+    # ---- batch>1 parity with a shuffled block_table (per-seq pool prefix + phys mapping)
+    bsz, q_len2 = 2, 64
+    cs2 = torch.tensor([3000, 500], dtype=torch.int32, device=DEV)
+    nbp = 12                       # uniform per-seq page capacity: covers full 3064-row writes
+    nb2 = torch.div(cs2 + q_len2 + PAGE_SIZE - 1, PAGE_SIZE, rounding_mode='floor')
+    bt2 = torch.randperm(bsz * nbp, dtype=torch.int32, device=DEV).view(bsz, nbp)
+    lay2 = CacheLayer_nvfp4(None, _Spec(), 0, bsz * nbp * PAGE_SIZE); lay2.alloc(torch.device(DEV))
+    hist_k = torch.randn(bsz, nbp * PAGE_SIZE - 8, KH, D, dtype=torch.float16, device=DEV) * 0.5
+    hist_v = torch.randn(bsz, nbp * PAGE_SIZE - 8, KH, D, dtype=torch.float16, device=DEV) * 0.5
+    lay2.update_kv(torch.zeros(bsz, dtype=torch.int32, device=DEV), bt2, hist_k, hist_v, nbp * PAGE_SIZE - 8)
+    ks_p, vs_p, _ = lay2.stage_range(cs2, bt2, q_len2)
+    total = int(nb2.sum())
+    idx = torch.cat([bt2[0, :nb2[0]].long(), bt2[1, :nb2[1]].long()])
+    ks_r = nvfp4_dequantize(lay2.k[idx].int(), lay2.ks[idx].half())
+    vs_r = nvfp4_dequantize(lay2.v[idx].int(), lay2.vs[idx].half())
+    dkb = (ks_p[:total] - ks_r).abs().max().item(); dvb = (vs_p[:total] - vs_r).abs().max().item()
+    if dkb != 0.0 or dvb != 0.0:
+        print(f"RED batch2 parity: maxdiff k={dkb} v={dvb}"); sys.exit(1)
+    print(f"GREEN batch2+shuffled-bt parity: maxdiff k={dkb} v={dvb} (bsz=2, cs=[3000,500], permuted pages)")
+
     # ---- attribution + semantics on one staged call vs forced-online call
     def run_staged():  return attn_dispatch(q, new_k, new_v, cache=lay, block_table=bt, cache_seqlens=cs.clone(), causal=True)
     thr = dsp._NVFP4_ONLINE_MAX_Q

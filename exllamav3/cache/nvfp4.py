@@ -29,11 +29,13 @@ def _nvfp4_bulk_dequant_kernel(
         k4_ptr, ks_ptr, v4_ptr, vs_ptr, ok_ptr, ov_ptr, bt_ptr, cs_ptr,
         extra, stride_bt_b,
         H: tl.constexpr, HALF: tl.constexpr, HSC: tl.constexpr, FULL: tl.constexpr,
-        PAGE: tl.constexpr, ROWS: tl.constexpr):
-    # One program per (sequence, page): dequantizes one physical page of K and V into the
-    # contiguous staging pool. Whole pages are staged, including rows past the sequence
-    # length in the last page — the format decodes to finite values for any bit pattern and
-    # attention masks those rows out via cache_seqlens.
+        PAGE: tl.constexpr, ROWS: tl.constexpr, SPLITS: tl.constexpr):
+    # One program per (sequence, page, row-slab): dequantizes ROWS rows of one physical
+    # page of K and V into the contiguous staging pool. SPLITS-way row parallelism keeps
+    # small pools (few pages) off the latency floor on 188-SM parts. Whole pages are
+    # staged, including rows past the sequence length in the last page — the format
+    # decodes to finite values for any bit pattern and attention masks those rows out
+    # via cache_seqlens.
     b = tl.program_id(0)
     j = tl.program_id(1)
     eff = tl.load(cs_ptr + b).to(tl.int32) + extra
@@ -44,12 +46,14 @@ def _nvfp4_bulk_dequant_kernel(
         base += (tl.load(cs_ptr + bb).to(tl.int32) + extra + PAGE - 1) // PAGE
     phys = tl.load(bt_ptr + b * stride_bt_b + j).to(tl.int64)
     slot = base + j
+    r_lo = tl.program_id(2) * (PAGE // SPLITS)
     rows = tl.arange(0, ROWS)
     hs = tl.arange(0, H)
     cb = tl.arange(0, HALF)
     cq = tl.arange(0, HSC)
     cf = tl.arange(0, FULL)
-    for r0 in range(0, PAGE, ROWS):
+    for rr in range(0, PAGE // SPLITS, ROWS):
+        r0 = r_lo + rr
         tok = (phys * PAGE + r0).to(tl.int64) + rows
         dst_tok = (slot.to(tl.int64) * PAGE + r0) + rows
         src = tok[:, None, None] * (H * HALF) + hs[None, :, None] * HALF + cb[None, None, :]
@@ -197,11 +201,11 @@ class CacheLayer_nvfp4(CacheLayer):
             bt_stage[b, :nb] = torch.arange(slot, slot + nb, dtype = torch.int32, device = block_table.device)
             slot += nb
         if self.k.is_cuda:
-            _nvfp4_bulk_dequant_kernel[(bsz, max(nblocks))](
+            _nvfp4_bulk_dequant_kernel[(bsz, max(nblocks), 8)](
                 self.k, self.ks, self.v, self.vs, ks, vs, block_table, cache_seqlens,
                 extra, block_table.stride(0),
                 H = h, HALF = half_d, HSC = self.ks.shape[3], FULL = half_d * 2,
-                PAGE = PAGE_SIZE, ROWS = 32, num_warps = 4)
+                PAGE = PAGE_SIZE, ROWS = 32, SPLITS = 8, num_warps = 4)
         else:
             slot = 0
             for b in range(bsz):
