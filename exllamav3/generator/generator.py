@@ -1313,6 +1313,13 @@ class Generator:
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
+        # [GS] asynccfguard: draft steps chain on-device (batch_ids.copy_(new_ids)); the
+        # per-step conf .cpu() was only the early-stop heuristic and drained the pipeline
+        # every step (top py-spy leaf). Async mode: enqueue the full window, collect conf
+        # on device, ONE readback after the loop, trim with the identical reach rule.
+        _async_conf = cal is not None and os.environ.get("EXL3_DRAFT_SYNC_CONF", "0") != "1"
+        conf_dev = None
+        conf_steps = 0
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -1328,19 +1335,38 @@ class Generator:
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
-            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
-            batch_ids.copy_(new_ids)
-            cache_seqlens += 1
-            temp_hidden = batch_state
+            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids, non_blocking = _async_conf)
             draft_conf = params.get("draft_conf")
             if cal is not None and draft_conf is not None:
-                c = draft_conf.float().cpu()
-                conf_cols.append(c)
-                est = [cal.estimate(v) for v in c.view(-1).tolist()]
+                if _async_conf:
+                    if conf_dev is None:
+                        conf_dev = torch.empty((batch_size, window), dtype = torch.float,
+                                               device = draft_conf.device)
+                    conf_dev[:batch_size, idx] = draft_conf.view(-1)[:batch_size]
+                    conf_steps = idx + 1
+                else:
+                    c = draft_conf.float().cpu()
+                    conf_cols.append(c)
+                    est = [cal.estimate(v) for v in c.view(-1).tolist()]
+                    reach = est if reach is None else [r * e for r, e in zip(reach, est)]
+                    if idx + 1 < window and max(reach) < cal.confidence:
+                        window = idx + 1
+                        break
+        if _async_conf and conf_dev is not None and conf_steps == window:
+            c_all = conf_dev[:, :window].float().cpu()   # ONE readback for the whole round
+            reach = None
+            for i in range(window):
+                est = [cal.estimate(v) for v in c_all[:, i].tolist()]
                 reach = est if reach is None else [r * e for r, e in zip(reach, est)]
-                if idx + 1 < window and max(reach) < cal.confidence:
-                    window = idx + 1
+                if i + 1 < window and max(reach) < cal.confidence:
+                    window = i + 1
                     break
+            conf_cols = [c_all[:, i:i+1] for i in range(window)]
+        elif _async_conf and conf_dev is not None and conf_steps > 0:
+            # a step exported no conf: keep the full window untrimmed (legacy semantics:
+            # early-stop evaluation simply stopped happening), publish only real columns
+            c_all = conf_dev[:, :conf_steps].float().cpu()
+            conf_cols = [c_all[:, i:i+1] for i in range(conf_steps)]
 
         if conf_cols and len(conf_cols) == window:
             self._draft_conf_round = {
