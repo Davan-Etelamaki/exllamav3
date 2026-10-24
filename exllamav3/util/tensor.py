@@ -225,10 +225,12 @@ class GTensorCache:
 
     def __init__(self):
         self.cache = {}
+        self._slice_cache = {}
 
     def make_key(self, device, shape, dtype, x):
-        device = torch.device(device)
-        return f"{device}/{str(shape)}/{str(dtype)}/{x}"
+        # [GS] tuple key: f-string per call measured hot in live py-spy (make_key+get_bucketed
+        # 2.5% of generator wall). Tuple hash skips string build; injectivity unchanged.
+        return (torch.device(device), tuple(shape), dtype, x)
 
     def get(self, device, shape, dtype, x = ""):
         key = self.make_key(device, shape, dtype, x)
@@ -245,7 +247,15 @@ class GTensorCache:
         count): nearby sizes share one kept entry instead of ratcheting a new allocation per
         distinct size, and the total kept per tag is bounded by 2x the largest use."""
         nb = 1 << max(numel - 1, 0).bit_length()
-        return self.get(device, (nb,), dtype, x)[:numel]
+        if numel == nb:
+            return self.get(device, (nb,), dtype, x)
+        # [GS] memoize the sliced view too: [:numel] built a fresh tensor per call
+        key = (torch.device(device), nb, dtype, x, numel)
+        sl = self._slice_cache.get(key)
+        if sl is None:
+            sl = self.get(device, (nb,), dtype, x)[:numel]
+            self._slice_cache[key] = sl
+        return sl
 
     def get_scratch(self, device, numel, dtype, x, rows: int, static_rows: int | None = None):
         """Flat workspace of numel elements for one call processing `rows` rows. Decode-class calls (rows up to
