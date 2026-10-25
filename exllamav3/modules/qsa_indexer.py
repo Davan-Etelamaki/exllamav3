@@ -9,6 +9,13 @@ from .module import Module
 from .linear import Linear
 from .rmsnorm import RMSNorm
 from ..model.config import Config
+import triton
+from .attention_fn.triton_paged import _fast_dispatch
+from .attention_fn.dsa_triton import (
+    dsa_indexer_scores, _dsa_indexer_fewq_kernel, _dsa_pool_expand_kernel, dsa_debug_bounds)
+from .attention_fn.smem import pick_config, shared_bytes, halving_ladder
+from ..ext import exllamav3_ext as ext
+from ..util.tensor import g_tensor_cache, get_for_device
 
 """
 QSA (Qwen sparse attention) indexer: selects which tokens each query may attend to, at 4-token
@@ -276,7 +283,6 @@ class QSAIndexer(Module):
 
     @staticmethod
     def _workspace(rows: int, numel: int, dtype, tag: str, device):
-        from ..util.tensor import g_tensor_cache
         # Power-of-two per-call size beyond the static rows: the score width grows with the context
         return g_tensor_cache.get_scratch(device, numel, dtype, tag, rows, QSAIndexer.STATIC_ROWS)
 
@@ -291,7 +297,6 @@ class QSAIndexer(Module):
         return w[:rows]
 
     def _select_rows(self, q_rows, pool_flat, pos0, T, out_rows, block_table = None, epp = 0):
-        from .attention_fn.triton_paged import _fast_dispatch
         """
         One sequence's selection for consecutive query rows starting at absolute position pos0:
         q_rows (R, H, dk) roped, pool_flat (rows, dk) pooled keys (contiguous, or the paged plane
@@ -302,10 +307,6 @@ class QSAIndexer(Module):
         top-k candidates are merged under dsa_topk's own total order (score desc, index asc), so
         the result is identical to a single pass over the whole row.
         """
-        import triton
-        from .attention_fn.dsa_triton import dsa_indexer_scores, _dsa_pool_expand_kernel
-        from ..ext import exllamav3_ext as ext
-        from ..util.tensor import g_tensor_cache
         R = q_rows.shape[0]
         cr = self.compress_ratio
         dev = q_rows.device
@@ -517,7 +518,6 @@ class QSAIndexer(Module):
         no per-layer H2D copy of the positions, no index arithmetic in torch. The pool kernel
         also writes the chunk's trailing incomplete pool (never selected; rebuilt once complete).
         """
-        from .attention_fn.triton_paged import _fast_dispatch
         from .attention_fn.qsa_triton import _qsa_stage_kernel, _qsa_pool_update_kernel
         from .attention_fn.mla_triton import _mla_plane_update_kernel
         from ..util.tensor import g_tensor_cache, get_for_device
@@ -649,12 +649,6 @@ class QSAIndexer(Module):
         count bounded: an exact t_max stride would recompile per token as context grows.
         The grid is sized to t_max and programs past each job's T retire (per-job T array).
         """
-        import triton
-        from .attention_fn.dsa_triton import _dsa_indexer_fewq_kernel, _dsa_pool_expand_kernel, dsa_debug_bounds
-        from .attention_fn.triton_paged import _fast_dispatch
-        from .attention_fn.smem import pick_config, shared_bytes, halving_ladder
-        from ..ext import exllamav3_ext as ext
-        from ..util.tensor import g_tensor_cache
         R = q_rows.shape[0]
         H_i, D_i = q_rows.shape[1], q_rows.shape[2]
         cr = self.compress_ratio
