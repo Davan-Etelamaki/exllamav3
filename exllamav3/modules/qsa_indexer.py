@@ -609,22 +609,31 @@ class QSAIndexer(Module):
             pooled_flat[pflat.flatten()[vm]] = pooled.reshape(-1, dk)[vm]
         return q
 
+    # Class-level, VALUE-keyed: the arrays are a pure function of (seqlens values, bsz, seq,
+    # compress_ratio) and every QSA layer with the same compress_ratio sees the same values
+    # for one token. The generator hands each layer a FRESH CPU tensor per step, so the old
+    # (data_ptr, version) key missed on every layer of every token: 24 pageable H2D copies
+    # per token, 7.1% of live decode samples (py-spy 20 s, prod, 2026-10-24).
+    _JOB_CACHE: dict = {}
+    _JOB_CACHE_CAP = 64
+
     def _job_arrays(self, cache_seqlens_cpu, bsz, seq, dev):
         """
         Per-job i32 arrays for the MULTIROW selection kernels: q_pos0 and the pool entry
         count T = (pos0 + seq) // cr (also the top-k scan bound and the causal clamp).
-        Identical for every QSA layer within one token, so memoize on the source CPU
-        tensor's (data_ptr, version, bsz) plus a strong ref, same contract as _bt_rows_cached.
+        Shared across all QSA layers through _JOB_CACHE; the returned GPU tensors are
+        read-only to the kernels, so aliasing between layers is safe.
         """
-        key = (cache_seqlens_cpu.data_ptr(), _memo_ver(cache_seqlens_cpu), bsz, seq)
-        cache = getattr(self, "_job_arrays_cache", None)
-        if cache is not None and cache[0] == key:
-            return cache[2]
-        pos_host = cache_seqlens_cpu[:bsz].to(dtype = torch.int32)
-        t_host = (pos_host + seq) // self.compress_ratio
-        pair = (pos_host.to(device = dev), t_host.to(device = dev))
-        if key[1] is not None:      # inference tensor: no version to invalidate against
-            self._job_arrays_cache = (key, cache_seqlens_cpu, pair)
+        key = (tuple(cache_seqlens_cpu[:bsz].tolist()), bsz, seq, self.compress_ratio, str(dev))
+        pair = QSAIndexer._JOB_CACHE.get(key)
+        if pair is None:
+            with torch.inference_mode(False):     # cache entries are always normal tensors:
+                pos_host = torch.tensor(key[0], dtype = torch.int32)    # a build inside the
+                t_host = (pos_host + seq) // self.compress_ratio        # warmup pass must not
+                pair = (pos_host.to(device = dev), t_host.to(device = dev))  # poison serving
+            if len(QSAIndexer._JOB_CACHE) >= QSAIndexer._JOB_CACHE_CAP:
+                QSAIndexer._JOB_CACHE.pop(next(iter(QSAIndexer._JOB_CACHE)))
+            QSAIndexer._JOB_CACHE[key] = pair
         return pair
 
     def _select_rows_multi(self, q_rows, pool_flat, a_pos, a_T, out_rows, block_table, epp, dev, t_max, seq):

@@ -90,8 +90,10 @@ def test_memo_skipped_for_normal_input_inside_inference_mode(device):
         assert torch.is_inference(out[0])              # derived inside the pass
         assert not hasattr(s, "_bt_rows_cache")        # ... and so never kept
         pair = s._job_arrays(cs, bsz, seq, device)
-        assert torch.is_inference(pair[0])
-        assert not hasattr(s, "_job_arrays_cache")
+        # Value-keyed class cache: safe to keep across the pass boundary, and entries are
+        # built under inference_mode(False) so warmup can never poison serving with an
+        # inference tensor (contract updated 2026-10-24 with the _job_arrays value cache).
+        assert not torch.is_inference(pair[0])
 
     # The serving path then gets normal tensors, which are writable in place.
     a = s._bt_tables(bt, bsz, seq)
@@ -99,7 +101,9 @@ def test_memo_skipped_for_normal_input_inside_inference_mode(device):
     a[0].zero_()
     b = s._job_arrays(cs, bsz, seq, device)
     assert not torch.is_inference(b[0])
-    b[0].zero_()
+    assert b is pair          # the value-keyed cache hit across the pass boundary
+    b[0].zero_()              # cache entries are normal tensors: writable
+    QSAIndexer._JOB_CACHE.clear()
 
 
 def test_memo_still_caches_outside_inference(device):
