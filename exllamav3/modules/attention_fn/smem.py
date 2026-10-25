@@ -23,6 +23,7 @@ _env_limit = int(os.environ.get("EXL3_TRITON_SMEM_LIMIT", "0") or "0")
 # EXL3_TRITON_SMEM_DEBUG=1 prints every pick with its measured footprint
 _debug = bool(os.environ.get("EXL3_TRITON_SMEM_DEBUG"))
 _picks = {}
+_arch = {}
 
 
 class NoFittingConfig(RuntimeError):
@@ -63,8 +64,13 @@ def pick_config(device, name: str, key, candidates, probe):
     NoFittingConfig when no candidate fits (also cached).
     """
     idx = _dev_index(device)
-    limit = smem_limit(idx)
-    full_key = (torch.cuda.get_device_capability(idx), limit, name, key)
+    # (capability, limit) is constant per device for the process lifetime; recomputing
+    # get_device_capability per launch showed up in live py-spy (smem.py:67, prod 2026-10-25)
+    ap = _arch.get(idx)
+    if ap is None:
+        ap = _arch[idx] = (torch.cuda.get_device_capability(idx), smem_limit(idx))
+    limit = ap[1]
+    full_key = (ap[0], ap[1], name, key)
     cfg = _picks.get(full_key, ...)
     if cfg is None:
         raise NoFittingConfig(f"{name}: no tile configuration fits the device's {limit} B of dynamic shared memory")

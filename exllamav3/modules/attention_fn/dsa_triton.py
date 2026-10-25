@@ -1234,7 +1234,8 @@ def dsa_indexer_scores(
                 halving_ladder(block_n),
                 lambda bn: shared_bytes(_dsa_indexer_fewq_kernel, f_args, **f_consts(bn), num_warps = num_warps, num_stages = num_stages))
             grid = (R, triton.cdiv(max(T, 1), block_n))
-            _dsa_indexer_fewq_kernel[grid](*f_args, **f_consts(block_n), num_warps = num_warps, num_stages = num_stages)
+            _fast_dispatch(_dsa_indexer_fewq_kernel, grid, f_args,
+                           dict(f_consts(block_n), num_warps = num_warps, num_stages = num_stages))
         else:
             t_args = (q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt)
             def t_consts(cfg):
@@ -1251,5 +1252,6 @@ def dsa_indexer_scores(
                 ladder,
                 lambda cfg: shared_bytes(_dsa_indexer_kernel, t_args, **t_consts(cfg), num_warps = num_warps, num_stages = num_stages))
             grid = (triton.cdiv(R, block_m), triton.cdiv(max(T, 1), block_n))
-            _dsa_indexer_kernel[grid](*t_args, **t_consts((block_m, block_n)), num_warps = num_warps, num_stages = num_stages)
+            _fast_dispatch(_dsa_indexer_kernel, grid, t_args,
+                           dict(t_consts((block_m, block_n)), num_warps = num_warps, num_stages = num_stages))
     return scores[:, :T]
