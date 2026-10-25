@@ -173,8 +173,9 @@ def test_tiled_tables_match_stored(device):
     def ws(shape, dtype):
         return torch.empty(shape, dtype = dtype, device = device)
 
-    a = m._tiled_tables(ws)
-    b = m._tiled_tables(ws)
+    a = m._tiled_tables()
+    b = m._tiled_tables()
+    assert a is b  # memoized per site (64b1a07d)
     Mpad = m.proj_h.shape[0]
     ref_i8 = torch.empty((2, Mpad, 4 * 1024), dtype = torch.int8, device = device)
     ref_sb = torch.empty((Mpad,), dtype = torch.float, device = device)

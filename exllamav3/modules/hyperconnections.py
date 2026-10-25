@@ -544,16 +544,6 @@ class GatedResidual(Module):
         tables = (proj_i8_c, proj_sb_c, up_i8_c, up_sb_c)
         self._tiled_tables_cache = (ph.data_ptr(), ux.data_ptr(), ph, ux, tables)
         return tables
-        proj_i8 = ws((2, Mpad, H * Dh), torch.int8)
-        proj_sb = ws((Mpad,), torch.float)
-        ext.det_quant_weight(self.proj_h, proj_i8, proj_sb)
-        up = ws((H * Dh, self.rank), torch.half).view(H, Dh // 4, 4, self.rank)
-        up.copy_(self.upx_h.permute(0, 1, 3, 2))
-        up = up.view(H * Dh, self.rank)
-        up_i8 = ws((2, H * Dh, self.rank), torch.int8)
-        up_sb = ws((H * Dh,), torch.float)
-        ext.det_quant_weight(up, up_i8, up_sb)
-        return proj_i8, proj_sb, up_i8, up_sb
 
     def _gr_mix_bufs(self, dev, R, M, H, Dh):
         """View memo for the fused decode path: the three bucketed lookups per site per

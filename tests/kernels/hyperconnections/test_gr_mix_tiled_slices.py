@@ -61,7 +61,7 @@ def _run(m, s3, S_ws, fill = None):
     Mpad = m.proj_h.shape[0]
     Rpad = -(-R // 64) * 64
     ws = lambda shape, dtype: torch.empty(shape, dtype = dtype, device = dev)
-    proj_i8, proj_sb, up_i8, up_sb = m._tiled_tables(ws)
+    proj_i8, proj_sb, up_i8, up_sb = m._tiled_tables()
     dm = torch.full((S_ws, Rpad, Mpad), fill if fill is not None else 0.0, device = dev)
     ss = torch.full((S_ws, Rpad), fill if fill is not None else 0.0, device = dev)
     post = torch.empty((R, H), device = dev) if m.use_combine else None
@@ -115,7 +115,7 @@ def test_tiled_empty_rows(device):
     s3 = torch.empty((0, 4, D), device = device)
     S = ext.gr_mix_tiled_slices(0, D, m.proj_h.shape[0])
     ws = lambda shape, dtype: torch.empty(shape, dtype = dtype, device = device)
-    proj_i8, proj_sb, up_i8, up_sb = m._tiled_tables(ws)
+    proj_i8, proj_sb, up_i8, up_sb = m._tiled_tables()
     Mpad = m.proj_h.shape[0]
     pbuf = torch.full((64,), 7.0, device = device)
     mbuf = torch.full((64,), 7.0, dtype = torch.half, device = device)
