@@ -133,22 +133,25 @@ class SlicedMultiLinear:
         # tensor per miss (callers like attn.prealloc_qkv_cptrs_1 hold tables across steps;
         # a rotating GPU buffer would corrupt them). Pinned-slot reuse is gated on a
         # recorded event so a slot is never rewritten while its copy is in flight.
+        # Pinned staging ring + SYNCHRONOUS pinned H2D. The async form this replaces
+        # (non_blocking=True, event recorded after the copy) RETURNED THE TABLE WHILE ITS
+        # COPY WAS STILL IN FLIGHT: the table's contents were only ordered behind the
+        # copy on the stream that enqueued it, so any reader on another stream -- or a
+        # caller that holds the table across steps (attn/sliding_attn
+        # prealloc_qkv_cptrs_1) -- could launch against a half-written pointer table.
+        # Those entries are raw device addresses written by the consumer kernel, so a
+        # partially populated table is an illegal device WRITE. Pinned-source sync keeps
+        # the win over the pageable-sync H2D it replaced (the 5.8% py-spy leaf) and
+        # restores the pre-change contract: the table is complete when c_ptrs returns.
         if getattr(self, "_cptr_pin", None) is None:
             self._cptr_pin = [torch.empty(self.num_slices, dtype = torch.long, pin_memory = True)
-                              for _ in range(4)]
-            self._cptr_evt = [None] * 4
+                              for _ in range(2)]
             self._cptr_slot = 0
         i = self._cptr_slot
-        self._cptr_slot = (i + 1) % 4
-        evt = self._cptr_evt[i]
-        if evt is not None and not evt.query():
-            evt.synchronize()
+        self._cptr_slot = (i + 1) % 2
         self._cptr_pin[i].copy_(torch.tensor(ptrs, dtype = torch.long))
         out = torch.empty(self.num_slices, dtype = torch.long, device = self.device)
-        out.copy_(self._cptr_pin[i], non_blocking = True)
-        evt = torch.cuda.Event()
-        evt.record()
-        self._cptr_evt[i] = evt
+        out.copy_(self._cptr_pin[i])
         self._cptr_last = (key, out)
         return out
 
