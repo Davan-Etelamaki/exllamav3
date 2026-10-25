@@ -90,8 +90,11 @@ def _rewind_layers(layers, slot: int, last_history: int, num_tokens: int,
     for l in layers:
         if isinstance(l, GDNLayerState):
             # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
-            # torch.device, so normalize rather than assume a .index attribute
-            device_index = torch.device(l.device).index
+            # torch.device, so normalize rather than assume a .index attribute. Static per
+            # state object, so parse once (cut 21).
+            device_index = l.__dict__.get("_dev_idx")
+            if device_index is None:
+                device_index = l.__dict__["_dev_idx"] = torch.device(l.device).index
             cj = l.rewind_conv_job(slot, last_history, num_tokens)
             if cj is not None:
                 conv_by_device.setdefault(device_index, []).append(cj)
@@ -327,6 +330,8 @@ class GDNLayerState:
         # (bsz, tokens, token stride) of the pass the staging buffers currently hold
         self.spec_shape = None
         self.device = None
+        self.__dict__.pop("_scan_geom", None)
+        self.__dict__.pop("_dev_idx", None)
         self.max_history = max_history
         self.max_batch_size = max_batch_size
         self.cache_id = cache_id
@@ -337,6 +342,8 @@ class GDNLayerState:
         assert self.device is None, "recurrent state dtype must be set before the state is allocated"
         assert dtype in (torch.float, torch.half), "recurrent state dtype must be float32 or float16"
         self.recurrent_state = torch.empty_like(self.recurrent_state, dtype = dtype)
+        self.__dict__.pop("_scan_geom", None)
+        self.__dict__.pop("_dev_idx", None)
 
 
     def get_checkpoint_size(self):
@@ -364,6 +371,8 @@ class GDNLayerState:
         self.recurrent_state.zero_()
         self.spec_shape = None
         self.device = device
+        self.__dict__.pop("_scan_geom", None)
+        self.__dict__.pop("_dev_idx", None)
 
 
     def free(self):
@@ -374,6 +383,8 @@ class GDNLayerState:
         self.spec_g = torch.empty_like(self.spec_g, device = "meta")
         self.spec_shape = None
         self.device = None
+        self.__dict__.pop("_scan_geom", None)
+        self.__dict__.pop("_dev_idx", None)
 
 
     def clear(self, idx: int):
@@ -425,10 +436,16 @@ class GDNLayerState:
 
     def scan_geometry(self):
         """(kind, num_k_heads, num_v_heads, k_head_dim, v_head_dim, state_half): the replay
-        kernel's selection; every job of one batched_scan_replay launch shares it"""
-        m = self.module
-        kind = 2 if getattr(m, "kda", False) else (1 if getattr(m, "mamba2", False) else 0)
-        return kind, m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim, self.recurrent_state.dtype == torch.half
+        kernel's selection; every job of one batched_scan_replay launch shares it. Static for
+        the life of the state object, so it is computed once and memoized (cut 21: a rewind
+        walks every GDN layer per verify step)."""
+        geom = self.__dict__.get("_scan_geom")
+        if geom is None:
+            m = self.module
+            kind = 2 if getattr(m, "kda", False) else (1 if getattr(m, "mamba2", False) else 0)
+            geom = (kind, m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim, self.recurrent_state.dtype == torch.half)
+            self.__dict__["_scan_geom"] = geom
+        return geom
 
 
     def rewind_conv_job(self, slot: int, last_history: int, num_tokens: int):
