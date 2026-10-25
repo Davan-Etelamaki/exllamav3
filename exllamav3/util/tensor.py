@@ -131,6 +131,18 @@ class SeqTensor:
 
 no_default = object()
 
+def _capturing() -> bool:
+    """True while the current stream is capturing a CUDA graph.
+
+    Graph-captured work allocates from the graph's private memory pool, and that memory dies with
+    the graph. Any cache that keeps such a tensor alive hands out storage that no longer exists -
+    an illegal device write at a fixed address (Xid 31 FAULT_PDE ACCESS_TYPE_VIRT_WRITE), the
+    sticky error surfacing later on the next tensor destruction. Every cache below therefore
+    refuses to store a capture-time tensor.
+    """
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
 def get_for_device(
     input_dict: dict,
     key: str | int,
@@ -149,7 +161,7 @@ def get_for_device(
     # address, illegal device WRITE, sticky error surfacing on the next tensor destruction).
     # Never store a capture-time copy in a cache: the capture gets a fresh copy each time, callers
     # outside a capture keep caching exactly as before.
-    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+    if _capturing():
         if key not in input_dict:
             return default if default is not no_default else None
         v_cap = input_dict[key]
@@ -279,6 +291,10 @@ class GTensorCache:
             return torch.empty(shape, dtype = dtype, device = device)
 
     def get(self, device, shape, dtype, x = ""):
+        # Never keep a capture-time allocation: it lives in the graph's private pool, so the entry
+        # would outlive its own storage and be handed to later eager callers (see _capturing)
+        if _capturing():
+            return self._empty(shape, dtype, device)
         key = self.make_key(device, shape, dtype, x)
         if key not in self.cache:
             refc, v = (0, self._empty(shape, dtype, device))
@@ -301,7 +317,8 @@ class GTensorCache:
         sl = self._slice_cache.get(key)
         if sl is None:
             sl = self.get(device, (nb,), dtype, x)[:numel]
-            self._slice_cache[key] = sl
+            if not _capturing():
+                self._slice_cache[key] = sl
         return sl
 
     def get_scratch(self, device, numel, dtype, x, rows: int, static_rows: int | None = None):
