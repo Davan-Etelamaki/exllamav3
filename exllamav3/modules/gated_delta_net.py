@@ -332,6 +332,7 @@ class GDNLayerState:
         self.device = None
         self.__dict__.pop("_scan_geom", None)
         self.__dict__.pop("_dev_idx", None)
+        self.__dict__.pop("_stage_cache", None)
         self.max_history = max_history
         self.max_batch_size = max_batch_size
         self.cache_id = cache_id
@@ -344,6 +345,7 @@ class GDNLayerState:
         self.recurrent_state = torch.empty_like(self.recurrent_state, dtype = dtype)
         self.__dict__.pop("_scan_geom", None)
         self.__dict__.pop("_dev_idx", None)
+        self.__dict__.pop("_stage_cache", None)
 
 
     def get_checkpoint_size(self):
@@ -373,6 +375,7 @@ class GDNLayerState:
         self.device = device
         self.__dict__.pop("_scan_geom", None)
         self.__dict__.pop("_dev_idx", None)
+        self.__dict__.pop("_stage_cache", None)
 
 
     def free(self):
@@ -385,6 +388,7 @@ class GDNLayerState:
         self.device = None
         self.__dict__.pop("_scan_geom", None)
         self.__dict__.pop("_dev_idx", None)
+        self.__dict__.pop("_stage_cache", None)
 
 
     def clear(self, idx: int):
@@ -403,35 +407,53 @@ class GDNLayerState:
     def staged_views(self, bsz: int, seqlen: int):
         """The (bsz, seqlen, ...) conv output, beta and g buffers a speculative pass of that
         shape writes its scan inputs into (contiguous views over the staging rows), and the
-        record of that shape for the rewind"""
+        record of that shape for the rewind. Views over the persistent staging buffers are
+        static per (buffer, shape), so they are memoized (cut 22); the memo is dropped whenever
+        a staging buffer is reallocated (alloc/free/set_state_dtype)."""
         assert seqlen <= self.max_history + 1 and bsz <= self.max_batch_size, \
             f"speculative pass of {seqlen} tokens x {bsz} rows exceeds the cache's max_history {self.max_history} / max_batch_size {self.max_batch_size}"
-        n = bsz * seqlen
         self.spec_shape = (bsz, seqlen, 1)
-        return (
-            self.spec_conv[:n].view(bsz, seqlen, -1),
-            self.spec_beta[:n].view(bsz, seqlen, -1),
-            self.spec_g[:n].view(bsz, seqlen, -1),
-        )
+        cache = self.__dict__.get("_stage_cache")
+        if cache is None:
+            cache = self.__dict__["_stage_cache"] = {}
+        key = (bsz, seqlen)
+        views = cache.get(key)
+        if views is None:
+            n = bsz * seqlen
+            views = (
+                self.spec_conv[:n].view(bsz, seqlen, -1),
+                self.spec_beta[:n].view(bsz, seqlen, -1),
+                self.spec_g[:n].view(bsz, seqlen, -1),
+            )
+            cache[key] = views
+        return views
 
 
     def staged_step_views(self, bsz: int, step: int):
         """The (bsz, 1, ...) buffers step `step` of a pass fed one token at a time writes its scan
         inputs into (token-major rows), and the record of the pass so far for the rewind. Step 0
         is the same rows as a one-token pass, so it may run through the one-token speculative
-        graph slot"""
+        graph slot. View triples memoized per (buffer generation, bsz, step) — cut 22."""
         assert step <= self.max_history and bsz <= self.max_batch_size, \
             f"step {step} of a token-by-token speculative pass exceeds the cache's max_history {self.max_history} / max_batch_size {self.max_batch_size}"
         if step > 0:
             assert self.spec_shape == (bsz, step, bsz), \
                 f"step {step} continues a pass staged as {self.spec_shape}, expected ({bsz}, {step}, {bsz})"
-        a, b = step * bsz, (step + 1) * bsz
         self.spec_shape = (bsz, step + 1, bsz)
-        return (
-            self.spec_conv[a:b].view(bsz, 1, -1),
-            self.spec_beta[a:b].view(bsz, 1, -1),
-            self.spec_g[a:b].view(bsz, 1, -1),
-        )
+        cache = self.__dict__.get("_stage_cache")
+        if cache is None:
+            cache = self.__dict__["_stage_cache"] = {}
+        key = (bsz, step)
+        views = cache.get(key)
+        if views is None:
+            a, b = step * bsz, (step + 1) * bsz
+            views = (
+                self.spec_conv[a:b].view(bsz, 1, -1),
+                self.spec_beta[a:b].view(bsz, 1, -1),
+                self.spec_g[a:b].view(bsz, 1, -1),
+            )
+            cache[key] = views
+        return views
 
 
     def scan_geometry(self):
