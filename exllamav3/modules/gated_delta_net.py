@@ -333,6 +333,7 @@ class GDNLayerState:
         self.__dict__.pop("_scan_geom", None)
         self.__dict__.pop("_dev_idx", None)
         self.__dict__.pop("_stage_cache", None)
+        self.__dict__.pop("_y_pool", None)
         self.max_history = max_history
         self.max_batch_size = max_batch_size
         self.cache_id = cache_id
@@ -346,6 +347,7 @@ class GDNLayerState:
         self.__dict__.pop("_scan_geom", None)
         self.__dict__.pop("_dev_idx", None)
         self.__dict__.pop("_stage_cache", None)
+        self.__dict__.pop("_y_pool", None)
 
 
     def get_checkpoint_size(self):
@@ -376,6 +378,7 @@ class GDNLayerState:
         self.__dict__.pop("_scan_geom", None)
         self.__dict__.pop("_dev_idx", None)
         self.__dict__.pop("_stage_cache", None)
+        self.__dict__.pop("_y_pool", None)
 
 
     def free(self):
@@ -389,6 +392,7 @@ class GDNLayerState:
         self.__dict__.pop("_scan_geom", None)
         self.__dict__.pop("_dev_idx", None)
         self.__dict__.pop("_stage_cache", None)
+        self.__dict__.pop("_y_pool", None)
 
 
     def clear(self, idx: int):
@@ -1411,7 +1415,10 @@ class GatedDeltaNet(Module):
             # acquisition per GDN layer per step under the prod allocator-lock contention).
             y_dtype = self.out_dtype or torch.half
             pool = self.__dict__.setdefault("_y_pool", {})
-            ykey = (x.shape, y_dtype)
+            # Key must pin the full layout contract the consumer relies on (shape AND strides AND
+            # device): a same-shape tensor with different strides/device must never reuse a buffer
+            # allocated for another layout (cut 23 fix).
+            ykey = (x.shape, y_dtype, x.device, x.stride())
             y = pool.get(ykey)
             if y is None:
                 if len(pool) > 8:
