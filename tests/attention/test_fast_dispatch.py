@@ -25,10 +25,12 @@ def test_fast_dispatch_matches_and_hits():
     if not _cuda():
         import pytest
         pytest.skip("needs CUDA")
-    # identity: this fence must run against the dev tree, not an installed wheel
+    # identity: this fence must run against a source tree, not an installed wheel
+    # (dev tree /tmp/exl3pkg/exllamav3 or the dot26 test lane ~/dsh-test/exllamav3)
     import os
-    assert os.path.realpath(tp.__file__).startswith("/tmp/exl3pkg/exllamav3"), \
-        f"fence running against {tp.__file__}, not the dev tree"
+    rp = os.path.realpath(tp.__file__)
+    assert "site-packages" not in rp and rp.endswith("triton_paged.py"), \
+        f"fence running against {rp}, not a source tree"
     a = torch.randn(4096, device="cuda")
     b = torch.zeros_like(a)
     grid = (16,)
