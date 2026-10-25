@@ -16,6 +16,11 @@ from .attention_fn.dsa_triton import (
 from .attention_fn.smem import pick_config, shared_bytes, halving_ladder
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache, get_for_device
+from .attention_fn.qsa_triton import qsa_sparse_attend_rows, _qsa_stage_kernel, _qsa_pool_update_kernel
+from .attention_fn.mla_triton import _mla_plane_update_kernel
+from ..cache.quant import CacheLayer_quant
+from ..cache.nvfp4 import CacheLayer_nvfp4
+from ..cache.fp8 import CacheLayer_fp8
 
 """
 QSA (Qwen sparse attention) indexer: selects which tokens each query may attend to, at 4-token
@@ -450,7 +455,6 @@ class QSAIndexer(Module):
         a materialized (bsz, seq, seq) mask (whose SDPA fallback also expands K/V per q head).
         q (bsz, seq, qh, hd) roped, k/v (bsz, seq, kvh, hd); returns (bsz, seq, qh, hd) fp16.
         """
-        from .attention_fn.qsa_triton import qsa_sparse_attend_rows
         bsz, seq = q.shape[:2]
         indices = self.select_indices(q_idx, pooled, past_len = 0, batch_stride = seq)
         o = qsa_sparse_attend_rows(
@@ -518,9 +522,6 @@ class QSAIndexer(Module):
         no per-layer H2D copy of the positions, no index arithmetic in torch. The pool kernel
         also writes the chunk's trailing incomplete pool (never selected; rebuilt once complete).
         """
-        from .attention_fn.qsa_triton import _qsa_stage_kernel, _qsa_pool_update_kernel
-        from .attention_fn.mla_triton import _mla_plane_update_kernel
-        from ..util.tensor import g_tensor_cache, get_for_device
         bsz, seqlen, _ = x.shape
         dev = x.device
         cr, H, dk = self.compress_ratio, self.n_heads, self.head_dim
@@ -820,10 +821,6 @@ class QSAIndexer(Module):
         q: (bsz, seq, num_q_heads, head_dim) roped; q_idx: roped indexer queries from
         update_planes. Returns (bsz, seq, num_q_heads, head_dim) fp16.
         """
-        from .attention_fn.qsa_triton import qsa_sparse_attend_rows
-        from ..cache.quant import CacheLayer_quant
-        from ..cache.nvfp4 import CacheLayer_nvfp4
-        from ..cache.fp8 import CacheLayer_fp8
         bsz, seq = q.shape[:2]
         indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
         bt_rows = self._bt_rows_cached(block_table, bsz, seq)
