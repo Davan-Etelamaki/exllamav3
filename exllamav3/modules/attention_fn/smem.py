@@ -33,7 +33,9 @@ class NoFittingConfig(RuntimeError):
 
 
 def _dev_index(device) -> int:
-    idx = device.index if hasattr(device, "index") else device
+    # Hot path (pick_config, ~0.6% of decode wall in prod py-spy 2026-10-25): callers pass
+    # torch.device; isinstance is cheaper than hasattr and never probes .index on an int.
+    idx = device.index if isinstance(device, torch.device) else device
     return torch.cuda.current_device() if idx is None else idx
 
 
