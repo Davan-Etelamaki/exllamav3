@@ -1205,9 +1205,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # of generator wall in live py-spy). Sticky eager fallback on any failure.
                 graph_route = False
                 A_rt = num_tokens * top_k
+                # cpu_split_first no longer excludes the graph: the prelude is pure-device
+                # routing (same mapping as the eager branch below), and live py-spy (prod,
+                # 2026-10-25) showed the eager argsort+bincount glue at 20% of decode wall
+                # precisely because the CPU-split model failed this gate every layer.
                 if (
                     _ROUTE_GRAPH and self.fused_mode_buffers is not None and
-                    A_rt <= self.fused_rows and self.cpu_split_first is None
+                    A_rt <= self.fused_rows
                 ):
                     _rgc = self.__dict__.setdefault("_route_graphs", {})
                     _rgk = (A_rt, self.num_local_experts, self.routing_first)
