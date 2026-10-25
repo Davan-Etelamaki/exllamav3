@@ -142,6 +142,21 @@ def get_for_device(
     break if the tensor is updated after being accessed in this way. Intended for tensors that are read-only for the
     lifetime of the dict, such as RoPE coefficients during a single forward pass.
     """
+    # A CUDA graph capture allocates from the graph's private memory pool, and that pool's memory
+    # dies with the graph. A cache entry populated during a capture therefore outlives its own
+    # storage: it keeps being handed to later eager callers (same tensor, same device), which then
+    # read and write freed VA - the observed Xid 31 FAULT_PDE ACCESS_TYPE_VIRT_WRITE (deterministic
+    # address, illegal device WRITE, sticky error surfacing on the next tensor destruction).
+    # Never store a capture-time copy in a cache: the capture gets a fresh copy each time, callers
+    # outside a capture keep caching exactly as before.
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        if key not in input_dict:
+            return default if default is not no_default else None
+        v_cap = input_dict[key]
+        if v_cap is None:
+            return None
+        return to_device(v_cap, device, non_blocking = False)
+
     if key not in input_dict and default is not no_default:
         return default
 
