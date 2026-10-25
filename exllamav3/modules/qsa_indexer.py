@@ -651,6 +651,7 @@ class QSAIndexer(Module):
         """
         import triton
         from .attention_fn.dsa_triton import _dsa_indexer_fewq_kernel, _dsa_pool_expand_kernel, dsa_debug_bounds
+        from .attention_fn.triton_paged import _fast_dispatch
         from .attention_fn.smem import pick_config, shared_bytes, halving_ladder
         from ..ext import exllamav3_ext as ext
         from ..util.tensor import g_tensor_cache
@@ -683,14 +684,14 @@ class QSAIndexer(Module):
                 return shared_bytes(_dsa_indexer_fewq_kernel, args, **consts, num_warps = 8, num_stages = 2)
             bn = pick_config(dev, "qsa_indexer_fewq", (H_i, D_i, s_stride, cr, epp, seq), halving_ladder(128), probe)
             args, consts = i_args(bn)
-            _dsa_indexer_fewq_kernel[(R, triton.cdiv(max(t_max, 1), bn))](*args, **consts, num_warps = 8, num_stages = 2)
+            _fast_dispatch(_dsa_indexer_fewq_kernel, (R, triton.cdiv(max(t_max, 1), bn)),
+                           args, dict(consts, num_warps = 8, num_stages = 2))
         ext.dsa_topk(scores, pool_idx, k_sel, a_T, seq)
         with torch.cuda.device(dev):
-            _dsa_pool_expand_kernel[(R, triton.cdiv(out_rows.shape[1], 256))](
-                pool_idx, out_rows, a_pos, P = cr, SEL = self.block_topk,
-                K_pad = out_rows.shape[1], KP_pool = kp, TAIL = 1,
-                SEQ = seq, MULTIROW = 1, BLOCK = 256,
-            )
+            _fast_dispatch(_dsa_pool_expand_kernel, (R, triton.cdiv(out_rows.shape[1], 256)),
+                (pool_idx, out_rows, a_pos),
+                dict(P = cr, SEL = self.block_topk, K_pad = out_rows.shape[1], KP_pool = kp,
+                     TAIL = 1, SEQ = seq, MULTIROW = 1, BLOCK = 256))
 
     def select_indices_paged(
         self,

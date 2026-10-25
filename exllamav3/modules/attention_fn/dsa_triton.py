@@ -42,7 +42,7 @@ dsa_debug_bounds = os.environ.get("EXL3_DSA_DEBUG_BOUNDS", "0") != "0"
 import triton
 import triton.language as tl
 
-from .triton_paged import _rot_h32, _qc_load_v, _get_h32
+from .triton_paged import _rot_h32, _qc_load_v, _get_h32, _fast_dispatch
 from .smem import pick_config, shared_bytes, halving_ladder
 from . import dsa_mqa
 
@@ -1092,27 +1092,24 @@ def dsa_attn(
             if mqa is not None:
                 block_h = dsa_mqa.DECODE_BLOCK_H
                 hb, ws_ml, ws_acc = workspace(block_h)
-                dsa_mqa._dsa_decode_mqa_kernel[(R * hb, n_splits)](
-                    *s_args(ws_ml, ws_acc), **dsa_mqa.decode_consts(s_consts(block_h, dsa_mqa.DECODE_BLOCK_N), mqa),
-                    num_warps = dsa_mqa.DECODE_WARPS, num_stages = 1,
-                )
+                _fast_dispatch(dsa_mqa._dsa_decode_mqa_kernel, (R * hb, n_splits),
+                    s_args(ws_ml, ws_acc),
+                    dict(dsa_mqa.decode_consts(s_consts(block_h, dsa_mqa.DECODE_BLOCK_N), mqa),
+                         num_warps = dsa_mqa.DECODE_WARPS, num_stages = 1))
             else:
                 block_h, block_n, s_stages = pick_config(q.device, "dsa_attn_split", pick_key, hb_ladder, probe)
                 hb, ws_ml, ws_acc = workspace(block_h)
-                _dsa_attn_split_kernel[(R * hb, n_splits)](
-                    *s_args(ws_ml, ws_acc), **s_consts(block_h, block_n), num_warps = num_warps, num_stages = s_stages,
-                )
-            _dsa_attn_combine_kernel[(R * hb, triton.cdiv(D_out, 128))](
-                ws_ml, ws_acc, sinks_t, derot_t, out,
-                a_qpos, R, n_splits, h32_t,
-                H = H, D_c = D_c, D_r = D_r,
-                HAS_SINKS = has_sinks, DEROTATE = derotate, HPG = hpg,
-                BLOCK_H = block_h, BLOCK_D = 128,
-                SEQ = a_seq, MULTIROW = multirow is not None,
-                OUT_LATENT = 1 if out_latent else 0,
-                QC = qc_bits,
-                num_warps = 4, num_stages = 2,
-            )
+                _fast_dispatch(_dsa_attn_split_kernel, (R * hb, n_splits),
+                    s_args(ws_ml, ws_acc),
+                    dict(s_consts(block_h, block_n), num_warps = num_warps, num_stages = s_stages))
+            _fast_dispatch(_dsa_attn_combine_kernel, (R * hb, triton.cdiv(D_out, 128)),
+                (ws_ml, ws_acc, sinks_t, derot_t, out, a_qpos, R, n_splits, h32_t),
+                dict(H = H, D_c = D_c, D_r = D_r,
+                     HAS_SINKS = has_sinks, DEROTATE = derotate, HPG = hpg,
+                     BLOCK_H = block_h, BLOCK_D = 128,
+                     SEQ = a_seq, MULTIROW = multirow is not None,
+                     OUT_LATENT = 1 if out_latent else 0,
+                     QC = qc_bits, num_warps = 4, num_stages = 2))
         return out
 
     m_args = (
