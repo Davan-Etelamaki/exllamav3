@@ -290,6 +290,7 @@ class QSAIndexer(Module):
         return w[:rows]
 
     def _select_rows(self, q_rows, pool_flat, pos0, T, out_rows, block_table = None, epp = 0):
+        from .attention_fn.triton_paged import _fast_dispatch
         """
         One sequence's selection for consecutive query rows starting at absolute position pos0:
         q_rows (R, H, dk) roped, pool_flat (rows, dk) pooled keys (contiguous, or the paged plane
@@ -370,11 +371,11 @@ class QSAIndexer(Module):
                             w_idx, w_scr, w_cnt, n_idx[:, 0], n_scr[:, 0], n_cnt[:, 0], k_sel)
                         cur ^= 1
             with torch.cuda.device(dev):
-                _dsa_pool_expand_kernel[(rows, triton.cdiv(k_pad, 256))](
-                    pool_idx, out_rows[r0 : r1], pos0 + r0,
-                    P = cr, SEL = self.block_topk, K_pad = k_pad, KP_pool = kp, TAIL = 1,
-                    SEQ = self.SEL_SLAB, MULTIROW = 0, BLOCK = 256,
-                )
+                _fast_dispatch(
+                    _dsa_pool_expand_kernel, (rows, triton.cdiv(k_pad, 256)),
+                    (pool_idx, out_rows[r0 : r1], pos0 + r0),
+                    dict(P = cr, SEL = self.block_topk, K_pad = k_pad, KP_pool = kp, TAIL = 1,
+                         SEQ = self.SEL_SLAB, MULTIROW = 0, BLOCK = 256))
 
     def select_indices(
         self,
@@ -515,6 +516,7 @@ class QSAIndexer(Module):
         no per-layer H2D copy of the positions, no index arithmetic in torch. The pool kernel
         also writes the chunk's trailing incomplete pool (never selected; rebuilt once complete).
         """
+        from .attention_fn.triton_paged import _fast_dispatch
         from .attention_fn.qsa_triton import _qsa_stage_kernel, _qsa_pool_update_kernel
         from .attention_fn.mla_triton import _mla_plane_update_kernel
         from ..util.tensor import g_tensor_cache, get_for_device
@@ -536,24 +538,21 @@ class QSAIndexer(Module):
         kraw = self._workspace(R, R * dk, torch.half, "qsa_up_k", dev) \
             .view(bsz, seqlen, dk)
         with torch.cuda.device(dev):
-            _qsa_stage_kernel[(R, H + 1)](
-                qk, self._norm_w_half("q", dev), q, kraw, R,
-                eps = float(self.q_layernorm.rms_norm_eps), H_i = H, D = dk,
-            )
+            _fast_dispatch(_qsa_stage_kernel, (R, H + 1),
+                (qk, self._norm_w_half("q", dev), q, kraw, R),
+                dict(eps = float(self.q_layernorm.rms_norm_eps), H_i = H, D = dk))
             rope.apply(q, None, 0, seqlens, None, True)
-            _mla_plane_update_kernel[(R,)](
-                kraw, layer.raw_k, bt, seqlens, npr, seqlen,
-                page_size = page_size, D = dk, DST_D = 0, DST_OFF = 0,
-            )
+            _fast_dispatch(_mla_plane_update_kernel, (R,),
+                (kraw, layer.raw_k, bt, seqlens, npr, seqlen),
+                dict(page_size = page_size, D = dk, DST_D = 0, DST_OFF = 0))
             # MAXPOOLS is documentation of the grid height only (unused in the body); a fixed
             # value keeps one compile across chunk lengths
-            _qsa_pool_update_kernel[(bsz, seqlen // cr + 1)](
-                layer.raw_k.view(-1, dk), layer.pooled.view(-1, dk), self._norm_w_half("k", dev),
-                rope.inv_freq, bt, seqlens, npr, seqlen,
-                page_size = page_size, P = cr, D = dk, ROPE_R = 2 * rope.inv_freq.numel(),
-                attn_factor = float(rope.attn_factor),
-                eps = float(self.k_layernorm.rms_norm_eps), MAXPOOLS = 1,
-            )
+            _fast_dispatch(_qsa_pool_update_kernel, (bsz, seqlen // cr + 1),
+                (layer.raw_k.view(-1, dk), layer.pooled.view(-1, dk), self._norm_w_half("k", dev),
+                 rope.inv_freq, bt, seqlens, npr, seqlen),
+                dict(page_size = page_size, P = cr, D = dk, ROPE_R = 2 * rope.inv_freq.numel(),
+                     attn_factor = float(rope.attn_factor),
+                     eps = float(self.k_layernorm.rms_norm_eps), MAXPOOLS = 1))
         return q
 
     def update_planes_ref(
