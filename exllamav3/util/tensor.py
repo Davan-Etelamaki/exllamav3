@@ -230,7 +230,8 @@ class GTensorCache:
     def make_key(self, device, shape, dtype, x):
         # [GS] tuple key: f-string per call measured hot in live py-spy (make_key+get_bucketed
         # 2.5% of generator wall). Tuple hash skips string build; injectivity unchanged.
-        return (torch.device(device), tuple(shape), dtype, x)
+        dk = device if isinstance(device, torch.device) else torch.device(device)
+        return (dk, tuple(shape), dtype, x)
 
     @staticmethod
     def _empty(shape, dtype, device):
@@ -261,7 +262,8 @@ class GTensorCache:
         if numel == nb:
             return self.get(device, (nb,), dtype, x)
         # [GS] memoize the sliced view too: [:numel] built a fresh tensor per call
-        key = (torch.device(device), nb, dtype, x, numel)
+        key = ((device if isinstance(device, torch.device) else torch.device(device)),
+               nb, dtype, x, numel)
         sl = self._slice_cache.get(key)
         if sl is None:
             sl = self.get(device, (nb,), dtype, x)[:numel]
