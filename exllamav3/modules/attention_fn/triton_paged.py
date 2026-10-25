@@ -11,6 +11,56 @@ from .smem import pick_config, shared_bytes, tile_ladder, halving_ladder
 from ...util.backend import ROCM, gfx_arch, attn_decode_config
 
 
+_FAST_DISPATCH = None
+
+
+def _fast_dispatch(fn, grid, args, consts):
+    """JIT-dispatch cache-hit fast path (triton 3.6): replicate JITFunction.run's hot branch —
+    binder + compute_cache_key + CompiledKernel.run — while skipping the pre_run_hooks loop,
+    the used_global_vals scan and the kwargs dict churn. Specialization stays the binder's, so
+    pointer-alignment / ==1 keys cannot drift. Falls back to the ordinary dispatch when the
+    triton internals are absent or the kernel is not yet compiled for this specialization
+    (first call per specialization compiles through the normal path)."""
+    global _FAST_DISPATCH
+    if _FAST_DISPATCH is None:
+        try:
+            import inspect
+            from triton.runtime.jit import JITFunction, compute_cache_key  # noqa: F401
+            # device_caches is an instance attr; gate on run()'s source shape instead
+            _FAST_DISPATCH = ("device_caches" in inspect.getsource(JITFunction.run)
+                              and "packed_metadata" in inspect.getsource(JITFunction.run))
+        except Exception:
+            _FAST_DISPATCH = False
+    if not _FAST_DISPATCH:
+        return fn[grid](*args, **consts)
+    from triton import knobs
+    from triton.runtime import driver
+    from triton.runtime.jit import compute_cache_key
+    dev = driver.active.get_current_device()
+    entry = getattr(fn, "device_caches", {}).get(dev)
+    if entry is None:
+        return fn[grid](*args, **consts)
+    kernel_cache, key_cache, target, backend, binder = entry
+    kw = {"debug": fn.debug or knobs.runtime.debug,
+          "instrumentation_mode": knobs.compilation.instrumentation_mode}
+    bound_args, spec, options = binder(*args, **consts, **kw)
+    key = compute_cache_key(key_cache, spec, options)
+    kernel = kernel_cache.get(key)
+    if kernel is None:
+        return fn[grid](*args, **consts)
+    grid_size = len(grid)
+    grid_0 = grid[0]
+    grid_1 = grid[1] if grid_size > 1 else 1
+    grid_2 = grid[2] if grid_size > 2 else 1
+    stream = driver.active.get_current_stream(dev)
+    vals = list(bound_args.values())
+    launch_metadata = kernel.launch_metadata(grid, stream, *vals)
+    kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata,
+               launch_metadata, knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook,
+               *vals)
+    return kernel
+
+
 def _is_power_of_2(x: int) -> bool:
     return x > 0 and (x & (x - 1)) == 0
 
@@ -533,12 +583,14 @@ def paged_attn_triton(
     with torch.cuda.device(q.device):
         if k is not None and kv_append_len:
             if nvfp4:
-                _paged_kv_update_nvfp4_kernel[(bsz * kv_append_len, n_kv_heads)](
-                    k, v, k_cache, v_cache, k_scales, v_scales,
-                    block_table, cache_seqlens,
-                    num_pages_per_seq, kv_append_len,
-                    n_kv_heads, page_size, head_dim,
-                    num_warps = 4,
+                _fast_dispatch(
+                    _paged_kv_update_nvfp4_kernel,
+                    (bsz * kv_append_len, n_kv_heads),
+                    (k, v, k_cache, v_cache, k_scales, v_scales,
+                     block_table, cache_seqlens,
+                     num_pages_per_seq, kv_append_len,
+                     n_kv_heads, page_size, head_dim),
+                    {"num_warps": 4},
                 )
             else:
                 _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
@@ -546,37 +598,38 @@ def paged_attn_triton(
 
         q_blocks = triton.cdiv(q_len, block_m)
         attn_grid = (bsz * n_q_heads * q_blocks, triton.cdiv(head_dim, block_dv))
-        _paged_attn_splitdv_kernel[attn_grid](
-            q,
-            k_cache,
-            v_cache,
-            block_table,
-            cache_seqlens,
-            out,
-            sinks,
-            k_scales if nvfp4 else q,   # dummy pointer when unused
-            v_scales if nvfp4 else q,
-            q_len,
-            kv_append_len,
-            n_q_heads,
-            n_kv_heads,
-            num_pages_per_seq,
-            page_size,
-            head_dim,
-            float(softmax_scale),
-            bool(causal),
-            int(window_left),
-            int(window_right),
-            window_left >= 0,
-            window_right >= 0,
-            float(softcap or 0.0),
-            has_sinks,
-            nvfp4,
-            block_m,
-            block_n,
-            block_dv,
-            num_warps=num_warps,
-            num_stages=num_stages,
+        _fast_dispatch(
+            _paged_attn_splitdv_kernel,
+            attn_grid,
+            (q,
+             k_cache,
+             v_cache,
+             block_table,
+             cache_seqlens,
+             out,
+             sinks,
+             k_scales if nvfp4 else q,   # dummy pointer when unused
+             v_scales if nvfp4 else q,
+             q_len,
+             kv_append_len,
+             n_q_heads,
+             n_kv_heads,
+             num_pages_per_seq,
+             page_size,
+             head_dim,
+             float(softmax_scale),
+             bool(causal),
+             int(window_left),
+             int(window_right),
+             window_left >= 0,
+             window_right >= 0,
+             float(softcap or 0.0),
+             has_sinks,
+             nvfp4,
+             block_m,
+             block_n,
+             block_dv),
+            {"num_warps": num_warps, "num_stages": num_stages},
         )
     return out
 
@@ -696,12 +749,14 @@ def paged_attn_triton_longq(
     with torch.cuda.device(q.device):
         if k is not None and kv_append_len:
             if nvfp4:
-                _paged_kv_update_nvfp4_kernel[(bsz * kv_append_len, n_kv_heads)](
-                    k, v, k_cache, v_cache, k_scales, v_scales,
-                    block_table, cache_seqlens,
-                    num_pages_per_seq, kv_append_len,
-                    n_kv_heads, page_size, head_dim,
-                    num_warps = 4,
+                _fast_dispatch(
+                    _paged_kv_update_nvfp4_kernel,
+                    (bsz * kv_append_len, n_kv_heads),
+                    (k, v, k_cache, v_cache, k_scales, v_scales,
+                     block_table, cache_seqlens,
+                     num_pages_per_seq, kv_append_len,
+                     n_kv_heads, page_size, head_dim),
+                    {"num_warps": 4},
                 )
             else:
                 _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
@@ -1447,12 +1502,14 @@ def paged_attn_triton_decode(
 
         if k is not None and kv_append_len:
             if nvfp4:
-                _paged_kv_update_nvfp4_kernel[(bsz * kv_append_len, n_kv_heads)](
-                    k, v, k_cache, v_cache, k_scales, v_scales,
-                    block_table, cache_seqlens,
-                    num_pages_per_seq, kv_append_len,
-                    n_kv_heads, page_size, head_dim,
-                    num_warps = 4,
+                _fast_dispatch(
+                    _paged_kv_update_nvfp4_kernel,
+                    (bsz * kv_append_len, n_kv_heads),
+                    (k, v, k_cache, v_cache, k_scales, v_scales,
+                     block_table, cache_seqlens,
+                     num_pages_per_seq, kv_append_len,
+                     n_kv_heads, page_size, head_dim),
+                    {"num_warps": 4},
                 )
             else:
                 _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
