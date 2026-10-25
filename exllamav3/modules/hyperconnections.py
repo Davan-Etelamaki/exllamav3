@@ -513,12 +513,37 @@ class GatedResidual(Module):
             return None
         return xw
 
-    def _tiled_tables(self, ws):
-        """Per-call int8 hi/lo tables (+ per-row fp32 scales) for the tiled kernel, derived from
-        the resident fp16 tables: det_quant_weight is a deterministic per-row split, so the
-        bytes match a stored copy. up goes back to its checkpoint orientation first."""
+    def _tiled_tables(self):
+        """Int8 hi/lo tables (+ per-row fp32 scales) for the tiled kernel, derived from the
+        resident fp16 tables: det_quant_weight is a deterministic per-row split, so the bytes
+        match a stored copy. up goes back to its checkpoint orientation first.
+        MEMOIZED per site: the source weights are frozen for a model load, so re-quantizing
+        them on every prefill call was pure waste (~1.9% of live decode samples, py-spy prod
+        2026-10-24). The entry holds strong refs to the source tensors and is keyed by their
+        data_ptr, so a rebuilt proj_h/upx_h (new tensor, new ptr) misses and rebuilds; an
+        in-place weight mutation without a rebuild would read stale — nothing does that
+        (model_init rebuilds). Tables are read-only for the kernel; built outside inference
+        mode so warmup cannot poison serving."""
+        ph, ux = self.proj_h, self.upx_h
+        ent = getattr(self, "_tiled_tables_cache", None)
+        if ent is not None and ent[0] == ph.data_ptr() and ent[1] == ux.data_ptr():
+            return ent[4]
         H, Dh = self.hc_mult, self.hidden_size
-        Mpad = self.proj_h.shape[0]
+        Mpad = ph.shape[0]
+        with torch.inference_mode(False):
+            proj_i8_c = torch.empty((2, Mpad, H * Dh), dtype = torch.int8, device = ph.device)
+            proj_sb_c = torch.empty((Mpad,), dtype = torch.float, device = ph.device)
+            ext.det_quant_weight(ph, proj_i8_c, proj_sb_c)
+            up_c = torch.empty((H * Dh, self.rank), dtype = torch.half, device = ph.device) \
+                .view(H, Dh // 4, 4, self.rank)
+            up_c.copy_(ux.permute(0, 1, 3, 2))
+            up_c = up_c.view(H * Dh, self.rank)
+            up_i8_c = torch.empty((2, H * Dh, self.rank), dtype = torch.int8, device = ph.device)
+            up_sb_c = torch.empty((H * Dh,), dtype = torch.float, device = ph.device)
+            ext.det_quant_weight(up_c, up_i8_c, up_sb_c)
+        tables = (proj_i8_c, proj_sb_c, up_i8_c, up_sb_c)
+        self._tiled_tables_cache = (ph.data_ptr(), ux.data_ptr(), ph, ux, tables)
+        return tables
         proj_i8 = ws((2, Mpad, H * Dh), torch.int8)
         proj_sb = ws((Mpad,), torch.float)
         ext.det_quant_weight(self.proj_h, proj_i8, proj_sb)
@@ -595,7 +620,7 @@ class GatedResidual(Module):
                 buf = torch.empty((1 << (numel - 1).bit_length(),), dtype = dtype, device = dev)
                 return buf[: numel].view(shape)
             Mpad = self.proj_h.shape[0]
-            proj_i8, proj_sb, up_i8, up_sb = self._tiled_tables(ws)
+            proj_i8, proj_sb, up_i8, up_sb = self._tiled_tables()
             S = ext.gr_mix_tiled_slices(R, Dh, Mpad)
             Rpad = -(-R // 64) * 64
             post = ws((R, H), torch.float) if self.use_combine else None
