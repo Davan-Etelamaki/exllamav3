@@ -631,9 +631,14 @@ class QSAIndexer(Module):
         """
         One launch chain for ALL rows: the few-query scorer with per-job T/pos0/bound and a
         per-job block-table row (MULTIROW, SEQ rows per job), one row-wise top-k with per-job
-        scan bound, one per-row pool expand. Mirrors the dsv4 batched selection path. The
-        score stride follows the block-table capacity (fixed per model config, one compile);
-        the grid is sized to t_max and programs past each job's T retire (per-job T array).
+        scan bound, one per-row pool expand. Mirrors the dsv4 batched selection path.
+        The score row holds one entry per POOL visible to a job, so its stride must cover the
+        pool count T (which reaches pages * EPP, EPP = PAGE_SIZE / compress_ratio) -- deriving it
+        from the block table's PAGE count left the row EPP times too short, so the scorer wrote
+        off the row and dsa_topk scanned off the buffer (illegal memory access whenever a batch
+        ran past ~one page of context). Power-of-two quantized to keep the Triton specialization
+        count bounded: an exact t_max stride would recompile per token as context grows.
+        The grid is sized to t_max and programs past each job's T retire (per-job T array).
         """
         import triton
         from .attention_fn.dsa_triton import _dsa_indexer_fewq_kernel, _dsa_pool_expand_kernel, dsa_debug_bounds
@@ -645,7 +650,8 @@ class QSAIndexer(Module):
         cr = self.compress_ratio
         k_sel = self.block_topk
         kp = -(-k_sel // 32) * 32
-        s_stride = -(-block_table.shape[1] // 128) * 128
+        s_stride = max(128, triton.next_power_of_2(max(t_max, 1)))
+        assert s_stride >= t_max
         scores = g_tensor_cache.get_bucketed(dev, R * s_stride, torch.half, "qsa_multi_scores") \
             .view(R, s_stride)
         pool_idx = g_tensor_cache.get_bucketed(dev, R * kp, torch.int32, "qsa_sel_pool") \
