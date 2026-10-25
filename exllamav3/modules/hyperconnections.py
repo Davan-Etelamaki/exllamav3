@@ -530,6 +530,30 @@ class GatedResidual(Module):
         ext.det_quant_weight(up, up_i8, up_sb)
         return proj_i8, proj_sb, up_i8, up_sb
 
+    def _gr_mix_bufs(self, dev, R, M, H, Dh):
+        """View memo for the fused decode path: the three bucketed lookups per site per
+        token were ~9.7% of live decode samples (ws leaves, py-spy prod 2026-10-24). A
+        (dev, numel, dtype, tag) lookup returns one tensor until the cache regrows the
+        bucket; if it regrows, our held view keeps the older buffer alive and remains a
+        consistent scratch for this site (gr_mix writes and reads it within one call), so
+        aliasing between generations is benign. Built outside inference mode so a
+        warmup-pass view can never poison serving (same contract as GTensorCache)."""
+        vkey = (str(dev), R, M, self.use_combine)
+        vcache = getattr(self, "_gr_mix_views", None)
+        if vcache is None:
+            vcache = self._gr_mix_views = {}
+        got = vcache.get(vkey)
+        if got is None:
+            with torch.inference_mode(False):
+                dots = g_tensor_cache.get_bucketed(dev, R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
+                post = g_tensor_cache.get_bucketed(dev, R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
+                mixed = g_tensor_cache.get_bucketed(dev, R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
+            got = (dots, post, mixed)
+            if len(vcache) >= 16:
+                vcache.clear()
+            vcache[vkey] = got
+        return got
+
     def _mix(self, streams: torch.Tensor, cached: bool = True, params: dict | None = None):
         """streams (b, s, H, D) fp32 -> (post (R, H) fp32 or None, mixed (R, D) half).
         cached: small-R outputs may come from the per-device static workspaces (see below);
@@ -556,9 +580,12 @@ class GatedResidual(Module):
                     return g_tensor_cache.get_bucketed(dev, numel, dtype, tag)
                 return torch.empty((numel,), dtype = dtype, device = dev)
             M = self.proj_m + 1
-            dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
-            post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
-            mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
+            if cached:
+                dots, post, mixed = self._gr_mix_bufs(dev, R, M, H, Dh)
+            else:
+                dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
+                post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
+                mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
             ext.gr_mix(s3, xw, self.proj_h[: self.proj_m], self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
         elif self.tiled:
             # Prefill-shaped workspaces are per-call (pow2-rounded so the caching allocator
