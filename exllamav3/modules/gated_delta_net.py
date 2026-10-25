@@ -1405,7 +1405,18 @@ class GatedDeltaNet(Module):
                     self._bc_configure_slot(bsz, seqlen, save_history, rsl)
             if save_history:
                 stage(bsz, seqlen)   # records the pass shape for the rewind (step 0 shares the one-token slot's rows)
-            y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
+            # Output buffer pooled per (shape, dtype): the consumer (o_proj/residual) runs on the
+            # same stream within this forward, so same-stream ordering makes reuse as safe as the
+            # allocator's own immediate reuse of freed blocks (cut 23: removes one allocator
+            # acquisition per GDN layer per step under the prod allocator-lock contention).
+            y_dtype = self.out_dtype or torch.half
+            pool = self.__dict__.setdefault("_y_pool", {})
+            ykey = (x.shape, y_dtype)
+            y = pool.get(ykey)
+            if y is None:
+                if len(pool) > 8:
+                    pool.clear()
+                y = pool[ykey] = torch.empty_like(x, dtype = y_dtype)
             self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, slots_scan, save_history, slots_scan_in)
             if self.tp_reduce:
                 self.tp_collect(params["backend"], y)
