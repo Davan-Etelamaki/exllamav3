@@ -349,23 +349,26 @@ def qsa_sparse_attend_rows(
 
     # Triton JIT launches on the CURRENT device; with a model split across GPUs this
     # layer's device need not be current
+    from .triton_paged import _fast_dispatch
     with torch.cuda.device(dev):
-        _qsa_sparse_split_kernel[(programs, splits)](
-            q, k, v, block_table if paged else indices, indices, partial_o, partial_ml,
-            K_pad, block_table.shape[1] if paged else 0, splits, split_len,
-            k_scales, v_scales, h32,
-            n_q_heads = H, n_kv_heads = kvh, page_size = page_size if paged else 1,
-            head_dim = hd, K_pad = K_pad, scale = float(sm_scale),
-            BLOCK_H = BLOCK_H, BLOCK_N = BLOCK_N, PAGED = 1 if paged else 0,
-            QCK = k_bits, QCV = v_bits, KFMT = kfmt, VFMT = vfmt,
-            num_warps = 4, num_stages = 2,
+        _fast_dispatch(
+            _qsa_sparse_split_kernel, (programs, splits),
+            (q, k, v, block_table if paged else indices, indices, partial_o, partial_ml,
+             K_pad, block_table.shape[1] if paged else 0, splits, split_len,
+             k_scales, v_scales, h32),
+            dict(n_q_heads = H, n_kv_heads = kvh, page_size = page_size if paged else 1,
+                 head_dim = hd, K_pad = K_pad, scale = float(sm_scale),
+                 BLOCK_H = BLOCK_H, BLOCK_N = BLOCK_N, PAGED = 1 if paged else 0,
+                 QCK = k_bits, QCV = v_bits, KFMT = kfmt, VFMT = vfmt,
+                 num_warps = 4, num_stages = 2),
         )
         rows_sub, d_sub = combine_subtiles(BLOCK_H, hd)
-        _paged_attn_decode_combine_kernel[(programs, (BLOCK_H // rows_sub) * (hd // d_sub))](
-            partial_o, partial_ml, o, h32, splits, partial_ml,
-            QCV = v_bits, HAS_SINKS = False, q_len = 1, n_q_heads = H, n_kv_heads = kvh,
-            head_dim = hd, HD_PAD = hd, V_DIM = hd, BLOCK_ROWS = BLOCK_H,
-            ROWS_SUB = rows_sub, D_SUB = d_sub,
-            num_warps = 4, num_stages = 1,
+        _fast_dispatch(
+            _paged_attn_decode_combine_kernel, (programs, (BLOCK_H // rows_sub) * (hd // d_sub)),
+            (partial_o, partial_ml, o, h32, splits, partial_ml),
+            dict(QCV = v_bits, HAS_SINKS = False, q_len = 1, n_q_heads = H, n_kv_heads = kvh,
+                 head_dim = hd, HD_PAD = hd, V_DIM = hd, BLOCK_ROWS = BLOCK_H,
+                 ROWS_SUB = rows_sub, D_SUB = d_sub,
+                 num_warps = 4, num_stages = 1),
         )
     return o
