@@ -360,9 +360,20 @@ class QSAIndexer(Module):
                 # own total order (score descending, index ascending), emitting the merged set --
                 # with scores -- into slot 0 of the other workspace for the next tile. Workspaces
                 # are fixed-size per call, so the allocator reuses them across chunks
-                ws = [(torch.empty((rows, 2, kp), dtype = torch.int32, device = dev),
-                       torch.empty((rows, 2, kp), dtype = torch.half, device = dev),
-                       torch.zeros((rows, 2), dtype = torch.int32, device = dev)) for _ in range(2)]
+                # Bucketed per-device cache instead of six fresh allocations per slab:
+                # the alloc block measured 15.83 us/call (isolated bench 2026-10-25, shared
+                # busy GPU) and its torch.empty/zeros lines are 1.18% of prod decode wall
+                # (py-spy r130, wheel b75a161880c0). Dirty reuse is safe: dsa_topk_tile
+                # resets its cnt slot at t == 0 (dsa_topk.cu:364) and writes idx/scr before
+                # merge_tiles reads them; tests/kernels/dsa/test_dsa_topk_tiles.py drives
+                # this exact loop over uninitialized ws
+                ws = []
+                for slot in (0, 1):
+                    ws.append((
+                        g_tensor_cache.get_bucketed(dev, rows * 2 * kp, torch.int32, f"qsa_sel_ws{slot}_idx")[:rows * 2 * kp].view(rows, 2, kp),
+                        g_tensor_cache.get_bucketed(dev, rows * 2 * kp, torch.half, f"qsa_sel_ws{slot}_scr")[:rows * 2 * kp].view(rows, 2, kp),
+                        g_tensor_cache.get_bucketed(dev, rows * 2, torch.int32, f"qsa_sel_ws{slot}_cnt")[:rows * 2].view(rows, 2),
+                    ))
                 cur = 0
                 tiles = list(range(0, T_slab, t_tile))
                 for n, t0 in enumerate(tiles):
