@@ -127,7 +127,28 @@ class SlicedMultiLinear:
             o = outputs[t]
             assert o.is_contiguous() and o.shape[-1] == self.linears[t].out_features
             ptrs.append(o.data_ptr() + n0 * o.element_size())
-        out = torch.tensor(ptrs, dtype = torch.long, device = self.device)
+        # Miss path: pinned staging ring + async copy replaces the pageable-sync H2D that
+        # live py-spy (prod, 2026-10-24) showed holding 5.8% of decode samples -- the memo
+        # misses nearly every token because output blocks churn. The GPU table is a FRESH
+        # tensor per miss (callers like attn.prealloc_qkv_cptrs_1 hold tables across steps;
+        # a rotating GPU buffer would corrupt them). Pinned-slot reuse is gated on a
+        # recorded event so a slot is never rewritten while its copy is in flight.
+        if getattr(self, "_cptr_pin", None) is None:
+            self._cptr_pin = [torch.empty(self.num_slices, dtype = torch.long, pin_memory = True)
+                              for _ in range(4)]
+            self._cptr_evt = [None] * 4
+            self._cptr_slot = 0
+        i = self._cptr_slot
+        self._cptr_slot = (i + 1) % 4
+        evt = self._cptr_evt[i]
+        if evt is not None and not evt.query():
+            evt.synchronize()
+        self._cptr_pin[i].copy_(torch.tensor(ptrs, dtype = torch.long))
+        out = torch.empty(self.num_slices, dtype = torch.long, device = self.device)
+        out.copy_(self._cptr_pin[i], non_blocking = True)
+        evt = torch.cuda.Event()
+        evt.record()
+        self._cptr_evt[i] = evt
         self._cptr_last = (key, out)
         return out
 
