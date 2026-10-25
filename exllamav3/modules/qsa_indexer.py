@@ -27,6 +27,16 @@ by the caller.
 """
 
 
+def _memo_ver(t: torch.Tensor):
+    """Version counter for a memo key, or None when the tensor does not track one.
+
+    Inference tensors (anything built under ``torch.inference_mode()``) raise on ``_version``,
+    and the load-time autosplit dummy forward runs there -- reading ``_version`` unguarded
+    aborted model load outright. A None version means "cannot detect an in-place rewrite", so
+    callers skip the memo instead of risking a stale hit."""
+    return None if torch.is_inference(t) else t._version
+
+
 def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """
     Partial rotary on the first cos.shape[-1] dims of x. cos/sin broadcast over head dims.
@@ -601,14 +611,15 @@ class QSAIndexer(Module):
         Identical for every QSA layer within one token, so memoize on the source CPU
         tensor's (data_ptr, version, bsz) plus a strong ref, same contract as _bt_rows_cached.
         """
-        key = (cache_seqlens_cpu.data_ptr(), cache_seqlens_cpu._version, bsz, seq)
+        key = (cache_seqlens_cpu.data_ptr(), _memo_ver(cache_seqlens_cpu), bsz, seq)
         cache = getattr(self, "_job_arrays_cache", None)
         if cache is not None and cache[0] == key:
             return cache[2]
         pos_host = cache_seqlens_cpu[:bsz].to(dtype = torch.int32)
         t_host = (pos_host + seq) // self.compress_ratio
         pair = (pos_host.to(device = dev), t_host.to(device = dev))
-        self._job_arrays_cache = (key, cache_seqlens_cpu, pair)
+        if key[1] is not None:      # inference tensor: no version to invalidate against
+            self._job_arrays_cache = (key, cache_seqlens_cpu, pair)
         return pair
 
     def _select_rows_multi(self, q_rows, pool_flat, a_pos, a_T, out_rows, block_table, epp, dev, t_max, seq):
@@ -764,15 +775,17 @@ class QSAIndexer(Module):
         misses. Rebuilds only when the table actually changes: one copy launch per
         token instead of one per layer.
         """
-        key = (block_table.data_ptr(), block_table._version, tuple(block_table.shape), bsz, seq)
+        key = (block_table.data_ptr(), _memo_ver(block_table), tuple(block_table.shape), bsz, seq)
         cache = getattr(self, "_bt_rows_cache", None)
         if cache is not None and cache[0] == key:
             return cache[2]
         bt_job = block_table.int().contiguous()
         bt_rows = bt_job.unsqueeze(1).expand(bsz, seq, -1) \
             .reshape(bsz * seq, -1).contiguous()
-        self._bt_rows_cache = (key, block_table, (bt_job, bt_rows))
-        return self._bt_rows_cache[2]
+        if key[1] is not None:      # inference tensor: no version to invalidate against
+            self._bt_rows_cache = (key, block_table, (bt_job, bt_rows))
+            return self._bt_rows_cache[2]
+        return (bt_job, bt_rows)
 
     def sparse_attend(
         self,

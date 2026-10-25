@@ -233,6 +233,11 @@ class GTensorCache:
         return (torch.device(device), tuple(shape), dtype, x)
 
     def get(self, device, shape, dtype, x = ""):
+        if torch.is_inference_mode_enabled():
+            # [GS] See get_bucketed: a buffer kept from an InferenceMode pass (the load-time
+            # autosplit dummy forward) is an inference tensor, and the first real decode would
+            # abort on any in-place write to it. Never keep it.
+            return torch.empty(shape, dtype = dtype, device = device)
         key = self.make_key(device, shape, dtype, x)
         if key not in self.cache:
             refc, v = (0, torch.empty(shape, dtype = dtype, device = device))
@@ -247,6 +252,13 @@ class GTensorCache:
         count): nearby sizes share one kept entry instead of ratcheting a new allocation per
         distinct size, and the total kept per tag is bounded by 2x the largest use."""
         nb = 1 << max(numel - 1, 0).bit_length()
+        if torch.is_inference_mode_enabled():
+            # [GS] Never keep a buffer built inside InferenceMode. Tensors created there are
+            # inference tensors, which raise on any in-place update done outside InferenceMode
+            # ("Inplace update to inference tensor ... is not allowed"), and the load-time
+            # autosplit dummy forward runs inside InferenceMode: a kept entry from that pass
+            # would poison the first real decode. Throwaway is the correct behaviour there.
+            return torch.empty((nb,), dtype = dtype, device = device)[:numel]
         if numel == nb:
             return self.get(device, (nb,), dtype, x)
         # [GS] memoize the sliced view too: [:numel] built a fresh tensor per call
