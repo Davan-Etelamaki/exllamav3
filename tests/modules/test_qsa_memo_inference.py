@@ -76,6 +76,32 @@ def test_job_arrays_inference_tensor(device):
     assert pos.dtype == torch.int32 and t.dtype == torch.int32
 
 
+def test_memo_skipped_for_normal_input_inside_inference_mode(device):
+    """Handing a NORMAL tensor to the memo during an InferenceMode pass must still keep
+    nothing: what the memo would store (bt_job/bt_rows, the pos/T pair) is produced inside
+    the pass and is therefore an inference tensor itself."""
+    bsz, npr, seq = 2, 3, 2
+    s = _stub()
+    bt = _block_table(bsz, npr, device, inference = False)
+    cs = torch.tensor([3, 5], dtype = torch.int32)
+    assert not torch.is_inference(bt) and not torch.is_inference(cs)
+    with torch.inference_mode():
+        out = s._bt_tables(bt, bsz, seq)
+        assert torch.is_inference(out[0])              # derived inside the pass
+        assert not hasattr(s, "_bt_rows_cache")        # ... and so never kept
+        pair = s._job_arrays(cs, bsz, seq, device)
+        assert torch.is_inference(pair[0])
+        assert not hasattr(s, "_job_arrays_cache")
+
+    # The serving path then gets normal tensors, which are writable in place.
+    a = s._bt_tables(bt, bsz, seq)
+    assert not torch.is_inference(a[0]) and not torch.is_inference(a[1])
+    a[0].zero_()
+    b = s._job_arrays(cs, bsz, seq, device)
+    assert not torch.is_inference(b[0])
+    b[0].zero_()
+
+
 def test_memo_still_caches_outside_inference(device):
     """The guard must not disable the optimization: plain tensors still hit the memo, and an
     in-place rewrite (version bump) still misses it."""

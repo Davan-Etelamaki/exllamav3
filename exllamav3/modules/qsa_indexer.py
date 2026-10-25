@@ -28,13 +28,18 @@ by the caller.
 
 
 def _memo_ver(t: torch.Tensor):
-    """Version counter for a memo key, or None when the tensor does not track one.
+    """Version counter for a memo key, or None when the result must not be cached.
 
-    Inference tensors (anything built under ``torch.inference_mode()``) raise on ``_version``,
-    and the load-time autosplit dummy forward runs there -- reading ``_version`` unguarded
-    aborted model load outright. A None version means "cannot detect an in-place rewrite", so
-    callers skip the memo instead of risking a stale hit."""
-    return None if torch.is_inference(t) else t._version
+    None is returned in two cases, both of which mean "cannot detect an in-place rewrite":
+      * we are inside InferenceMode -- anything we derive and keep would be an inference
+        tensor, and the load-time autosplit dummy forward runs there, so a kept entry would
+        poison the first real decode;
+      * t is itself an inference tensor, where reading _version raises outright (inference
+        tensors do not track a version counter).
+    Callers compute fresh and skip the memo when this returns None."""
+    if torch.is_inference_mode_enabled() or torch.is_inference(t):
+        return None
+    return t._version
 
 
 def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
