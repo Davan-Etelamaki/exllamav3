@@ -1259,15 +1259,16 @@ class Generator:
 
         self._draft_conf_round = None
 
-        # Get shape of active batch
-        batch_size = 0
-        max_seq_len = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
-            max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens + 1)
-            batch_size += 1
-        if batch_size == 0:
+        # Glue cut (py-spy prod 2026-10-24: 3.48% self): ONE scan of active_jobs feeds all three
+        # passes; previously is_prefill_done() ran three times per job per draft call and
+        # os.environ.get ran per call.
+        ready = [job for job in self.active_jobs if job.is_prefill_done()]
+        if not ready:
             return None
+        max_seq_len = 0
+        for job in ready:
+            max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens + 1)
+        batch_size = len(ready)
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
@@ -1278,8 +1279,7 @@ class Generator:
         block_index.zero_()
         cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
+        for job in ready:
             for seq in job.sequences:
                 seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
                 block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
@@ -1289,8 +1289,7 @@ class Generator:
         # Collect input IDs
         input_ids_list = []
         mtp_hidden_list = []
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
+        for job in ready:
             assert len(job.sequences) == 1, "Qwen3.5 MTP drafting does not currently support CFG/multi-sequence jobs"
             if job.mtp_last_hidden is None:
                 # A one-token prompt has no token to prefill before the generation input.
@@ -1317,7 +1316,7 @@ class Generator:
         # per-step conf .cpu() was only the early-stop heuristic and drained the pipeline
         # every step (top py-spy leaf). Async mode: enqueue the full window, collect conf
         # on device, ONE readback after the loop, trim with the identical reach rule.
-        _async_conf = cal is not None and os.environ.get("EXL3_DRAFT_SYNC_CONF", "0") != "1"
+        _async_conf = cal is not None and not self._draft_sync_conf()
         conf_dev = None
         conf_steps = 0
         for idx in range(window):
@@ -1631,6 +1630,14 @@ class Generator:
             self.replay_rounds += 1
         return out
 
+
+    def _draft_sync_conf(self):
+        """EXL3_DRAFT_SYNC_CONF escape hatch, read once per generator instead of per draft
+        call (py-spy prod glue). Env is fixed for a process lifetime; first read wins."""
+        got = getattr(self, "_draft_sync_conf_cached", None)
+        if got is None:
+            got = self._draft_sync_conf_cached = os.environ.get("EXL3_DRAFT_SYNC_CONF", "0") == "1"
+        return got
 
     def _staging(self, name, rows: int, width: int | None = None, dtype = torch.int32):
         """
