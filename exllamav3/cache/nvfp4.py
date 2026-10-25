@@ -257,11 +257,13 @@ class CacheLayer_nvfp4(CacheLayer):
             bt_stage[b, :nb] = torch.arange(slot, slot + nb, dtype = torch.int32, device = block_table.device)
             slot += nb
         if self.k.is_cuda:
-            _nvfp4_bulk_dequant_kernel[(bsz, max(nblocks), 8)](
-                self.k, self.ks, self.v, self.vs, ks, vs, block_table, cache_seqlens,
-                extra, block_table.stride(0),
-                H = h, HALF = half_d, HSC = self.ks.shape[3], FULL = half_d * 2,
-                PAGE = PAGE_SIZE, ROWS = 32, SPLITS = 8, num_warps = 4)
+            from ..modules.attention_fn.triton_paged import _fast_dispatch
+            _fast_dispatch(
+                _nvfp4_bulk_dequant_kernel, (bsz, max(nblocks), 8),
+                (self.k, self.ks, self.v, self.vs, ks, vs, block_table, cache_seqlens,
+                 extra, block_table.stride(0)),
+                dict(H = h, HALF = half_d, HSC = self.ks.shape[3], FULL = half_d * 2,
+                     PAGE = PAGE_SIZE, ROWS = 32, SPLITS = 8, num_warps = 4))
         else:
             slot = 0
             for b in range(bsz):
@@ -289,10 +291,12 @@ class CacheLayer_nvfp4(CacheLayer):
                 and k.shape[2] == self.shape4[2] and k.shape[3] == self.shape4[3] * 2
                 and k.is_contiguous() and v.is_contiguous()
                 and (g := k.shape[3] // 16) & (g - 1) == 0):
-            _nvfp4_quant_append_kernel[(k.shape[0] * length,)](
-                k, v, self.k, self.ks, self.v, self.vs, block_table, cache_seqlens,
-                length, block_table.stride(0),
-                H = k.shape[2], G = g, PAGE = PAGE_SIZE, num_warps = 4)
+            from ..modules.attention_fn.triton_paged import _fast_dispatch
+            _fast_dispatch(
+                _nvfp4_quant_append_kernel, (k.shape[0] * length,),
+                (k, v, self.k, self.ks, self.v, self.vs, block_table, cache_seqlens,
+                 length, block_table.stride(0)),
+                dict(H = k.shape[2], G = g, PAGE = PAGE_SIZE, num_warps = 4))
             return
         self._update_kv_python(cache_seqlens, block_table, k, v, length)
 
