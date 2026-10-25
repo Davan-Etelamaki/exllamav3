@@ -261,3 +261,46 @@ def test_conv_history_then_rewind(device, k, seqlen, max_history):
             s = int(slots[b])
             ref = _conv_window_reference(state0[s], x[b, :, : seqlen - r], k)
             assert torch.equal(state[s, :, :k], ref), (r, b)
+
+
+# Cuts 21/22: scan_geometry and staged-view memos must be identity-stable within a buffer
+# generation and must die with every state mutation (set_state_dtype / alloc / free)
+
+@torch.inference_mode()
+def test_scan_geometry_memo_identity_and_invalidation(device):
+    ls = _layer_state(device, 2, 3, 384, 4, 4, 32, 64)
+    g1 = ls.scan_geometry()
+    assert ls.scan_geometry() is g1, "memo must return the identical object"
+    ls.free()                                             # free must invalidate
+    assert "_scan_geom" not in ls.__dict__
+    ls.set_state_dtype(torch.half)                         # legal only while unallocated
+    assert "_scan_geom" not in ls.__dict__                 # set_state_dtype must invalidate
+    ls.alloc(device)                                       # alloc must invalidate
+    assert "_scan_geom" not in ls.__dict__
+    g2 = ls.scan_geometry()
+    assert ls.scan_geometry() is g2 and g2 is not g1, "recomputed memo must be fresh but stable"
+
+
+@torch.inference_mode()
+def test_staged_views_memo_identity_and_invalidation(device):
+    ls = _layer_state(device, 2, 3, 384, 4, 4, 32, 64)
+    v1 = ls.staged_views(2, 3)
+    v1b = ls.staged_views(2, 3)
+    assert all(a is b for a, b in zip(v1b, v1)), "same (bsz, seqlen) must return identical triples"
+    s0 = ls.staged_step_views(2, 0)
+    s1 = ls.staged_step_views(2, 1)                        # step 1 continues the (2, 1, 2) staging
+    ls.staged_views(2, 3)                                  # a new pass resets spec_shape
+    s0b = ls.staged_step_views(2, 0)                       # ...so step 0 may run again,
+    s1b = ls.staged_step_views(2, 1)                       # and step 1 must hit the memo
+    assert all(a is b for a, b in zip(s1b, s1)) and all(a is b for a, b in zip(s0b, s0)), \
+        "across passes the same (bsz, step) must return identical triples"
+    storages = [t.untyped_storage() for t in v1]
+    ls.free()
+    assert "_stage_cache" not in ls.__dict__, "free must invalidate the stage cache"
+    ls.set_state_dtype(torch.half)
+    assert "_stage_cache" not in ls.__dict__, "set_state_dtype must invalidate the stage cache"
+    ls.alloc(device)
+    assert "_stage_cache" not in ls.__dict__, "alloc must invalidate the stage cache"
+    v2 = ls.staged_views(2, 3)
+    assert all(t.untyped_storage() is not s for t in v2 for s in storages), \
+        "views after reallocation must target new buffers"
