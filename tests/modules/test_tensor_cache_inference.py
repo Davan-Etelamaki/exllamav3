@@ -1,11 +1,16 @@
 """
-g_tensor_cache must never keep a buffer built inside torch.inference_mode().
+g_tensor_cache must stay usable inside torch.inference_mode() AND never hand out an inference tensor.
 
-Regression fence for the prod load abort (2026-10-24): the load-time autosplit dummy forward
-runs inside InferenceMode, so every tensor it created was an inference tensor. Anything the
-cache kept from that pass came back on the first real decode, where a normal-mode in-place
-write on an inference tensor raises ("Inplace update to inference tensor outside InferenceMode
-is not allowed"). get/get_bucketed now hand back throwaway buffers there.
+Regression fence for the prod load abort (2026-10-24): the load-time autosplit dummy forward runs
+inside InferenceMode, so every tensor it created was an inference tensor. Anything the cache kept
+from that pass came back on the first real decode, where a normal-mode in-place write on an
+inference tensor raises ("Inplace update to inference tensor outside InferenceMode is not allowed").
+
+The fix is that the cache allocates its entries with InferenceMode disabled, so a kept entry is a
+NORMAL tensor: a call inside a pass still reuses its buffer (caching is the whole point of the
+cache and the engine's serving path runs in a pass), and the same entry written outside the pass
+is legal. Disabling caching inside a pass, the earlier sledgehammer, is RED against
+tests/kernels/dsa/test_dsa_kernels.py::test_workspaces_kept_only_for_decode_rows.
 
 The positive control feeds a cache entry an inference tensor and asserts the normal-mode write
 raises -- without it, a green would not show that the poisoning this guards against is real.
@@ -29,30 +34,27 @@ def test_positive_control_inference_tensor_inplace_raises(device):
         handed_back.zero_()
 
 
-def test_get_and_get_bucketed_keep_nothing_in_inference_mode(device):
-    tag = "fence_inf_keep_nothing"
+def test_cache_keeps_normal_buffers_inside_inference_mode(device):
+    """Caching must survive a pass, and the kept entry must not be an inference tensor."""
+    tag = "fence_inf_keeps"
     with torch.inference_mode():
-        a = g_tensor_cache.get(device, (128,), torch.float, tag)
-        b = g_tensor_cache.get_bucketed(device, 100, torch.float, tag)
-        b2 = g_tensor_cache.get_bucketed(device, 100, torch.float, tag)
-        # throwaway means: not the same object twice, and nothing retained
-        assert b2 is not b and b.numel() == 100 and b2.numel() == 100
-        assert g_tensor_cache.make_key(device, (128,), torch.float, tag) not in g_tensor_cache.cache
-        assert not any(k[3] == tag for k in g_tensor_cache._slice_cache)
-    assert a.numel() == 128
-
-    # Crucial: the same tag fetched in NORMAL mode must NOT be an inference tensor, i.e. the
-    # inference-mode pass left no entry behind for the serving path to trip over.
-    plain = g_tensor_cache.get(device, (128,), torch.float, tag)
-    assert not torch.is_inference(plain)
-    plain.zero_()                                        # the write that used to raise
-    buck = g_tensor_cache.get_bucketed(device, 100, torch.float, tag)
-    buck.zero_()
-    del g_tensor_cache.cache[g_tensor_cache.make_key(device, (128,), torch.float, tag)]
+        v1 = g_tensor_cache.get(device, (128,), torch.float, tag)
+        v2 = g_tensor_cache.get(device, (128,), torch.float, tag)
+        assert v1 is v2, "caching disabled inside InferenceMode: the whole cache is dead there"
+        assert not torch.is_inference(v1), "an inference tensor was kept as a cache entry"
+        s1 = g_tensor_cache.get_bucketed(device, 100, torch.float, tag)
+        s2 = g_tensor_cache.get_bucketed(device, 100, torch.float, tag)
+        assert s1 is s2 and s1.numel() == 100 and not torch.is_inference(s1)
+        v1.zero_()                       # legal: v1 is a normal tensor
+    # And still writable once the pass is over -- the write that used to raise on a poisoned entry.
+    v1.zero_()
+    s1.zero_()
+    g_tensor_cache.cache.pop(g_tensor_cache.make_key(device, (128,), torch.float, tag), None)
+    g_tensor_cache._slice_cache.pop((torch.device(device), 128, torch.float, tag, 100), None)
 
 
 def test_cache_still_caches_outside_inference_mode(device):
-    """The guard must not disable caching for the serving path."""
+    """The serving path outside a pass keeps caching, unchanged."""
     tag = "fence_inf_still_caches"
     v1 = g_tensor_cache.get(device, (256,), torch.float, tag)
     v2 = g_tensor_cache.get(device, (256,), torch.float, tag)
