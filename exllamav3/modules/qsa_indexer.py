@@ -3,6 +3,7 @@ import os
 from typing_extensions import override
 import math
 import torch
+from ..util.tensor import device_ctx
 import torch.nn.functional as F
 from .module import Module
 from .linear import Linear
@@ -370,7 +371,7 @@ class QSAIndexer(Module):
                         ext.dsa_topk_merge_tiles(
                             w_idx, w_scr, w_cnt, n_idx[:, 0], n_scr[:, 0], n_cnt[:, 0], k_sel)
                         cur ^= 1
-            with torch.cuda.device(dev):
+            with device_ctx(dev):
                 _fast_dispatch(
                     _dsa_pool_expand_kernel, (rows, triton.cdiv(k_pad, 256)),
                     (pool_idx, out_rows[r0 : r1], pos0 + r0),
@@ -537,7 +538,7 @@ class QSAIndexer(Module):
             .view(bsz, seqlen, H, dk)
         kraw = self._workspace(R, R * dk, torch.half, "qsa_up_k", dev) \
             .view(bsz, seqlen, dk)
-        with torch.cuda.device(dev):
+        with device_ctx(dev):
             _fast_dispatch(_qsa_stage_kernel, (R, H + 1),
                 (qk, self._norm_w_half("q", dev), q, kraw, R),
                 dict(eps = float(self.q_layernorm.rms_norm_eps), H_i = H, D = dk))
@@ -677,7 +678,7 @@ class QSAIndexer(Module):
                 DEBUG_PAGES = pool_flat.shape[0] // epp if dsa_debug_bounds else 0,
             )
             return args, consts
-        with torch.cuda.device(dev):
+        with device_ctx(dev):
             def probe(bn):
                 args, consts = i_args(bn)
                 return shared_bytes(_dsa_indexer_fewq_kernel, args, **consts, num_warps = 8, num_stages = 2)
@@ -686,7 +687,7 @@ class QSAIndexer(Module):
             _fast_dispatch(_dsa_indexer_fewq_kernel, (R, triton.cdiv(max(t_max, 1), bn)),
                            args, dict(consts, num_warps = 8, num_stages = 2))
         ext.dsa_topk(scores, pool_idx, k_sel, a_T, seq)
-        with torch.cuda.device(dev):
+        with device_ctx(dev):
             _fast_dispatch(_dsa_pool_expand_kernel, (R, triton.cdiv(out_rows.shape[1], 256)),
                 (pool_idx, out_rows, a_pos),
                 dict(P = cr, SEL = self.block_topk, K_pad = out_rows.shape[1], KP_pool = kp,

@@ -2,6 +2,7 @@ import math
 import os
 
 import torch
+from ...util.tensor import device_ctx
 
 import triton
 import triton.language as tl
@@ -580,7 +581,7 @@ def paged_attn_triton(
         block_dv = head_dim
     num_pages_per_seq = block_table.shape[1]
 
-    with torch.cuda.device(q.device):
+    with device_ctx(q.device):
         if k is not None and kv_append_len:
             if nvfp4:
                 _fast_dispatch(
@@ -746,7 +747,7 @@ def paged_attn_triton_longq(
         block_dv = head_dim
 
     num_pages_per_seq = block_table.shape[1]
-    with torch.cuda.device(q.device):
+    with device_ctx(q.device):
         if k is not None and kv_append_len:
             if nvfp4:
                 _fast_dispatch(
@@ -1491,7 +1492,7 @@ def paged_attn_triton_decode(
         )
         return args, splits, partial_o, partial_ml
 
-    with torch.cuda.device(q.device):
+    with device_ctx(q.device):
         pick_key = (head_dim, hd_pad, qck, qcv, q_len, block_rows, h_blocks, bool(causal), window_left >= 0,
                     window_right >= 0, has_sinks, num_warps, num_stages, candidates[0], nvfp4)
         block_n = pick_config(
@@ -2598,7 +2599,7 @@ def varlen_attn_triton(
             has_sinks and not sink_key0, has_sinks and sink_key0, block_m, block_n,
         )
 
-    with torch.cuda.device(q.device):
+    with device_ctx(q.device):
         stock = (block_m, block_n, num_warps, num_stages)
         pick_key = (head_dim, hd_p2, bool(causal), window_left >= 0, window_right >= 0,
                     has_sinks, sink_key0, stock)

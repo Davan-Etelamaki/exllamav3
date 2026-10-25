@@ -30,6 +30,7 @@ The lightning-indexer scoring kernel is shared as-is between raw-token (V3.2) an
 import math
 import os
 import torch
+from ...util.tensor import device_ctx
 from ...util.backend import DSA_MQA
 from ...util.tensor import g_tensor_cache
 
@@ -1080,7 +1081,7 @@ def dsa_attn(
                 Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
                 QC = qc_bits,
             )
-        with torch.cuda.device(q.device):
+        with device_ctx(q.device):
             pick_key = (H, D_c, D_r, K_pad, has_window, dense_pool, a_seq, multirow is not None,
                         dbg, bool(q_split), bool(out_latent), qc_bits, num_warps, hb_ladder[0])
             def probe(cfg):
@@ -1140,7 +1141,7 @@ def dsa_attn(
         c = m_consts((block_h, block_n, num_stages))
         mqa = dsa_mqa.prefill_eligible(c)
         if mqa is not None:
-            with torch.cuda.device(q.device):
+            with device_ctx(q.device):
                 grid = (R * (H // mqa[0]) * ((D_c + D_r) // mqa[1]),)
                 dsa_mqa._dsa_prefill_mqa_kernel[grid](
                     *m_args, **dsa_mqa.prefill_consts(c, mqa), num_warps = dsa_mqa.PREFILL_WARPS, num_stages = 1,
@@ -1154,7 +1155,7 @@ def dsa_attn(
             for bn in halving_ladder(block_n):
                 if (bh, bn, ns) not in ladder:
                     ladder.append((bh, bn, ns))
-    with torch.cuda.device(q.device):   # layer split: launch on the tensor's device
+    with device_ctx(q.device):   # layer split: launch on the tensor's device
         pick_key = (H, D_c, D_r, K_pad, has_window, has_sinks, dense_pool, derotate, hpg, dbg,
                     bool(nc_block), bool(nc_chunk), nc_hist, bool(q_split), bool(out_latent), qc_bits,
                     num_warps, ladder[0])
@@ -1215,7 +1216,7 @@ def dsa_indexer_scores(
         assert scores.shape[0] >= R and S_stride >= T_pad and S_stride % 8 == 0 \
             and scores.stride(1) == 1 and scores.stride(0) == S_stride, \
             "dsa_indexer_scores: score backing must be a row-contiguous (>= R, >= T rounded to the tile) view"
-    with torch.cuda.device(q_idx.device):
+    with device_ctx(q_idx.device):
         if R <= 4:
             # Few-query (decode) shape: heads as the MMA M dim, one dot per key tile --
             # the query-tiled kernel degenerates to a serial head loop over padding here

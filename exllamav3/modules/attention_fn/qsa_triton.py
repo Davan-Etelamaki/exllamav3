@@ -30,6 +30,7 @@ runtime arguments or derived on device, so the kernels are CUDA-graph-safe.
 """
 
 import torch
+from ...util.tensor import device_ctx
 
 import triton
 import triton.language as tl
@@ -350,7 +351,7 @@ def qsa_sparse_attend_rows(
     # Triton JIT launches on the CURRENT device; with a model split across GPUs this
     # layer's device need not be current
     from .triton_paged import _fast_dispatch
-    with torch.cuda.device(dev):
+    with device_ctx(dev):
         _fast_dispatch(
             _qsa_sparse_split_kernel, (programs, splits),
             (q, k, v, block_table if paged else indices, indices, partial_o, partial_ml,

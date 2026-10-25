@@ -1,6 +1,25 @@
 from __future__ import annotations
 import torch
 from .device_copy import to_device
+from contextlib import nullcontext
+
+_device_ctx_cache = {}
+
+
+def device_ctx(device):
+    """Reusable `with` object for launching on DEVICE.
+
+    torch.cuda.device(dev) costs ~1.1 us per construction+enter (bench 2026-10-25, shared-GPU
+    sm_120); hot attention paths pay it per layer per step. The decision (already-current =>
+    nullcontext, else a reusable torch.cuda.device object) is cached per device for the process
+    lifetime: the current device does not change after engine boot.
+    """
+    ctx = _device_ctx_cache.get(device)
+    if ctx is None:
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        ctx = nullcontext() if idx == torch.cuda.current_device() else torch.cuda.device(device)
+        _device_ctx_cache[device] = ctx
+    return ctx
 
 class SeqTensor:
 
