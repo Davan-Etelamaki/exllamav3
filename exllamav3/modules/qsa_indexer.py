@@ -363,10 +363,13 @@ class QSAIndexer(Module):
                 # Bucketed per-device cache instead of six fresh allocations per slab:
                 # the alloc block measured 15.83 us/call (isolated bench 2026-10-25, shared
                 # busy GPU) and its torch.empty/zeros lines are 1.18% of prod decode wall
-                # (py-spy r130, wheel b75a161880c0). Dirty reuse is safe: dsa_topk_tile
-                # resets its cnt slot at t == 0 (dsa_topk.cu:364) and writes idx/scr before
-                # merge_tiles reads them; tests/kernels/dsa/test_dsa_topk_tiles.py drives
-                # this exact loop over uninitialized ws
+                # (py-spy r130, wheel b75a161880c0). Reuse means these buffers arrive DIRTY,
+                # so the invariant is explicit: dsa_topk_tile resets ONLY its own cnt slot at
+                # t == 0 (dsa_topk.cu:364), never the accumulator slot this loop reads first.
+                # The accumulator is cleared below and the merge kernel clamps the count it
+                # reads. run_tiled in tests/kernels/dsa/test_dsa_topk_tiles.py zero-inits its
+                # workspace, so it cannot catch a dirty slot; test_qsa_tiled_slot0.py poisons
+                # the slot on purpose
                 ws = []
                 for slot in (0, 1):
                     ws.append((
@@ -374,6 +377,15 @@ class QSAIndexer(Module):
                         g_tensor_cache.get_bucketed(dev, rows * 2 * kp, torch.half, f"qsa_sel_ws{slot}_scr")[:rows * 2 * kp].view(rows, 2, kp),
                         g_tensor_cache.get_bucketed(dev, rows * 2, torch.int32, f"qsa_sel_ws{slot}_cnt")[:rows * 2].view(rows, 2),
                     ))
+                # The first merge below reduces slots 0 and 1, but by then only slot 1 has been
+                # written: slot 0 is this pass's running set and has to start EMPTY. These
+                # workspaces come from the bucketed cache as dirty memory, and
+                # dsa_topk_merge_kernel takes ws_cnt[row, g] as the loop bound over
+                # ws_idx/ws_scr slot g -- an uninitialized count is a garbage bound and reads far
+                # outside the slot (observed: illegal memory access / Xid 31 during the autosplit
+                # load measure). Zero the accumulator counts before the loop.
+                for w in ws:
+                    w[2][:, 0].zero_()
                 cur = 0
                 tiles = list(range(0, T_slab, t_tile))
                 for n, t0 in enumerate(tiles):

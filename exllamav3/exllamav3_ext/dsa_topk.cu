@@ -564,7 +564,10 @@ void dsa_topk_merge_kernel
     __shared__ int sh_res[2];
     __shared__ int sh_tile_total;
 
-    if (t < G) cnt_sh[t] = row_cnt[t];
+    // ws_cnt is a per-slot candidate count supplied by the caller, and the loops below use it as
+    // the bound over ws_idx/ws_scr slot g (at most k_pad entries each). Clamp it here so a stale,
+    // uninitialized or corrupt count can never turn those loops into an out-of-bounds read.
+    if (t < G) cnt_sh[t] = min(max(row_cnt[t], 0), k_pad);
     if (t < 256) hist[t] = 0;
     __syncthreads();
 
