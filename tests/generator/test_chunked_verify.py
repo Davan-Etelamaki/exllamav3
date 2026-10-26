@@ -49,7 +49,16 @@ class _Seq:
     def __init__(self, ids):
         self.sequence_ids = _SeqIds(ids)
         self.kv_position = len(ids) - 1
-        self.allocated_pages = [_Page() for _ in range(64)]   # generous: index errors must not mask bugs
+        # Real lifecycle (chunked-verify16b repro): prefill cached the prefix
+        # contiguously, so page fill must START consistent with kv_position — page p
+        # holds min(PAGE_SIZE, max(0, kv_position - p*PAGE_SIZE)) tokens. Drift from a
+        # verify round is only visible against primed pages.
+        self.allocated_pages = []
+        n_cached = len(ids) - 1
+        for p in range(64):                       # generous: index errors must not mask bugs
+            page = _Page()
+            page.kv_position = max(0, min(PAGE_SIZE, n_cached - p * PAGE_SIZE))
+            self.allocated_pages.append(page)
         self.block_index_tensor = torch.arange(1, 65, dtype=torch.int32).view(1, 64)
 
 
@@ -108,7 +117,18 @@ class _Job:
             if add_to_cache:
                 n = ids.shape[-1]
                 skvp = seq.kv_position
+                guard = 0
                 while n:
+                    # Loop bound: the real job.py:401-406 loop has none, which is why the
+                    # drift bug wedged the engine for 25 min instead of failing. Here a
+                    # no-progress spin raises so the fence can assert on it.
+                    guard += 1
+                    if guard > 1000:
+                        raise RuntimeError(
+                            f"LIVELOCK: get_input_ids_list add_to_cache made no progress "
+                            f"(seq.kv_position={seq.kv_position} page.kv_position="
+                            f"{page.kv_position} tokens_left={n}); page fill is ahead of "
+                            f"kv_position")
                     page = seq.allocated_pages[skvp // PAGE_SIZE]
                     tp = min(n, PAGE_SIZE - page.kv_position)
                     page.kv_position += tp
@@ -377,3 +397,62 @@ def test_witness_counters_are_nonzero_on_fire():
     _, _, _, g_c, g_s = _run_pair(40, 20)
     assert g_c.chunk_rounds == 1 and g_c.chunk_rows_verified > 0 and g_c.chunk_subrounds >= 2
     assert g_s.chunk_rounds == 0 and g_s.chunk_rows_verified == 0
+
+
+def _world_batch(W, mismatches, cap_guard, prefix_len=247):
+    """Multi-row world sharing one prefix, like the real batch: a row that is done in an
+    early sub-round keeps feeding its pending token + filler columns in later sub-rounds
+    so the batch stays rectangular. prefix_len places the early-rejecting row's pending
+    token at the LAST slot of a PAGE_SIZE page, so any page-fill drift bites the very
+    next round's add_to_cache."""
+    prefix = [1000 + (i % 900) for i in range(prefix_len)]
+    jobs, drafts = [], []
+    for k, mm in enumerate(mismatches):
+        draft = [2000 + ((i + 7 * k) % 37) for i in range(W)]
+        oracle = list(draft) + [3999]
+        if mm is not None:
+            oracle[mm] = 3888 + k             # correction: != any draft token
+        jobs.append(_Job(prefix, oracle))
+        drafts.append(draft)
+    model = _Model(jobs, prefix_len - 1, cap_guard)
+    g = _gen(jobs[0], model)
+    g.active_jobs = jobs
+    dt = torch.tensor(drafts, dtype=torch.int64)
+    return jobs, g, dt
+
+
+def test_wide_chunked_round_leaves_no_page_drift_for_next_round():
+    # Reproducer for the dot26 livelock (chunked-verify16b). Two rows, W=24 (wide):
+    # row A rejects at sub-round 0 row 8 (done), row B accepts all of sub-round 0 and
+    # rejects at sub-round 1 row 0 — so sub-round 1 runs with A still in the batch.
+    # A's done-row rollback (reject_window(j, 0)) releases cap-1 of the cap tokens
+    # staged for that window (its pending correction token + 15 filler columns),
+    # leaving page.kv_position one ahead of seq.kv_position. The next iterate_gen —
+    # ANY width — then spins in get_input_ids_list's add_to_cache loop
+    # (job.py:403<->406): the pending slot's page is full, tokens_page = 0 forever,
+    # tokens_to_add never decrements. Pre-fix this raises LIVELOCK (the stub bounds
+    # the loop the real code leaves unbounded); post-fix both rounds complete with
+    # page fill == kv_position throughout.
+    jobs, g, dt = _world_batch(24, [8, 16], CAP)
+    g.iterate_gen([], dt)                                   # wide chunked round
+    assert g.chunk_rounds == 1 and g.chunk_subrounds == 2   # the incident's shape
+    dt2 = torch.tensor([[2500 + i for i in range(8)] for _ in jobs], dtype=torch.int64)
+    try:
+        g.iterate_gen([], dt2)                              # narrow round: spun here pre-fix
+        spin = None
+    except RuntimeError as exc:                             # stub's loop bound caught the spin
+        spin = str(exc)
+    assert spin is None, f"second iterate_gen livelocked in add_to_cache: {spin}"
+    for job in jobs:                                        # the invariant the bug breaks
+        seq = job.sequences[0]
+        fill = sum(p.kv_position for p in seq.allocated_pages)
+        assert fill == seq.kv_position, (
+            f"page fill {fill} != kv_position {seq.kv_position}: page ahead -> next "
+            f"round's add_to_cache spins (job.py:401-406)")
+        assert job.recurrent_state.target.pos == len(seq.sequence_ids), \
+            "recurrent state drifted ahead of the committed sequence"
+    assert g.chunk_rounds == 1                              # positive control: round 2 was single-pass
+    for job in jobs:
+        seq = job.sequences[0]
+        assert sum(p.kv_position for p in seq.allocated_pages) == seq.kv_position
+        assert len(seq.sequence_ids) == seq.kv_position + 1

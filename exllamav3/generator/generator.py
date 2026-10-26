@@ -1696,8 +1696,9 @@ class Generator:
         # lossless filler convention as the rectangular pass, which rejects them at the first
         # mismatch) and its bonus row ends the round. A rejecting row rolls back only the rows it
         # wrote in the current sub-round; done rows keep feeding their columns so the batch stays
-        # rectangular, and their unaccepted rows roll back again every sub-round (K/V writes are
-        # idempotent at the same position). Round-level counters, the replay bandit and the
+        # rectangular, and their unaccepted rows roll back the FULL window again every sub-round
+        # (chunked-verify16b: they staged pending + cap-1 filler columns and committed none;
+        # K/V writes are idempotent at the same position). Round-level counters, the replay bandit and the
         # draft-cache tails run once at round end over the concatenated sub-round layout, where
         # the single-pass formulas hold unchanged: concatenating [lead_k | 15 columns] over k
         # reproduces the single-pass [lead | W columns] id layout column-for-column.
@@ -1724,13 +1725,20 @@ class Generator:
         windows_run = 0
         self.chunk_rounds += 1
 
-        def reject_window(job_, j_, i_):
+        def reject_window(job_, j_, i_, full=False):
             # Roll back this sub-round's rows past the accepted prefix: the recurrent state
             # through the engine's own rewind (which rebuilds the prefix state by replaying
             # the staged inputs, gated_delta_net._rewind_layers), the pages through the same
             # kv_position rollback loop the single-pass reject_remainder uses. rewind(0) is a
             # commit (same semantics as the rejected == 0 normalization in iterate_gen).
-            num_rejected = cap - 1 - i_
+            # full=True (chunked-verify16b): a row that finished in an EARLIER sub-round still
+            # staged a whole window here (its pending token + cap-1 filler columns) and
+            # committed nothing, so the rollback must release all cap rows; releasing cap-1
+            # left page.kv_position and the recurrent state one token ahead of seq.kv_position
+            # per extra sub-round, and the next round's get_input_ids_list(add_to_cache=True)
+            # spun forever with tokens_page = 0 once the pending token sat on the drained
+            # page slot (job.py:401-406 livelock, dot26 2026-10-26).
+            num_rejected = cap if full else cap - 1 - i_
             if batch_states is not None:
                 batch_states[j_].rewind(num_rejected)
             if num_rejected == 0:
@@ -1821,7 +1829,8 @@ class Generator:
                 if a == b:
                     continue
                 if row_done[j]:
-                    reject_window(job, j, 0)
+                    # [GS] chunked-verify16b: full-window rollback (see reject_window)
+                    reject_window(job, j, 0, full = True)
                     continue
                 job_logits = batch_logits[a:b, :, :]
                 for i in range(cap):
