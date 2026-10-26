@@ -19,6 +19,21 @@ _SD_FASTSYNC = os.environ.get("EXL3_SD_FASTSYNC", "1") == "1"
 # gate OFF holds the only large wins (+64/+101%). Default OFF; knob kept for
 # flagship sweeps where per-step time dwarfs sync cost differently.
 _SD_FAST_MINW = int(os.environ.get("EXL3_SD_FAST_MINW", "0"))
+
+# [GS] chunked-verify16: a wide verify round pads every row to the global max width and
+# computes the whole rectangle even though acceptance is a prefix per row (generator.py
+# rectangular pass): a row that rejects at token p still pays the model for columns p+1..W,
+# and non-fired rows pay full width for ≤5 accepted. Such a round instead iterates as
+# sequential sub-rounds of _CHUNK_VERIFY_CAP tokens inside one pass: total tokens per pass
+# are preserved on full accepts (copy-dominated replay), and a rejecting row stops its
+# sub-round loop, forfeiting only the columns that verification would have rejected anyway.
+# Lane A/B (fleet regime, paired interleaved): replay16 gave 8-lane +7.0%, transform-lane
+# +11.1% (ppa 1.07→1.00, acc 74.6→80.4%). NOT a claim about attention tiers: generic-tier
+# NVFP4 staging is not width-triggered at batch>1 (measured C arm at q_len=16 still hot).
+# Marker: chunked-verify16. Default ON in code; rounds at or below the cap take the
+# single-pass path unchanged.
+_CHUNK_VERIFY_CAP = 16  # sub-round width: 1 lead token + 15 draft columns
+
 from ..util import cuda_sync_active
 
 logger = logging.getLogger(__name__)
@@ -355,6 +370,12 @@ class Generator:
         self.hybrid_rounds = 0
         self.replay_rounds = 0
         self.replay_rejects = 0
+        # [GS] chunked-verify16 witnesses: rounds taken by the chunked path, sub-rounds run,
+        # model rows fed and draft tokens accepted across them (law 12 trace metric)
+        self.chunk_rounds = 0
+        self.chunk_subrounds = 0
+        self.chunk_rows_verified = 0
+        self.chunk_accepted = 0
 
         # Pinned staging buffer for batched token readback in iterate_gen
         self.sample_pinned = None
@@ -1662,7 +1683,393 @@ class Generator:
         return buf[:rows]
 
 
+    def _iterate_gen_chunked(self, results: list, draft_tokens: torch.Tensor):
+        # [GS] chunked-verify16: run a wide verify round (draft width + 1 > _CHUNK_VERIFY_CAP)
+        # as sequential sub-rounds of exactly _CHUNK_VERIFY_CAP tokens inside ONE pass, so a
+        # rejecting row stops paying the model for columns verification would only reject
+        # (see the _CHUNK_VERIFY_CAP comment for the measured justification; no attention-tier
+        # claim). Sub-round k feeds
+        # [lead, draft columns 16k..16k+14]; its last logit row verifies column 16k+15, which is
+        # the next sub-round's lead token when accepted (the sub-round boundary is an ordinary
+        # draft comparison at position 15, so no separate boundary logic exists). The final
+        # sub-round pads its draft columns with repeats of the row's last draft token (the same
+        # lossless filler convention as the rectangular pass, which rejects them at the first
+        # mismatch) and its bonus row ends the round. A rejecting row rolls back only the rows it
+        # wrote in the current sub-round; done rows keep feeding their columns so the batch stays
+        # rectangular, and their unaccepted rows roll back again every sub-round (K/V writes are
+        # idempotent at the same position). Round-level counters, the replay bandit and the
+        # draft-cache tails run once at round end over the concatenated sub-round layout, where
+        # the single-pass formulas hold unchanged: concatenating [lead_k | 15 columns] over k
+        # reproduces the single-pass [lead | W columns] id layout column-for-column.
+        cap = _CHUNK_VERIFY_CAP
+        per_win = cap - 1
+        W = draft_tokens.shape[-1]
+        nwin = -(-W // per_win)
+
+        jobs = [job for job in self.active_jobs if job.is_prefill_done()]
+        if not jobs:
+            return
+        batch_states = [job.recurrent_state.target for job in jobs] if self.target_recurrent else None
+        accepted_drafts = [0] * len(jobs)
+        row_done = [False] * len(jobs)
+        completed_jobs = []
+        requeuing_jobs = []
+        accepted_lengths = []
+        rewound_jobs = set()
+        win_ids = []
+        win_hidden = []
+        round_cache_seqlens = None
+        last_block_index = None
+        logit_mapping = None
+        windows_run = 0
+        self.chunk_rounds += 1
+
+        def reject_window(job_, j_, i_):
+            # Roll back this sub-round's rows past the accepted prefix: the recurrent state
+            # through the engine's own rewind (which rebuilds the prefix state by replaying
+            # the staged inputs, gated_delta_net._rewind_layers), the pages through the same
+            # kv_position rollback loop the single-pass reject_remainder uses. rewind(0) is a
+            # commit (same semantics as the rejected == 0 normalization in iterate_gen).
+            num_rejected = cap - 1 - i_
+            if batch_states is not None:
+                batch_states[j_].rewind(num_rejected)
+            if num_rejected == 0:
+                return 0
+            for seq_ in job_.sequences:
+                r = num_rejected
+                while r:
+                    pos = seq_.kv_position + r
+                    page = seq_.allocated_pages[(pos - 1) // PAGE_SIZE]
+                    rp = min(page.kv_position, r)
+                    page.kv_position -= rp
+                    r -= rp
+            return num_rejected
+
+        for win in range(nwin):
+            c = win * cap
+            dhi = min(c + per_win, W)
+            rows = sum(len(job.sequences) for job in jobs)
+            max_seq_len = 0
+            for job in jobs:
+                max_seq_len = max(max_seq_len, job.get_max_seq_len() + cap)
+            max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+            max_pages_batch = (max_pages_batch + 15) // 16 * 16
+            block_index = self._staging("block_index", rows, max_pages_batch)
+            block_index.zero_()
+            cache_seqlens = self._staging("cache_seqlens", rows)
+            batch = 0
+            use_offsets = "mrope" in self.model.caps
+            positions = self._staging("positions", rows) if use_offsets else None
+            for job in jobs:
+                for seq in job.sequences:
+                    seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
+                    block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
+                    cache_seqlens[batch] = seq.kv_position
+                    if use_offsets:
+                        positions[batch] = seq.kv_position + job.alt_rope_offset
+                    batch += 1
+            if win == 0:
+                round_cache_seqlens = cache_seqlens.clone()
+            last_block_index = block_index
+
+            # Sub-round ids: [lead, 15 draft columns], the final sub-round's missing columns
+            # padded with a repeat of its last real column
+            input_ids_list = []
+            logit_mapping = []
+            for job in jobs:
+                logit_mapping.append(len(input_ids_list))
+                if job.time_first_token is None:
+                    cuda_sync_active()
+                    job.time_first_token = time.time()
+                dw = draft_tokens[:, c:dhi]
+                if dw.shape[-1] < per_win:
+                    dw = torch.cat((dw, draft_tokens[:, dhi - 1:dhi].expand(-1, per_win - dw.shape[-1])), dim = -1)
+                input_ids_list += job.get_input_ids_list(dw, len(input_ids_list), add_to_cache = True)
+            logit_mapping.append(len(input_ids_list))
+            batch_ids = torch.cat(input_ids_list, dim = 0)
+
+            for j, job in enumerate(jobs):
+                if row_done[j] or job.new_tokens < 0: continue
+                for f in job.filters:
+                    if not f.is_active: continue
+                    if f.use_background_worker():
+                        job.filter_futures.append(self.filter_pool.submit(f.get_next_logit_mask))
+                    else:
+                        job.filter_futures.append(None)
+
+            params = {
+                "attn_mode": "flash_attn",
+                "block_table": block_index,
+                "cache": self.cache,
+                "cache_seqlens": cache_seqlens,
+                "recurrent_states": batch_states,
+                "indexed_embeddings": [],
+                "positions": positions,
+                "recurrent_history": True,
+                "pinned_staging": True,
+            }
+            batch_logits = self.model.forward(input_ids = batch_ids, params = params)
+            p_export_states = params.get("export_states")
+            params = None
+
+            for job in jobs:
+                job.prepare_logit_mask()
+                job.prepare_sampling_past_ids()
+
+            for j, job in enumerate(jobs):
+                a, b = logit_mapping[j], logit_mapping[j + 1]
+                if a == b:
+                    continue
+                if row_done[j]:
+                    reject_window(job, j, 0)
+                    continue
+                job_logits = batch_logits[a:b, :, :]
+                for i in range(cap):
+                    token_logits = job_logits[:, i:i + 1, :]
+                    next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(token_logits)
+                    eos, sampled_token, rq = job.receive_sample(
+                        token_logits,
+                        next_token,
+                        next_k_tokens,
+                        next_k_probs,
+                        next_prob,
+                        results,
+                    )
+
+                    if len(job.sequences) == 1 and rq:
+                        reject_window(job, j, i)
+                        requeuing_jobs.append(job)
+                        row_done[j] = True
+                        break
+                    if eos:
+                        reject_window(job, j, i)
+                        completed_jobs.append(job)
+                        row_done[j] = True
+                        break
+                    if job.checkpoint_rewound:
+                        # The banned-string rewind already reset pages and state; the rest of
+                        # the sub-round extends a sequence that no longer exists (single-pass
+                        # abandons the window the same way)
+                        job.checkpoint_rewound = False
+                        rewound_jobs.add(id(job))
+                        row_done[j] = True
+                        break
+
+                    col = c + i
+                    if col >= W:
+                        # Bonus row after the round's last real draft column: the sampled token
+                        # leads the NEXT round; roll back the padded rows written after it
+                        reject_window(job, j, i)
+                        row_done[j] = True
+                        break
+
+                    cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
+                    mismatch = draft_tokens[j, col].item() != sampled_token.item()
+                    if mismatch or cp_boundary:
+                        reject_window(job, j, i)
+                        row_done[j] = True
+                        break
+
+                    job.accepted_draft_tokens += 1
+                    accepted_drafts[j] += 1
+                    for f in job.filters:
+                        if not f.is_active: continue
+                        if f.use_background_worker():
+                            job.filter_futures.append(self.filter_pool.submit(f.get_next_logit_mask))
+                            job.logit_masks.append(None)
+                        else:
+                            job.logit_masks.append(f.get_next_logit_mask())
+                            job.filter_futures.append(None)
+                    job.prepare_logit_mask()
+                    job.prepare_sampling_past_ids()
+                    if i == cap - 1:
+                        # Whole sub-round accepted: commit its recurrent advance
+                        if batch_states is not None:
+                            batch_states[j].rewind(0)
+
+            win_ids.append(batch_ids)
+            win_hidden.append(p_export_states)
+            windows_run += 1
+            self.chunk_rows_verified += batch_ids.shape[0] * batch_ids.shape[1]
+            if all(row_done):
+                break
+
+        self.chunk_subrounds += windows_run
+
+        # Round-level accounting, once, over the concatenated sub-round layout
+        total_acc = 0
+        for j, job in enumerate(jobs):
+            a, b = logit_mapping[j], logit_mapping[j + 1]
+            if a == b:
+                continue
+            acc = accepted_drafts[j]
+            total_acc += acc
+            rej = W - acc
+            if rej > 0:
+                job.rejected_draft_tokens += rej
+            accepted_lengths.append(1 + acc)
+            if job._depth_rec is not None:
+                _dt.record(job._depth_rec, W, acc)
+            if self.record_draft_stats:
+                job.draft_stats.append((job.new_tokens, W, acc))
+            pend = getattr(job, "_replay_pending", None)
+            if pend is not None:
+                # Hazard-adaptive width bandit, same transitions as the single-pass path
+                # (accepted drafts of the whole round take the place of one window's count)
+                job._replay_pending = None
+                if acc >= pend:
+                    job.replay_streak = getattr(job, "replay_streak", 0) + 1
+                    job.replay_width = min(self.replay_max_tokens,
+                                           max(pend * 2, self.hybrid_draft_tokens))
+                    self._replay_warm = job.replay_width
+                    job.replay_cap = min(self.replay_max_tokens,
+                                         max(getattr(job, "replay_cap", self.hybrid_draft_tokens) * 4,
+                                             pend * 2))
+                else:
+                    if pend > self.hybrid_draft_tokens:
+                        self.replay_rejects += 1
+                    job.replay_streak = 0
+                    job.replay_width = max(self.hybrid_draft_tokens, pend // 2)
+                    self._replay_warm = job.replay_width
+                    if acc < pend // 4:
+                        job.replay_cap = max(self.hybrid_draft_tokens, pend // 2)
+                    else:
+                        job.replay_cap = max(self.hybrid_draft_tokens, pend)
+        self.chunk_accepted += total_acc
+
+        # Draft-confidence calibration, identical to the single-pass tail (hybrid rounds
+        # null _draft_conf_round upstream, so replay rounds skip it)
+        if self.draft_calibrator is not None and self._draft_conf_round is not None:
+            st = self._draft_conf_round
+            self._draft_conf_round = None
+            cal = self.draft_calibrator
+            row = 0
+            for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+                if a_idx == b_idx: continue
+                accepted_length = accepted_lengths[row]
+                conf = st["conf"][row]
+                ids_full = st["ids"][row]
+                row += 1
+                if id(job) in rewound_jobs:
+                    continue
+                aa = accepted_length - 1
+                for i in range(aa):
+                    cal.add_label(conf[i].item(), True)
+                if aa < conf.shape[-1]:
+                    seq = job.sequences[0]
+                    n = len(seq.sequence_ids)
+                    tail = seq.sequence_ids.torch_slice(n - 1, n).item()
+                    cal.add_label(conf[aa].item(), ids_full[aa].item() == tail)
+            cal.decay_step()
+
+        # Settle a recurrent drafter's speculative pass, same as the single-pass tail
+        if self.draft_recurrent:
+            accepted_idx = 0
+            for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+                if a_idx == b_idx:
+                    continue
+                ad = accepted_lengths[accepted_idx] - 1
+                accepted_idx += 1
+                if id(job) in rewound_jobs or job.recurrent_state is None:
+                    continue
+                ds = job.recurrent_state.draft
+                ds.rewind(max(0, ds.last_history - ad))
+
+        # Draft-cache tails: concatenating the sub-round ids/export states reproduces the
+        # single-pass column layout, so the DFlash/MTP update formulas apply unchanged. The
+        # block table is the last sub-round's (a superset of the pages the accepted prefix
+        # uses); cache_seqlens is the round-start clone (the prefix's positions).
+        if self.draft_model is not None and win_ids:
+            batch_ids_cat = torch.cat(win_ids, dim = 1) if len(win_ids) > 1 else win_ids[0]
+            p_export_states = None
+            if win_hidden[0] is not None and all(h is not None for h in win_hidden):
+                p_export_states = torch.cat(win_hidden, dim = 1) if len(win_hidden) > 1 else win_hidden[0]
+            block_index = last_block_index
+            p_cache_seqlens = round_cache_seqlens
+            if self.dflash_draft:
+                update_params = {
+                    "block_table": block_index,
+                    "cache_seqlens": p_cache_seqlens,
+                }
+                lengths = accepted_lengths
+                if self.draft_recurrent:
+                    drafting = [job for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]) if a != b]
+                    update_params["recurrent_states"] = [job.recurrent_state.draft for job in drafting]
+                    lengths = [0 if id(job) in rewound_jobs or job.recurrent_state is None else n
+                               for job, n in zip(drafting, accepted_lengths)]
+                self.draft_model.update_kv_from_target(
+                    target_hidden = p_export_states,
+                    cache = self.draft_cache,
+                    lengths = lengths,
+                    params = update_params,
+                )
+            if self.mtp_draft and p_export_states is not None:
+                target_hidden = p_export_states[-1]
+                accepted_idx = 0
+                for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+                    if a_idx == b_idx:
+                        continue
+                    accepted_length = accepted_lengths[accepted_idx]
+                    accepted_idx += 1
+                    if id(job) in rewound_jobs:
+                        continue
+                    if accepted_length > 1:
+                        self.draft_model.prefill(
+                            batch_ids_cat[a_idx:b_idx, 1:accepted_length],
+                            {
+                                "attn_mode": "flash_attn",
+                                "block_table": block_index[a_idx:b_idx],
+                                "cache": self.draft_cache,
+                                "cache_seqlens": p_cache_seqlens[a_idx:b_idx] + 1,
+                                "target_hidden": target_hidden[a_idx:b_idx, :accepted_length - 1, :],
+                            },
+                        )
+                    job.mtp_last_hidden = target_hidden[
+                        a_idx:b_idx, accepted_length - 1:accepted_length, :
+                    ].clone()
+
+        # Release pages for completed and requeued jobs, same as the single-pass tail
+        num_jobs = self.num_remaining_jobs()
+        for job in completed_jobs + requeuing_jobs:
+            if job in requeuing_jobs and self.recurrent_cache is not None:
+                job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
+            job.deallocate_pages()
+            self.active_jobs.remove(job)
+        for job in requeuing_jobs:
+            rq_job = job.prepare_for_requeue()
+            self.pending_jobs.insert(0, rq_job)
+        if num_jobs and not self.num_remaining_jobs():
+            self.on_queue_drained()
+
+        # Warm the embedding lookups the next forward will consume
+        nxt = []
+        for job in jobs:
+            if job in completed_jobs or job in requeuing_jobs:
+                continue
+            for seq in job.sequences:
+                nxt.append(seq.sequence_ids.torch()[0, -1].item())
+        if nxt:
+            self.model.prefetch_tokens(nxt)
+
+        # [GS] chunked-verify16 trace witness (law 12): first three rounds, then every 256th
+        self._chunk_witness = getattr(self, "_chunk_witness", 0) + 1
+        if self._chunk_witness <= 3 or self._chunk_witness % 256 == 0:
+            print(f"[CHUNK16] rounds={self.chunk_rounds} sub_rounds={windows_run} W={W} "
+                  f"rows_verified={self.chunk_rows_verified} accepted={total_acc} "
+                  f"rejected={sum(max(0, W - a) for a in accepted_drafts)}", flush = True)
+
+
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
+
+        # [GS] chunked-verify16: rounds wider than the BC-graph coverage iterate as ≤16-token
+        # sub-rounds in one pass (see _iterate_gen_chunked); multimodal embedding inputs keep
+        # the single-pass path (its indexed_embeddings plumbing is not duplicated here).
+        if (
+            draft_tokens is not None and draft_tokens.shape[-1] + 1 > _CHUNK_VERIFY_CAP
+            and not any(job.embeddings for job in self.active_jobs)
+        ):
+            self._iterate_gen_chunked(results, draft_tokens)
+            return
 
         # Get shape of active batch
         # Only jobs that have finished prefill can participate in token generation. The maximum sequence length
