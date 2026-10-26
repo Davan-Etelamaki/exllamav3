@@ -1967,7 +1967,7 @@ class Generator:
                 # the same sampled tokens, the same draft comparison, the same
                 # receive_sample state machine.
                 sd_fast = False
-                sd_pen_K = 0
+                sd_pen_need = False
                 if _SD_FASTSYNC and draft_tokens is not None:
                     sd_fast = (
                         draft_tokens.shape[1] >= _SD_FAST_MINW
@@ -1981,34 +1981,25 @@ class Generator:
                         and not job.sampler.reqs_torch_seed
                     )
                     if sd_fast:
-                        # Past-ID steps are allowed when every one of them is a windowed
-                        # penalty (SS_RepP / SS_PresFreqP): both kernels skip tokens older
-                        # than sustain+decay and measure distance from the row end, so the
-                        # penalty at position i depends only on the LAST K tokens of
-                        # committed ++ draft[:i]. Feeding each position its own sliding
-                        # window of width K reproduces the serial path exactly. Any other
-                        # past-ID consumer (DRY, fused chains) still falls back to serial.
-                        from .sampler.custom import SS_RepP, SS_PresFreqP
+                        # Past-ID steps are allowed at ANY sustain/decay range (marker
+                        # penalty-fast1): build_rows() feeds each position its EXACT
+                        # full row committed ++ draft[:i], byte-identical to the row the
+                        # serial path gives position i when every earlier draft token
+                        # matched, so the penalty kernels see identical past_ids for any
+                        # window. The old probe capped sustain+decay at 4096, so every
+                        # fleet request (presence_penalty with default-range penalties,
+                        # sustain = max_seq_len or int(10e7)) fell to the serial path
+                        # with its per-position D2H syncs. Any other past-ID consumer
+                        # (DRY, fused chains) still falls back to serial.
+                        from . import sd_penalty
                         _pk = id(job.sampler)
                         _pe = self.sd_pen_cache.get(_pk)
                         if _pe is None or _pe[0] is not job.sampler:
-                            _ok, _kk = True, 0
-                            for st in getattr(job.sampler, "steps", ()):
-                                if not st.reqs_past_ids():
-                                    continue
-                                if isinstance(st, (SS_RepP, SS_PresFreqP)):
-                                    _sk = int(st.sustain_range) + int(st.decay_range)
-                                    if _sk > 4096:
-                                        _ok = False
-                                        break
-                                    _kk = max(_kk, _sk)
-                                else:
-                                    _ok = False
-                                    break
-                            self.sd_pen_cache[_pk] = (job.sampler, _ok, _kk)
+                            _ok, _need = sd_penalty.probe(job.sampler)
+                            self.sd_pen_cache[_pk] = (job.sampler, _ok, _need)
                         else:
-                            _ok, _kk = _pe[1], _pe[2]
-                        sd_fast, sd_pen_K = _ok, _kk
+                            _ok, _need = _pe[1], _pe[2]
+                        sd_fast, sd_pen_need = _ok, _need
                     if not sd_fast and self.sd_fast_diag < 3:
                         self.sd_fast_diag += 1
                         print("SDFAST off:",
@@ -2030,39 +2021,23 @@ class Generator:
                         )
                     launched_f = []
                     sd_fast_sid = None
-                    if sd_pen_K > 0:
-                        # Sliding penalty windows: row i = last K tokens of
-                        # committed ++ draft[:i], a true suffix of the serial
-                        # path's past_ids at position i. Both penalty kernels
-                        # ignore anything older than K and count distance from
-                        # the row end, so the fast path sees exactly the serial
-                        # penalty state. Built from device tensors only: no
-                        # sync, all ops enqueue ahead of the sampler launches.
-                        K = sd_pen_K
-                        n_now = job.current_device_ids.shape[1]
-                        # draft row j carries Wp - 1 proposals (position Wp is
-                        # the bonus sample); row Wp - 1 consumes draft[:Wp-1].
-                        if n_now < K + Wp or draft_tokens.shape[1] < Wp - 1:
+                    if sd_pen_need:
+                        # Exact per-position penalty rows (marker penalty-fast1):
+                        # row i = committed ++ draft[:i], contiguous prefix views of
+                        # one device buffer, byte-identical to the serial path's
+                        # past_ids at position i for ANY sustain/decay window. Built
+                        # from device tensors only: no sync, all ops enqueue ahead of
+                        # the sampler launches.
+                        sd_fast_sid, self.sd_pen_buf = sd_penalty.build_rows(
+                            job.current_device_ids, draft_tokens, j, Wp, self.sd_pen_buf
+                        )
+                        if sd_fast_sid is None:
                             sd_fast = False
-                        else:
-                            need = K + 2 * Wp
-                            buf = self.sd_pen_buf
-                            if buf is None or buf.shape[0] < need:
-                                self.sd_pen_buf = buf = torch.empty(
-                                    need, dtype = torch.long, device = batch_logits.device
-                                )
-                            buf[:K + Wp].copy_(
-                                job.current_device_ids[0, n_now - (K + Wp):n_now]
-                            )
-                            buf[K + Wp:K + Wp + Wp - 1].copy_(draft_tokens[j, :Wp - 1])
-                            sd_fast_sid = (
-                                buf[:K + Wp + Wp].unfold(0, K, 1)[Wp:Wp + Wp].contiguous()
-                            )
                     if sd_fast:
                         for i in range(Wp):
                             launched_f.append(job.sampler.forward(
                                 job_logits[:, i:i + 1, :],
-                                sd_fast_sid[i:i + 1] if sd_fast_sid is not None else job.current_device_ids,
+                                sd_fast_sid[i] if sd_fast_sid is not None else job.current_device_ids,
                                 job.rng.randint(0, (1<<32)-1),
                                 self.tokenizer,
                                 logit_mask = None,
@@ -2077,7 +2052,7 @@ class Generator:
                     self.sd_fast_rounds += 1
                     if self.sd_fast_rounds == 1:
                         print(f"SDFAST armed: first fast round, W={Wp}"
-                              + (f", pen window K={sd_pen_K}" if sd_pen_K else ""), flush = True)
+                              + (", exact penalty rows" if sd_pen_need else ""), flush = True)
                     elif self.sd_fast_rounds % 500 == 0:
                         print(f"SDFAST rounds={self.sd_fast_rounds}", flush = True)
 
