@@ -1335,6 +1335,15 @@ class Generator:
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids, non_blocking = _async_conf)
+            # [GS] mtp-chain-fix: asynccfguard deleted the step-chaining trio from this loop
+            # (its comment claimed copy_ chained the steps, but the line was removed), so every
+            # step after 0 was fed the same input ids/hidden/cache position and re-proposed the
+            # same token: warm acceptance fell 29->12 (dot26 bisect, ea915159..tip). Restored
+            # verbatim from ea915159^; all three are on-device ops, no readback, so the async
+            # pipeline win stands.
+            batch_ids.copy_(new_ids)
+            cache_seqlens += 1
+            temp_hidden = batch_state
             draft_conf = params.get("draft_conf")
             if cal is not None and draft_conf is not None:
                 if _async_conf:
