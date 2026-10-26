@@ -11,7 +11,7 @@ from ..constants import PAGE_SIZE
 _REPLAY_DEBUG = os.environ.get("EXL3_REPLAY_DEBUG", "0") == "1"
 _REPLAY_OPT = os.environ.get("EXL3_REPLAY_OPT", "0") == "1"
 _REPLAY_HYST = os.environ.get("EXL3_REPLAY_HYST", "0") == "1"
-_SD_FASTSYNC = os.environ.get("EXL3_SD_FASTSYNC", "0") == "1"
+_SD_FASTSYNC = os.environ.get("EXL3_SD_FASTSYNC", "1") == "1"
 # Optional width gate: when > 0, rounds proposing fewer than this many tokens
 # take the serial path (theory: narrow rounds barely amortize the fast path's
 # one full-device sync). MEASURED 2026-10-13 (ABAB quads, interleaved harness,
