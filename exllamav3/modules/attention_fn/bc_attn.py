@@ -350,7 +350,7 @@ class BCAttn:
             page_size = PAGE_SIZE, head_dim = hd, HD_PAD = hd_pad, scale = float(self.sm_scale),
             CAUSAL = bool(causal), WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
-            BLOCK_ROWS = block_rows, BLOCK_N = block_n,
+            BLOCK_ROWS = block_rows, BLOCK_N = block_n, NVFP4 = False,
         )
         k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
                                   pointer_range_32 = self._pointer_range_32())
