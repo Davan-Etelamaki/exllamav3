@@ -143,15 +143,34 @@ class SlicedMultiLinear:
         # partially populated table is an illegal device WRITE. Pinned-source sync keeps
         # the win over the pageable-sync H2D it replaced (the 5.8% py-spy leaf) and
         # restores the pre-change contract: the table is complete when c_ptrs returns.
-        if getattr(self, "_cptr_pin", None) is None:
-            self._cptr_pin = [torch.empty(self.num_slices, dtype = torch.long, pin_memory = True)
-                              for _ in range(2)]
+        # [GS] cptr-async-ring32: pinned staging is a 32-slot ring; refilling a slot first
+        # waits on the event recorded after that slot's PREVIOUS async copy retired (first
+        # pass through a slot has no event), so a CPU fill can never race an in-flight H2D
+        # of the same buffer. The H2D is non_blocking on the CURRENT stream: table consumers
+        # (exl3_mgemm etc.) launch on at::cuda::getCurrentCUDAStream() later in stream order,
+        # so the table is complete when they read it. This removes the per-call
+        # stream-synchronize pipeline drain that the 2026-10-26 dot26 py-spy record put at
+        # 21.1% of decode-window samples (leaf multilinear.py:154). Fresh GPU tensor per miss
+        # is KEPT: callers hold tables across steps (prealloc_qkv_cptrs_1).
+        ring = getattr(self, "_cptr_ring", None)
+        if ring is None:
+            ring = self._cptr_ring = [torch.empty(self.num_slices, dtype = torch.long, pin_memory = True)
+                                      for _ in range(32)]
+            self._cptr_ev = [None] * 32
+            self._cptr_np = [t.numpy() for t in ring]
             self._cptr_slot = 0
         i = self._cptr_slot
-        self._cptr_slot = (i + 1) % 2
-        self._cptr_pin[i].copy_(torch.tensor(ptrs, dtype = torch.long))
+        self._cptr_slot = (i + 1) % 32
+        ev = self._cptr_ev[i]
+        if ev is not None:
+            ev.synchronize()
+        self._cptr_np[i][:] = ptrs
         out = torch.empty(self.num_slices, dtype = torch.long, device = self.device)
-        out.copy_(self._cptr_pin[i])
+        out.copy_(ring[i], non_blocking = True)
+        if ev is None:
+            ev = torch.cuda.Event()
+            self._cptr_ev[i] = ev
+        ev.record()
         self._cptr_last = (key, out)
         return out
 
