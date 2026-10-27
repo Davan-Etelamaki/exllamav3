@@ -94,7 +94,7 @@ class PLELayerState:
         return self.conv_state, self.id_state
 
     def rewind(self, slot: int, last_history: int, num_tokens: int):
-        assert num_tokens <= last_history
+        assert num_tokens <= last_history + 1  # [GS] gdn-fulldiscard16c: full-window rollback
         if last_history > 0:
             p = self.conv_state.shape[-1] - num_tokens
             temp = self.conv_state[slot, :, p - self.win : p].clone()

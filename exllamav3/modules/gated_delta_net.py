@@ -81,7 +81,7 @@ def _rewind_layers(layers, slot: int, last_history: int, num_tokens: int,
     that pass (batched_scan_replay, one launch per device and kernel geometry). A rewind of the
     whole pass (prefix 0) never happens: the first token of a pass is always kept"""
     prefix = last_history + 1 - num_tokens
-    replay = last_history > 0 and num_tokens > 0
+    replay = last_history > 0 and num_tokens > 0 and prefix >= 1
     if replay:
         assert spec_shape is not None and spec_row is not None, \
             "GDN rewind: history was recorded but the pass staged no scan inputs to replay"
@@ -208,8 +208,14 @@ class GDNState:
         assert num_tokens >= 0, f"GDN rewind: negative num_tokens {num_tokens}"
         last_history = self.last_history
         if last_history > 0:
-            assert num_tokens <= last_history, \
-                f"GDN rewind: {num_tokens} tokens exceeds the recorded history of {last_history}"
+            # [GS] gdn-fulldiscard16c: a chunked sub-round stages cap = last_history + 1 rows
+            # (1 lead + cap-1 columns); a row that finished in an EARLIER sub-round commits
+            # nothing, so its full-window rollback rewinds the ENTIRE last pass. The pass wrote
+            # only the scratch row (base row untouched) and the conv rings, so a full discard
+            # needs the conv rewind but no scan replay and no parity flip.
+            assert num_tokens <= last_history + 1, \
+                f"GDN rewind: {num_tokens} tokens exceeds the recorded history of {last_history} (+1 full-discard)"
+            full_discard = num_tokens == last_history + 1
             args = (self.slot, last_history, num_tokens, self.spec_row, self.spec_shape,
                     self.base_row(), self.scratch_row())
             if not self.cache.model.loaded_tp:
@@ -217,8 +223,10 @@ class GDNState:
             else:
                 self.cache.model.tp_dispatch_all(mp_cache_recurrent_rewind, (id(self.cache),) + args)
             # The scratch row now holds the committed state: the whole pass, or the replayed
-            # accepted prefix. It becomes the base row
-            self.parity = 1 - self.parity
+            # accepted prefix. It becomes the base row. A full discard keeps the untouched
+            # base row as the committed state: no flip.
+            if not full_discard:
+                self.parity = 1 - self.parity
         self.position -= num_tokens
         self.last_history = 0
         self.spec_row = None
@@ -481,8 +489,8 @@ class GDNLayerState:
         per layer in Python."""
         if last_history == 0:
             return None
-        assert 0 <= num_tokens <= last_history, \
-            f"GDN conv rewind: {num_tokens} tokens outside the recorded history of {last_history}"
+        assert 0 <= num_tokens <= last_history + 1, \
+            f"GDN conv rewind: {num_tokens} tokens outside the recorded history of {last_history} (+1 full-discard)"
         cs = self.conv_state
         cdim = self.module.conv_kernel_size
         p = cs.shape[-1] - num_tokens
