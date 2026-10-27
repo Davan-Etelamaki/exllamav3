@@ -85,8 +85,12 @@ class _RoutingGraph:
             valid = (local >= 0) & (local < E)
             local = torch.where(valid, local, torch.full_like(local, E))
         order = local.argsort()
-        ft = buffered_interleaved_arange(self.num_tokens, self.top_k, device = self.sel_in.device)
-        token_sorted  = ft[order]
+        # [GS] dsh-route-wide: capture-safe token index. buffered_interleaved_arange keeps a
+        # CPU master and .to(device)s it — illegal mid-capture unless already resident, so
+        # capture ALWAYS raised and the sticky fallback made this whole graph dead code
+        # (proven on dot26 GPU at A_rt=160, inside the old gate). ft[order] == order // top_k
+        # for the interleaved arange, so derive it from order directly: one device kernel.
+        token_sorted  = order.div(self.top_k, rounding_mode = "floor")
         weight_sorted = self.w_in[order]
         # bincount copies a CPU scalar during graph capture; scatter_add_ is capture-safe
         expert_count  = torch.zeros(E + 1, dtype = torch.int64, device = local.device)
