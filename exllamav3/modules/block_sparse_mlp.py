@@ -57,6 +57,7 @@ FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 # launches per MoE layer per step. Replay = 2 copy-ins + graph replay. Only used on the
 # all-fused fast path (no host expert counts); any capture failure falls back to eager, sticky.
 _ROUTE_GRAPH = os.environ.get("EXL3_ROUTE_GRAPH", "1") != "0"
+_RG_MAX_A = int(os.environ.get("EXL3_ROUTE_GRAPH_MAX_A", 65536))  # [GS] dsh-route-wide: cover A_rt beyond fused_rows
 
 class _RoutingGraph:
     def __init__(self, sel, w, num_tokens, top_k, E, first, device):
@@ -1204,14 +1205,20 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # instead of ~8 tiny eager launches per MoE layer per step (routing glue ~8%
                 # of generator wall in live py-spy). Sticky eager fallback on any failure.
                 graph_route = False
+                planner_route = False
                 A_rt = num_tokens * top_k
                 # cpu_split_first no longer excludes the graph: the prelude is pure-device
                 # routing (same mapping as the eager branch below), and live py-spy (prod,
                 # 2026-10-25) showed the eager argsort+bincount glue at 20% of decode wall
                 # precisely because the CPU-split model failed this gate every layer.
+                # [GS] dsh-route-wide (2026-10-27): the fused_rows cap protected the KERNEL's
+                # per-expert row capacity, not the graph. Above fused_rows the graph still
+                # supplies mapped/sorted/counted routing (planner_route); the eager CPU tier
+                # planner then runs unchanged. Prod shapes (512 experts × top-10) exceeded
+                # 256 rows at 26 tokens, so eager routing cost 23% of decode wall (flame).
                 if (
                     _ROUTE_GRAPH and self.fused_mode_buffers is not None and
-                    A_rt <= self.fused_rows
+                    A_rt <= _RG_MAX_A
                 ):
                     _rgc = self.__dict__.setdefault("_route_graphs", {})
                     _rgk = (A_rt, self.num_local_experts, self.routing_first)
@@ -1231,12 +1238,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         try:
                             flat_expert_local, token_sorted, weight_sorted, expert_count, \
                                 inv_order_rg, tables_rg = rg.run(flat_expert_global, flat_weight)
-                            graph_route = True
+                            if A_rt <= self.fused_rows:
+                                graph_route = True
+                            else:
+                                planner_route = True
                         except Exception:
                             _rgc[_rgk] = False
                             rg = None
 
-                if not graph_route:
+                if not graph_route and not planner_route:
                     # Map to local expert ids whenever this module holds a slice (TP shard or
                     # CPU expert split), not only in the multi-device routing case
                     if self.num_local_experts == self.num_experts:
@@ -1292,9 +1302,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 scratch = tables = inv_order = None
                 if FUSED_DET and (fused_total or groups):
                     A = flat_expert_local.shape[0]
-                    if not graph_route:
+                    if not graph_route and not planner_route:
                         inv_order = torch.empty_like(order).scatter_(
                             0, order, torch.arange(A, device = order.device))
+                    elif planner_route:
+                        # [GS] dsh-route-wide: graph-supplied inverse permutation, exact size
+                        inv_order = inv_order_rg
                     if expert_count_list is None and not graph_route:
                         # Row num_ex of expert_count is the sentinel bucket for picks outside this
                         # module's expert slice (TP shard, CPU split). Its slots are never written,
