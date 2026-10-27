@@ -1738,6 +1738,10 @@ class Generator:
         if not jobs:
             return
         batch_states = [job.recurrent_state.target for job in jobs] if self.target_recurrent else None
+        # [GS] drafthoist1: draft_tokens is static for the whole round, so stage the verify
+        # window to host once per round. The per-column draft_tokens[j, col].item() was a
+        # device sync for every accepted token (decode-path torch-sync flame attribution).
+        draft_cpu = draft_tokens[:len(jobs)].tolist()
         accepted_drafts = [0] * len(jobs)
         row_done = [False] * len(jobs)
         completed_jobs = []
@@ -1900,7 +1904,10 @@ class Generator:
                         break
 
                     cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
-                    mismatch = draft_tokens[j, col].item() != sampled_token.item()
+                    # [GS] drafthoist1: host-staged compare (was draft_tokens[j, col].item(),
+                    # a device sync per accepted token); sampled_token is fresh per column
+                    # and still reads back with its own .item()
+                    mismatch = draft_cpu[j][col] != sampled_token.item()
                     if mismatch or cp_boundary:
                         reject_window(job, j, i)
                         row_done[j] = True
