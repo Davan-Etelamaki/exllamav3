@@ -1296,14 +1296,11 @@ class Generator:
         # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
         # pageable copies; the draft's own buffers, since the target's are still in flight
         max_pages_batch = (max_pages_batch + 15) // 16 * 16
-        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
-        block_index.zero_()
+        block_index = self._draft_block_table(ready, batch_size, max_pages_batch)
         cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
         for job in ready:
             for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
                 cache_seqlens[batch] = seq.kv_position
                 batch += 1
 
@@ -1681,6 +1678,36 @@ class Generator:
             buf = torch.zeros(shape, dtype = dtype, pin_memory = True)
             self.staging_buffers[key] = buf
         return buf[:rows]
+
+
+    def _draft_block_table(self, ready, batch_size: int, max_pages_batch: int):
+        """
+        [GS] bi-cache: assemble the MTP draft batch block-index table, reusing the previous
+        assembly when nothing it depends on changed. A sequence's page-table row only changes
+        when the sequence crosses a PAGE_SIZE boundary (the allocator writes the new page id
+        into block_index_tensor at the crossing index) or its backing tensor is reallocated,
+        so the assembled table only changes with membership, row storage, table width or a
+        crossing. The old code zero_()'d and re-copied the whole (batch × ctx/256) table on
+        every draft call (prod py-spy audit; ROUTE_WIDE_PATCH.md round 30). The staging buffer
+        is persistent per (name, width) and only this MTP path writes it — mtp_draft is fixed
+        at init, so iterate_draftmodel_gen never shares the key on this instance — hence the
+        buffer content equals the last assembly and signature equality is exactly validity.
+        """
+        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
+        sig = (batch_size, max_pages_batch,
+               tuple((id(seq), seq.block_index_tensor.data_ptr(),
+                      seq.block_index_tensor.shape[-1], seq.kv_position // PAGE_SIZE)
+                     for job in ready for seq in job.sequences))
+        if sig != getattr(self, "_bi_sig", None):
+            block_index.zero_()
+            batch = 0
+            for job in ready:
+                for seq in job.sequences:
+                    seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
+                    block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
+                    batch += 1
+            self._bi_sig = sig
+        return block_index
 
 
     def _iterate_gen_chunked(self, results: list, draft_tokens: torch.Tensor):
