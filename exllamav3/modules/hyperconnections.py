@@ -603,22 +603,33 @@ class GatedResidual(Module):
                 mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
             ext.gr_mix(s3, xw, self.proj_h[: self.proj_m], self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
         elif self.tiled:
-            # Prefill-shaped workspaces are per-call (pow2-rounded so the caching allocator
-            # reuses segments across chunk sizes), never statics
-            def ws(shape, dtype):
+            # Decode-class calls (cached) take the same per-device bucketed statics as the
+            # fused path: the tiled kernels fully write every scratch cell they read
+            # (gr_dots_i8 stores cover (s, row < R); each producer kernel precedes its
+            # consumer), so a reused backing is safe and ~7 per-call allocations x 62
+            # layers of allocator churn disappear from the decode hot path. Sites share
+            # one set per device+tag because a site's outputs are consumed before the
+            # next site mixes on the same stream, exactly as for the fused statics.
+            # Capture/quant_preserve (cached=False) keep per-call pow2 empties: CUDA
+            # graph pools must own their buffers at any size.
+            def ws(shape, dtype, tag):
                 numel = math.prod(shape)
+                if cached:
+                    return g_tensor_cache.get_bucketed(dev, numel, dtype, tag).view(shape)
                 buf = torch.empty((1 << (numel - 1).bit_length(),), dtype = dtype, device = dev)
                 return buf[: numel].view(shape)
             Mpad = self.proj_h.shape[0]
             proj_i8, proj_sb, up_i8, up_sb = self._tiled_tables()
             S = ext.gr_mix_tiled_slices(R, Dh, Mpad)
             Rpad = -(-R // 64) * 64
-            post = ws((R, H), torch.float) if self.use_combine else None
-            mixed = ws((R, Dh), torch.half)
+            post = ws((R, H), torch.float, "gr_tiled_post") if self.use_combine else None
+            mixed = ws((R, Dh), torch.half, "gr_tiled_mixed")
             ext.gr_mix_tiled(
                 s3, self.w_h, proj_i8, proj_sb, up_i8, up_sb, self.rms_eps, self.proj_m,
-                ws((S, Rpad, Mpad), torch.float), ws((S, Rpad), torch.float), ws((R, H), torch.float),
-                ws((2, R, self.rank), torch.int8), ws((R, self.rank // 64), torch.float), post, mixed
+                ws((S, Rpad, Mpad), torch.float, "gr_tiled_dm"), ws((S, Rpad), torch.float, "gr_tiled_ss"),
+                ws((R, H), torch.float, "gr_tiled_rmr"),
+                ws((2, R, self.rank), torch.int8, "gr_tiled_ti8"), ws((R, self.rank // 64), torch.float, "gr_tiled_ts"),
+                post, mixed
             )
         else:
             self._require_source_weights("the cuBLAS path")
