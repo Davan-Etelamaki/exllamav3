@@ -301,14 +301,17 @@ class RowTable:
                     assert base <= lo.item() and hi.item() < base + store.num_rows, \
                         f"Row index out of range for {self.key}"
                     if self.hinted and i1 - i0 <= INLINE_MAX_ROWS:
-                        # Rows announced ahead are in the page cache by now: one read each on
-                        # this thread, which the gather's worker pool only slows down
-                        for i in range(i0, i1):
-                            ext.ngram_gather_cpu(store._ensure_open(), store.abs_offset,
-                                                 store.row_bytes, uids[i : i + 1], base, out[i : i + 1])
+                        # rowgather-seq1: rows announced ahead are in the page cache by now;
+                        # one sequential call reads them inline on this thread (measured:
+                        # per-row loop 49.3 us vs pooled batch 60.0 us at warm U=16; one
+                        # crossing + inline preads beats both)
+                        ext.ngram_gather_cpu(store._ensure_open(), store.abs_offset,
+                                             store.row_bytes, seg.contiguous(), base,
+                                             out[i0 : i1], True)
                     else:
                         ext.ngram_gather_cpu(store._ensure_open(), store.abs_offset,
-                                             store.row_bytes, seg.contiguous(), base, out[i0 : i1])
+                                             store.row_bytes, seg.contiguous(), base,
+                                             out[i0 : i1], False)
                 else:
                     torch.index_select(store, 0, seg - base if base else seg, out = out[i0 : i1])
             i0 = i1

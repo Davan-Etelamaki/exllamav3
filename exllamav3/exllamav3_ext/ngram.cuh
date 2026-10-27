@@ -23,7 +23,8 @@ void ngram_gather_cpu
     int64_t row_bytes,
     const at::Tensor& uids,
     int64_t uid_base,
-    at::Tensor out
+    at::Tensor out,
+    bool sequential   // rowgather-seq1: read runs inline on the calling thread, no pool
 );
 
 void ngram_dequant

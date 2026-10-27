@@ -291,7 +291,8 @@ void ngram_gather_cpu
     int64_t row_bytes,
     const at::Tensor& uids,          // (U) int64 CPU, sorted ascending
     int64_t uid_base,                // subtracted from uids (shard-local row index)
-    at::Tensor out                   // (U, row_bytes / itemsize) CPU, contiguous
+    at::Tensor out,                  // (U, row_bytes / itemsize) CPU, contiguous
+    bool sequential                  // rowgather-seq1: one read in flight on this thread
 )
 {
     TORCH_CHECK(uids.device().is_cpu() && uids.dtype() == at::kLong && uids.is_contiguous(),
@@ -320,7 +321,13 @@ void ngram_gather_cpu
     }
     size_t n_runs = runs.size();
 
-    if (n_runs <= WG_MAX_DEPTH)
+    if (sequential)
+    {
+        // rowgather-seq1: hinted warm gather -- one read in flight on this thread,
+        // no pool round trip and no deep overlap bookkeeping
+        read_span_async(&ctx, 0, U, 1);
+    }
+    else if (n_runs <= WG_MAX_DEPTH)
     {
         // decode-sized gather: all runs in flight from this thread, no pool round trip
         read_span_async(&ctx, 0, U, (int) n_runs);

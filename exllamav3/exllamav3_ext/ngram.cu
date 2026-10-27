@@ -264,7 +264,8 @@ void ngram_gather_cpu
     int64_t row_bytes,
     const at::Tensor& uids,          // (U) int64 CPU, sorted ascending
     int64_t uid_base,                // subtracted from uids (shard-local row index)
-    at::Tensor out                   // (U, row_bytes / itemsize) CPU, contiguous
+    at::Tensor out,                  // (U, row_bytes / itemsize) CPU, contiguous
+    bool sequential                  // rowgather-seq1: inline pread per run, no pool
 )
 {
     TORCH_CHECK(uids.device().is_cpu() && uids.dtype() == at::kLong && uids.is_contiguous(),
@@ -292,6 +293,16 @@ void ngram_gather_cpu
         i = j;
     }
     size_t n_runs = runs.size();
+
+    if (sequential)
+    {
+        // rowgather-seq1: hinted rows are page-cache-warm; inline pread per run on this
+        // thread, no pool wake/join (measured warm U=16: pool join ~11 us median + p90 tail)
+        for (auto& r : runs)
+            GatherPool::read_span(&ctx, r.first, r.second);
+        TORCH_CHECK(!ctx.failed.load(), "ngram_gather_cpu: short read");
+        return;
+    }
 
     if (n_runs == 1)
     {
