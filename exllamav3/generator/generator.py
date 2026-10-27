@@ -385,6 +385,7 @@ class Generator:
         self.sd_fast_diag = 0
         self.sd_pen_cache = {}
         self.sd_pen_buf = None
+        self.sd_pen_tail = None  # penalty-tail1: (job, resident committed length)
         self.staging_buffers = {}
 
         # Buffers. Pinned: the draft input ids upload non-blocking from here every round (and
@@ -2472,8 +2473,13 @@ class Generator:
                         # from device tensors only: no sync, all ops enqueue ahead of
                         # the sampler launches.
                         sd_fast_sid, self.sd_pen_buf = sd_penalty.build_rows(
-                            job.current_device_ids, draft_tokens, j, Wp, self.sd_pen_buf
+                            job.current_device_ids, draft_tokens, j, Wp, self.sd_pen_buf,
+                            n_prev = (self.sd_pen_tail[1]
+                                      if self.sd_pen_tail is not None and self.sd_pen_tail[0] is job
+                                      else 0)  # penalty-tail1: same job => append-only prefix
                         )
+                        if sd_fast_sid is not None:
+                            self.sd_pen_tail = (job, job.current_device_ids.shape[1])
                         if sd_fast_sid is None:
                             sd_fast = False
                     if sd_fast:

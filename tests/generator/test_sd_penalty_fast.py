@@ -284,6 +284,64 @@ def test_generator_integration_markers():
     assert "sd_pen_K" not in src, "stale sliding-window variable still referenced"
 
 
+# ---------- penalty-tail1: append-only tail copy ----------
+
+def _ct(ids):
+    return torch.tensor([ids], dtype=torch.long)
+
+
+def test_tail_byte_equal_to_full():
+    committed = [1, 2, 3, 4, 5]
+    draft = torch.tensor([[7, 8, 9, 10]], dtype=torch.long)
+    _, buf = sd_penalty.build_rows(_ct(committed), draft, 0, 4, None)
+    c2 = _ct(committed + [6])
+    ref, _ = sd_penalty.build_rows(c2, draft, 0, 4, buf.clone())
+    tail, _ = sd_penalty.build_rows(c2, draft, 0, 4, buf, n_prev=len(committed))
+    assert tail is not None and ref is not None
+    for a, b in zip(tail, ref):
+        assert torch.equal(a, b), "tail path diverged from full copy"
+
+
+def test_tail_poison_proves_prefix_copy_skipped():
+    committed = [1, 2, 3, 4]
+    draft = torch.tensor([[5, 6, 7]], dtype=torch.long)
+    _, buf = sd_penalty.build_rows(_ct(committed), draft, 0, 3, None)
+    buf[:4] = -999
+    assert not torch.equal(buf[:4], _ct(committed)[0]), "poison did not land"
+    rows, buf2 = sd_penalty.build_rows(_ct(committed + [8]), draft, 0, 3, buf, n_prev=4)
+    assert buf2 is buf
+    assert torch.equal(buf2[:4], torch.tensor([-999] * 4)), "tail path re-copied the prefix"
+    assert torch.equal(buf2[4], torch.tensor(8)), "tail token missing"
+
+
+def test_growth_forces_full_copy():
+    committed = list(range(1, 101))
+    draft = torch.tensor([[500, 501, 502]], dtype=torch.long)
+    _, buf = sd_penalty.build_rows(_ct(committed), draft, 0, 3, None)
+    big = list(range(10000, 10000 + 9000))
+    buf[:100] = -7
+    rows, buf2 = sd_penalty.build_rows(_ct(big), draft, 0, 3, buf, n_prev=100)
+    assert buf2 is not buf, "buffer should have grown"
+    assert torch.equal(rows[-1][0, :100], _ct(big[:100])[0]), "grown buffer kept stale prefix"
+
+
+def test_stale_n_prev_forces_full_copy():
+    committed = [1, 2, 3]
+    draft = torch.tensor([[4, 5]], dtype=torch.long)
+    _, buf = sd_penalty.build_rows(_ct(committed), draft, 0, 3, None)
+    buf[:3] = -5
+    rows, _ = sd_penalty.build_rows(_ct(committed), draft, 0, 3, buf, n_prev=10)
+    assert torch.equal(rows[-1][0, :3], _ct(committed)[0]), "n_prev>n_now must force full copy"
+
+
+def test_generator_integration_tail_marker():
+    import inspect
+    from exllamav3.generator import generator as gen_mod
+    src = inspect.getsource(gen_mod)
+    assert "penalty-tail1" in src, "tail marker missing from generator.py"
+    assert "self.sd_pen_tail" in src and "n_prev =" in src, "tail wiring missing"
+
+
 if __name__ == "__main__":
     tests = sorted((k, v) for k, v in globals().items()
                    if k.startswith("test_") and callable(v))

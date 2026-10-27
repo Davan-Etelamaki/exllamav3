@@ -60,7 +60,7 @@ def probe(sampler):
     return True, needs_rows
 
 
-def build_rows(current_device_ids, draft_tokens, j, Wp, buf):
+def build_rows(current_device_ids, draft_tokens, j, Wp, buf, n_prev = 0):
     """
     Build the Wp per-position past-ID rows for one SD fast-path round.
 
@@ -72,15 +72,27 @@ def build_rows(current_device_ids, draft_tokens, j, Wp, buf):
     row is shorter than the logit window needs; buf is the (possibly grown) scratch
     buffer the caller must store back. All copies are async device-to-device; no
     synchronization happens here.
+
+    n_prev (penalty-tail1): the committed prefix length already resident in buf FROM
+    THE SAME JOB's previous round. job.current_device_ids is re-uploaded each round
+    from the per-job append-only pinned mirror (job.py:1762), so for one job the
+    committed history never changes — only extends. When 0 <= n_prev <= n_now and buf
+    was not reallocated this call, only the tail buf[n_prev:n_now] is copied; any
+    other value (0, foreign owner, shrunk prompt, grown buffer) forces the full
+    prefix copy and is byte-identical to the pre-tail behavior.
     """
     n_now = current_device_ids.shape[1]
     if draft_tokens.shape[1] < Wp - 1:
         return None, buf
     need = n_now + Wp - 1
+    grown = False
     if buf is None or buf.shape[0] < need:
         buf = torch.empty(max(2 * need, 8192), dtype = torch.long,
                           device = current_device_ids.device)
-    buf[:n_now].copy_(current_device_ids[0, :n_now])
+        grown = True
+    src = n_prev if (not grown and 0 <= n_prev <= n_now) else 0
+    if src < n_now:
+        buf[src:n_now].copy_(current_device_ids[0, src:n_now])
     buf[n_now:need].copy_(draft_tokens[j, :Wp - 1])
     rows = [buf[:n_now + i].view(1, -1) for i in range(Wp)]
     return rows, buf
