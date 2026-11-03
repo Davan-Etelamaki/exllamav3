@@ -49,6 +49,10 @@
     const int K_up,                             \
     const int K_down,                           \
                                                 \
+    const int* __restrict__ Ks_gate,            \
+    const int* __restrict__ Ks_up,              \
+    const int* __restrict__ Ks_down,            \
+                                                \
     int* __restrict__ locks,                    \
                                                 \
     float* __restrict__ output_scratch,         \

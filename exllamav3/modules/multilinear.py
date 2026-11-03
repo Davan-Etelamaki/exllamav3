@@ -23,9 +23,28 @@ class MultiLinear:
         self.in_features = linears[0].in_features
         self.out_features = linears[0].out_features
         self.K = linears[0].inner.K
-        assert all(l.inner.K == self.K for l in linears)
         assert all(l.in_features == self.in_features for l in linears)
         assert all(l.out_features == self.out_features for l in linears)
+
+        # Mixed-bitrate expert bundles (SAGE-style packs grade each expert separately). A uniform
+        # bundle keeps Ks = None and the compile-time-K kernel instance; a mixed one carries the
+        # per-expert rates in half-bit units (2 * bits + half, see bits_k.cuh) so the runtime-K
+        # instance can resolve each expert's width inside the kernel
+        rates = [l.inner.K for l in linears]
+        self.mixed_K = len(set(rates)) > 1
+        if self.mixed_K:
+            k2 = [
+                2 * int(r) + (1 if float(r) - int(r) == 0.5 else 0)
+                for r in rates
+            ]
+            assert all(1 <= r * 2 <= 16 and (float(r) - int(r)) in (0.0, 0.5) for r in rates), \
+                f"MultiLinear: unsupported expert bitrates {sorted(set(rates))}"
+            if any((r * 2) % 2 for r in rates):
+                assert linears[0].inner.mul1, \
+                    "MultiLinear: half-integer expert bitrates require the mul1 codebook"
+            self.Ks = torch.tensor(k2, dtype = torch.int32, device = device)
+        else:
+            self.Ks = None
 
         self.ptrs_suh = torch.tensor([l.inner.suh.data_ptr() for l in linears], dtype = torch.long, device = device)
         self.ptrs_svh = torch.tensor([l.inner.svh.data_ptr() for l in linears], dtype = torch.long, device = device)

@@ -275,6 +275,9 @@ void exl3_moe
     const float K_gate,
     const float K_up,
     const float K_down,
+    const c10::optional<at::Tensor>& Ks_gate,
+    const c10::optional<at::Tensor>& Ks_up,
+    const c10::optional<at::Tensor>& Ks_down,
 
     const at::Tensor& gate_ptrs_trellis,
     const at::Tensor& gate_ptrs_suh,
@@ -374,6 +377,24 @@ void exl3_moe
     {
         K = K2_gate / 2;
         half_k = (K2_gate % 2) != 0;
+    }
+
+    // Per-expert bitrates: an int32 table of half-bit units per expert (null = uniform). The
+    // scalar K_* args then only describe the bundle's codebook, and the launch must use the
+    // K = 0 runtime-switch instance so each expert's own rate is resolved inside the kernel
+    const bool any_ks = Ks_gate.has_value() || Ks_up.has_value() || Ks_down.has_value();
+    if (any_ks)
+    {
+        for (const c10::optional<at::Tensor>& ks: { Ks_gate, Ks_up, Ks_down })
+        {
+            if (!ks.has_value()) continue;
+            TORCH_CHECK(ks->scalar_type() == at::kInt && ks->is_cuda() && ks->is_contiguous(),
+                        "exl3_moe: per-expert bitrate tables must be contiguous CUDA int32");
+            TORCH_CHECK(ks->size(0) == num_experts,
+                        "exl3_moe: per-expert bitrate table length != num_experts");
+        }
+        K = 0;
+        half_k = false;
     }
 #if defined(USE_ROCM)
     // The pipelined mainloop (rocm/quant/exl3_moe_inner_rdna.cuh) has integer-K instances and instances for
@@ -523,6 +544,10 @@ void exl3_moe
     void* _down_ptrs_suh = down_ptrs_suh.data_ptr();
     void* _down_ptrs_svh = down_ptrs_svh.data_ptr();
 
+    const int* Ks_gate_ptr = Ks_gate.has_value() ? Ks_gate->data_ptr<int>() : nullptr;
+    const int* Ks_up_ptr   = Ks_up.has_value()   ? Ks_up->data_ptr<int>()   : nullptr;
+    const int* Ks_down_ptr = Ks_down.has_value() ? Ks_down->data_ptr<int>() : nullptr;
+
     void* _expert_count = expert_count.data_ptr();
     void* _token_sorted = token_sorted.data_ptr();
     void* _weight_sorted = weight_sorted.data_ptr();
@@ -558,6 +583,9 @@ void exl3_moe
         (void*) &K2_gate,
         (void*) &K2_up,
         (void*) &K2_down,
+        (void*) &Ks_gate_ptr,
+        (void*) &Ks_up_ptr,
+        (void*) &Ks_down_ptr,
         (void*) &locks,
         &_output_scratch,
         &_fused_base,

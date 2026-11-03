@@ -614,6 +614,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.multi_up = MultiLinear(self.device, self.ups, allow_bias = True)
             self.multi_down = MultiLinear(self.device, self.downs, allow_bias = True)
 
+            # SAGE-style packs grade each expert at its own bitrate. exl3_moe carries those rates
+            # per expert (see MultiLinear.Ks), but the bound-class graph and the fused decode kernels
+            # bake a single rate into their statics, so those paths stay reserved for uniform bundles
+            self.mixed_expert_K = any(
+                m is not None and m.mixed_K
+                for m in (self.multi_gate, self.multi_up, self.multi_down)
+            )
+            if self.mixed_expert_K:
+                self.support_bc_bszn = False
+                self.support_fused = False
+
             # Enable fully fused kernel if possible (uniform mcg or mul1 codebook across gate/up/down,
             # and an activation the fused kernel implements)
             cbs = (
@@ -689,7 +700,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.experts_cfg = cfg
 
         if (self.support_quant_paths or self.support_bc_bszn) \
-                and not self.config.infer_params.no_reconstruct:
+                and not self.config.infer_params.no_reconstruct \
+                and not getattr(self, "mixed_expert_K", False):
 
             # Embed bound classes for shared experts and shared gate
             sh_exp_bc = None
@@ -1436,6 +1448,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         multi_gate.K,
                         self.multi_up.K,
                         self.multi_down.K,
+                        multi_gate.Ks,
+                        self.multi_up.Ks,
+                        self.multi_down.Ks,
                         multi_gate.ptrs_trellis,
                         multi_gate.ptrs_suh,
                         multi_gate.ptrs_svh,

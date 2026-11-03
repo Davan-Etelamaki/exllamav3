@@ -23,6 +23,11 @@ void exl3_moe
     const float K_gate,
     const float K_up,
     const float K_down,
+    // Per-expert bitrate tables (int32 half-bit units, 2 * bits + half) for packs that grade
+    // each expert separately (SAGE); null when the bundle is uniform
+    const c10::optional<at::Tensor>& Ks_gate,
+    const c10::optional<at::Tensor>& Ks_up,
+    const c10::optional<at::Tensor>& Ks_down,
 
     const at::Tensor& gate_ptrs_trellis,
     const at::Tensor& gate_ptrs_suh,

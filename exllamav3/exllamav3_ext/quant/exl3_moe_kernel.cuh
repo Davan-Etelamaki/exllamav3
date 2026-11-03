@@ -207,6 +207,14 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         const half* exp_down_suh = down_suh[expert_idx];
         const half* exp_down_svh = down_svh[expert_idx];
 
+        // Per-expert bitrates (SAGE-style packs grade each expert independently): the tables hold
+        // half-bit units (2 * bits + half) and are null for uniform bundles, which keep the
+        // compile-time-K instance. Rates only vary per expert when the host launched the K = 0
+        // runtime-switch instance, so moe_gemm_tile resolves each expert's rate here
+        const int kg_exp = Ks_gate ? Ks_gate[expert_idx] : K_gate;
+        const int ku_exp = Ks_up   ? Ks_up[expert_idx]   : K_up;
+        const int kd_exp = Ks_down ? Ks_down[expert_idx] : K_down;
+
         // Gather + input hadamard for g, u. Non-gated mode skips the g staging (and the g GEMM
         // below); the activation synthesizes the gate lane from u
         const bool gated = act_function != MOE_ACT_RELU2_NOGATE;
@@ -312,7 +320,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             const half* in_addr     = p == 0 ? temp_state_g : (p == 1 ? temp_state_u : temp_intermediate_g);
             half* out_addr          = p == 0 ? temp_intermediate_g : (p == 1 ? temp_intermediate_u : temp_state_g);
             const uint16_t* trellis = p == 0 ? exp_gate_trellis : (p == 1 ? exp_up_trellis : exp_down_trellis);
-            const int K             = p == 0 ? K_gate : (p == 1 ? K_up : K_down);
+            const int K             = p == 0 ? kg_exp : (p == 1 ? ku_exp : kd_exp);
             const int size_k        = p == 2 ? intermediate_dim : hidden_dim;
             const int size_n        = p == 2 ? hidden_dim : intermediate_dim;
             if constexpr (PIPE)
@@ -331,11 +339,11 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         };
 
         if (gated)
-            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
-        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
+            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, kg_exp);
+        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, ku_exp);
         group_barrier(group_idx, group_size, barrier_counters_sense);
         had_guad();
-        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
+        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, kd_exp);
 #endif
         group_barrier(group_idx, group_size, barrier_counters_sense);
 
