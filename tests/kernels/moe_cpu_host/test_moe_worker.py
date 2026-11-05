@@ -37,7 +37,8 @@ from testlib.isolated import device_env, run_isolated
 from testlib.moe_handoff import (ABORT, CONSUMED, DATA_READY, DONE, KIND_COMPUTE, KIND_COMPUTE_GATED, PASS_WAKE,
                                  PINNED_FREE, QUIT, READY, STAGE_DONE, Segment)
 
-pytestmark = pytest.mark.cpu_flags("avx2")
+# [GS] dsh: the old avx2 gate over-skipped the whole loop on ARM64; these tests register layers
+# with swizzled = 0 (native layout), which the scalar tier runs identically
 
 H, TOPK, CAP_ROWS, NUM_SLOTS = 512, 3, 8, 3
 LAYERS = [dict(E = 6, I = 256, K = 4, gated = True), dict(E = 4, I = 384, K = 3, gated = False)]

@@ -125,6 +125,8 @@ void run_cpu_reduce_jobs
             {
                 #if defined(__aarch64__) || defined(__arm__)  // EXL3_AARCH64_PAUSE
                     asm volatile("yield" ::: "memory");
+                #elif defined(_M_ARM64) || defined(_M_ARM64EC)  // EXL3_AARCH64_PAUSE
+                    __yield();
                 #elif defined(__linux__)
                     __builtin_ia32_pause();
                 #else

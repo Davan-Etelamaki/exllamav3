@@ -1,4 +1,13 @@
-#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+// EXL3_X86_ISA gates every AVX2/AVX-512 island in this TU. The kernels themselves are x86-only,
+// but the surrounding machinery (job ring, layer registry, worker pool, scalar GEMV tier) is
+// architecture-neutral, so Windows/ARM64 compiles the whole file and runs at Isa::Scalar.
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    #define EXL3_X86_ISA 1
+#else
+    #define EXL3_X86_ISA 0
+#endif
+
+#if EXL3_X86_ISA || defined(_M_ARM64) || defined(_M_ARM64EC)
 #include "moe_mul1.h"
 #include <c10/util/Half.h>
 #include <torch/extension.h>
@@ -10,7 +19,9 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#if EXL3_X86_ISA
 #include <immintrin.h>
+#endif
 #include <chrono>
 #include <limits>
 #include <cstdio>
@@ -108,8 +119,10 @@ inline void cpu_pause()
 {
 #ifdef __linux__
     __builtin_ia32_pause();
-#else
+#elif EXL3_X86_ISA
     _mm_pause();
+#else  // EXL3_AARCH64_PAUSE
+    __yield();
 #endif
 }
 
@@ -255,6 +268,7 @@ void hadamard_128_scalar(float* v)
             }
 }
 
+#if EXL3_X86_ISA
 M1_TARGET_AVX2
 void hadamard_128_avx2(float* v)
 {
@@ -303,11 +317,16 @@ void hadamard_128_avx2(float* v)
     #pragma unroll
     for (int i = 0; i < 16; ++i) _mm256_storeu_ps(v + i * 8, r[i]);
 }
+#endif  // EXL3_X86_ISA (hadamard_128_avx2)
 
 inline void hadamard_128(float* v)
 {
+#if EXL3_X86_ISA
     if (g_isa != Isa::Scalar) hadamard_128_avx2(v);
     else                      hadamard_128_scalar(v);
+#else
+    hadamard_128_scalar(v);
+#endif
 }
 
 // -------------------------------------------------------------------------------------------
@@ -343,6 +362,7 @@ const bool g_wide_rows = []{
     return !(e && e[0] == '0');
 }();
 
+#if EXL3_X86_ISA
 M1_TARGET_AVX2
 float row_absmax_avx2(const float* dst, int k)
 {
@@ -473,6 +493,28 @@ void prepare_block_avx2(const void* srcv, bool f16, const at::Half* suh, float* 
                              _mm256_mul_ps(_mm256_loadu_ps(dst + block + i), hs));
     }
 }
+#endif  // EXL3_X86_ISA (row_absmax_avx2 .. prepare_block_avx2)
+
+#if !EXL3_X86_ISA
+// Windows/ARM64 twin of prepare_block_avx2: scale, 128-point Hadamard, renormalize. Same
+// arithmetic and order as prepare_rows' scalar branch, so decoded and batched paths agree
+void prepare_block_scalar(const void* srcv, bool f16, const at::Half* suh, float* dst, int k)
+{
+    const at::Half* src16 = static_cast<const at::Half*>(srcv);
+    const float* src32 = static_cast<const float*>(srcv);
+    for (int block = 0; block < k; block += 128)
+    {
+        float vals[128];
+        for (int i = 0; i < 128; ++i)
+        {
+            const float xv = f16 ? half_to_float(src16[block + i]) : src32[block + i];
+            vals[i] = xv * half_to_float(suh[block + i]);
+        }
+        hadamard_128(vals);
+        for (int i = 0; i < 128; ++i) dst[block + i] = vals[i] * HAD_SCALE;
+    }
+}
+#endif  // !EXL3_X86_ISA (prepare_block_scalar)
 
 // int8 quantization of token row r (transformed, in dst) into GEMV row `slot`, one scale per
 // GEMV row; two rows for a token that goes wide. Returns the next free slot
@@ -488,6 +530,7 @@ int quantize_row(const float* dst, int k, PreparedIn& p, int r, int slot)
     p.wide[r] = 0;
     float q;
     int32_t s;
+    #if EXL3_X86_ISA
     if (g_isa != Isa::Scalar)
     {
         const float amax = row_absmax_avx2(dst, k);
@@ -500,6 +543,7 @@ int quantize_row(const float* dst, int k, PreparedIn& p, int r, int slot)
         }
     }
     else
+#endif
     {
         float amax = 0.0f;
         for (int i = 0; i < k; ++i) amax = std::max(amax, std::fabs(dst[i]));
@@ -534,6 +578,7 @@ void prepare_rows
     {
         float* dst = p.tin + static_cast<size_t>(slot) * k;
         const size_t src_off = static_cast<size_t>(token_idx[r]) * src_stride;
+        #if EXL3_X86_ISA
         if (g_isa != Isa::Scalar)
         {
             prepare_block_avx2(src_f16 ? reinterpret_cast<const void*>(src_f16 + src_off)
@@ -541,6 +586,7 @@ void prepare_rows
                                src_f16 != nullptr, mat.suh, dst, k);
         }
         else
+    #endif
         {
             for (int block = 0; block < k; block += 128)
             {
@@ -561,6 +607,14 @@ void prepare_rows
     }
     p.rows = slot;
 }
+
+// -------------------------------------------------------------------------------------------
+//   x86 vector kernels (AVX-512 VNNI / BW / VBMI and the AVX2 tiers)
+//
+//   Whole-region guard: these kernels are the AVX2/AVX-512 implementations only. On
+//   Windows/ARM64 the GEMV goes through scalar_tiles below, so none of this is built.
+// -------------------------------------------------------------------------------------------
+#if EXL3_X86_ISA
 
 // -------------------------------------------------------------------------------------------
 //   AVX-512 VNNI banded kernel
@@ -1448,6 +1502,7 @@ inline void vbmi_band_rows
     }
 }
 
+#endif  // !KSlice: architecture-neutral, needed by the split-K decode path below
 // Split-K slice of one 8-tile group (decode_phase): the band kernels run tile rows [kt0, kt1)
 // only and store their raw int32 accumulators at raw + row * 128 + (tile - n_base) * 16 instead
 // of the scaled output, for the worker completing the group to sum and finish (finish_partials)
@@ -1457,6 +1512,8 @@ struct KSlice
     int n_base;
     int32_t* raw;
 };
+
+#if EXL3_X86_ISA
 
 template <int bits, bool hb, int rows, int band>
 M1_TARGET_VBMI
@@ -1670,6 +1727,7 @@ void vbmi_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
     }
 }
 
+#endif  // end x86 guard: finish_partials is called by the split-K decode path on every tier
 // Sum a group's split-K partials (parts slices of 2 x 128 int32, see KSlice) and apply the
 // band kernels' epilogue: the integer sum is exact, so the result matches an unsplit run
 M1_TARGET_VBMI
@@ -1678,6 +1736,7 @@ void finish_partials(const int32_t* raw, int parts, const PreparedIn& in, float*
     for (int i = 0; i < in.rows; ++i)
     {
         const float scale = mul1_k_inv() * in.q[i];
+#if EXL3_X86_ISA
         const __m512 corr = _mm512_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
         for (int col = 0; col < 128; col += 16)
         {
@@ -1687,8 +1746,21 @@ void finish_partials(const int32_t* raw, int parts, const PreparedIn& in, float*
             const __m512 out = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), _mm512_set1_ps(scale), corr);
             _mm512_storeu_ps(tout + static_cast<size_t>(i) * n + n_base * 16 + col, out);
         }
+#else  // EXL3_AARCH64_SCALAR: same arithmetic, no AVX-512
+        const float corr = -510.0f * static_cast<float>(in.sum_x8[i]) * scale;
+        for (int col = 0; col < 128; ++col)
+        {
+            int32_t acc = raw[i * 128 + col];
+            for (int part = 1; part < parts; ++part)
+                acc += raw[part * 256 + i * 128 + col];
+            tout[static_cast<size_t>(i) * n + n_base * 16 + col] =
+                std::fma(static_cast<float>(acc), scale, corr);
+        }
+#endif
     }
 }
+
+#if EXL3_X86_ISA  // resume x86 vector kernels
 
 // -------------------------------------------------------------------------------------------
 //   AVX2
@@ -2351,6 +2423,8 @@ void avx2_swz2_half_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* 
         avx2_swz2<bits, Rows, true>(mat, in, tout, Rows, tn0, tn1);
 }
 
+#endif  // EXL3_X86_ISA (x86 vector kernels)
+
 // -------------------------------------------------------------------------------------------
 //   Scalar fallback
 // -------------------------------------------------------------------------------------------
@@ -2393,6 +2467,10 @@ void scalar_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, in
 
 Isa detect_isa()
 {
+#if !EXL3_X86_ISA
+    // Windows/ARM64: scalar is the only GEMV tier compiled here (see the x86 kernel guards above)
+    Isa hw = Isa::Scalar;
+#else
     Isa hw;
 #if defined(__GNUC__) && defined(__linux__)
     if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
@@ -2438,6 +2516,7 @@ Isa detect_isa()
            :                              Isa::Scalar;
     }
 #endif
+#endif  // EXL3_X86_ISA (detect_isa detection)
 
     // EXL3_MOE_CPU_MAX_ISA=scalar|avx2|bw|vnni|vbmi: cap detection at a lower tier for testing
     // (e.g. exercising the AVX2 path on AVX512-VNNI hardware, or the dword scheme on VBMI
@@ -2476,6 +2555,7 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
 {
     if (tn0 >= tn1) return;
     switch (g_isa) {
+#if EXL3_X86_ISA
         case Isa::Vbmi:
         {
             if (mat.hb)
@@ -2757,6 +2837,7 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
                 default: avx2_tiles<8, false>(mat, in, tout, m, tn0, tn1); return;
             }
         }
+#endif  // EXL3_X86_ISA (vector dispatch arms)
         case Isa::Scalar:
         {
             if (mat.hb)
@@ -3189,6 +3270,7 @@ struct ForwardArena
     }
 };
 
+#if EXL3_X86_ISA
 M1_TARGET_AVX2 M1_NOINLINE
 void transform_out_avx2(const MoeCpuMatrix& mat, float* tout, int m)
 {
@@ -3211,10 +3293,13 @@ void transform_out_avx2(const MoeCpuMatrix& mat, float* tout, int m)
             }
         }
 }
+#endif  // EXL3_X86_ISA (transform_out_avx2)
 
 void transform_out(const MoeCpuMatrix& mat, float* tout, int m)
 {
+#if EXL3_X86_ISA
     if (g_isa != Isa::Scalar) { transform_out_avx2(mat, tout, m); return; }
+#endif
 
     for (int r = 0; r < m; ++r)
         for (int block = 0; block < mat.n; block += 128)
@@ -3397,7 +3482,11 @@ void decode_gu_block(ForwardCtx& c, int j, int block)
         transform_out_block(L.ups[e], u, block);
         apply_activation(L, g + block, u + block, 128);
         const float* a = gated ? g : u;
+#if EXL3_X86_ISA
         prepare_block_avx2(a + block, false, L.downs[e].suh + block, c.prep_d[j].tin + ro + block, 128);
+#else
+        prepare_block_scalar(a + block, false, L.downs[e].suh + block, c.prep_d[j].tin + ro + block, 128);
+#endif
     }
 }
 

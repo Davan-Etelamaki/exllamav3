@@ -30,7 +30,9 @@ def routed_ref(ex, y, sel, w):
 def launch(y, out, layout_args, bufs, tabs, num_active = -1, scratch = None, base = None, lo = 1, hi = CAP,
            m_tile = 16):
     expert_count, token_sorted, weight_sorted = layout_args
-    ext.exl3_moe(y, out, expert_count, token_sorted, weight_sorted, *bufs, 0, K, K, K,
+    # None, None, None: the per-expert bitrate tables added when the kernel learned mixed-K
+    # packs; this test's bundle is uniform K
+    ext.exl3_moe(y, out, expert_count, token_sorted, weight_sorted, *bufs, 0, K, K, K, None, None, None,
                  *tabs["g"], *tabs["u"], *tabs["d"], False, True, False, True, False, True, 0.0, num_active,
                  scratch, base, lo, hi, m_tile)
 

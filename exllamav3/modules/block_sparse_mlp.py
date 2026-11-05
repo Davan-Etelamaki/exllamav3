@@ -624,6 +624,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             if self.mixed_expert_K:
                 self.support_bc_bszn = False
                 self.support_fused = False
+                print(f" -- Mixed-rate expert bundle (SAGE): {self.key}: BC/fused reserved for uniform "
+                      f"packs, every batch size takes the exl3_moe/dense tier")
 
             # Enable fully fused kernel if possible (uniform mcg or mul1 codebook across gate/up/down,
             # and an activation the fused kernel implements)
@@ -634,7 +636,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )
             self.support_fused = (
                 cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
-                self.support_quant_paths
+                self.support_quant_paths and
+                not getattr(self, "mixed_expert_K", False)
             )
 
         # Temp buffers for graph, dq and fused-bsz1 paths
@@ -1248,7 +1251,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         elif (
             (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or
             self.config.infer_params.no_reconstruct or
-            not (self.support_quant_paths or bszn_eligible)
+            not (self.support_quant_paths or bszn_eligible) or
+            # A missing bound class (mixed-rate/SAGE bundles never build one) means the fused
+            # decode tier is unavailable at EVERY batch size, not only above f_threshold: the
+            # dense path carries per-expert rates through MultiLinear.Ks, so it must serve
+            # bsz < f_threshold too or those shapes have no tier left
+            self.bc is None
         ):
             # One spare row: the batched reconstruct tier's padding sink (never read back)
             fhs_ext = torch.zeros((y.shape[0] + 1, y.shape[1]), dtype = torch.float, device = y.device)
@@ -1360,6 +1368,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 else:
                     cnt = expert_count.cpu().numpy()
                     expert_count_list = cnt.tolist()
+                fused_ok = self.fused_mode_buffers is not None
                 # Tier plan: fused kernel for experts up to self.fused_rows rows, batched reconstruct groups
                 # above that up to the tile cap, per-expert reconstruct beyond
                 recon = None
@@ -1581,6 +1590,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             multi_gate.K,
                             self.multi_up.K,
                             self.multi_down.K,
+                            multi_gate.Ks,
+                            self.multi_up.Ks,
+                            self.multi_down.Ks,
                             multi_gate.ptrs_trellis,
                             multi_gate.ptrs_suh,
                             multi_gate.ptrs_svh,
@@ -1730,9 +1742,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # not worth the argsort/bincount host-sync cost that the fused/exl3_moe path pays). Shared
         # experts (if present) run through their own multi-row BC_GatedMLP graph and are merged
         # inside the kernel. Expert-range shards (CPU split, TP) produce a partial sum here:
-        # out-of-range picks are masked inside the kernel and contribute exact zeros. Every
-        # quantized configuration that reaches this point has self.bc (it is built whenever the
-        # quantized paths apply), so this is the last tier
+        # out-of-range picks are masked inside the kernel and contribute exact zeros. Configurations
+        # without self.bc (mixed-rate bundles, an in-flight outer capture) are taken by the tier
+        # above, so this is the last tier
         else:
             assert bszn_eligible
             self.bc.run_bszN(y, selected_experts, routing_weights)

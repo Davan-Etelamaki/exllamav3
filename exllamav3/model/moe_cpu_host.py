@@ -1189,7 +1189,7 @@ class MoeCpuHost:
                   flush = True)
 
     def register_layer(self, key, gate_keys, up_keys, down_keys, activation, act_limit, hi, ho, topk,
-                       proj_dims = None, aux = None, interm_fp32 = False):
+                       proj_dims = None, aux = None, interm_fp32 = False, proj_rates = None):
         if key in self.by_key:
             # Autosplit rollback retry: the child keeps its copy, reuse the index, but take
             # the re-fetched aux tensors: the retry runs on a different device, and the stored
@@ -1210,6 +1210,7 @@ class MoeCpuHost:
             hi = hi, ho = ho, topk = topk,
             num_experts = len(up_keys),
             proj_dims = proj_dims,
+            proj_rates = proj_rates,      # per-expert bitrates per projection; mixed packs skip streamed prefill
             interm_fp32 = interm_fp32,      # resident experts' gate/up output dtype (BlockSparseMLP interm_dtype)
         )
         if proj_dims is not None:
@@ -1923,6 +1924,15 @@ class MoeCpuHost:
         if msg[0] != "ok":
             raise RuntimeError(f"CPU MoE worker expert install failed: {msg[1] if len(msg) > 1 else msg}")
 
+    @staticmethod
+    def _proj_rates_uniform(spec):
+        """True unless the pack grades this layer's experts at different bitrates (SAGE-style
+        mixed-K). proj_dims, the packed layout and the uniform expert_bytes the streamed DMA
+        copies all describe one rate per projection, so a mixed layer must not take the
+        streamed path; the plain CPU path rehomes each expert's own trellis and is fine."""
+        rates = spec.get("proj_rates")
+        return rates is None or all(len(set(v)) <= 1 for v in rates.values() if v)
+
     def submit_prefill(self, layer_idx, y, selected_experts, routing_weights):
         """
         Split the routed-expert workload by per-expert token count: hot experts (count >=
@@ -1936,7 +1946,8 @@ class MoeCpuHost:
         spec = self.specs[layer_idx]
         rows = y.shape[0]
         if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
-                or spec["expert_bytes"] > self.wslot_size or layer_idx not in self.aux):
+                or spec["expert_bytes"] > self.wslot_size or layer_idx not in self.aux
+                or not self._proj_rates_uniform(spec)):
             return self.submit(layer_idx, y, selected_experts, routing_weights)
 
         with torch.cuda.device(y.device):
@@ -2016,7 +2027,8 @@ class MoeCpuHost:
         # Plain CPU path: the fp32 output and the readback staging
         fixed = rows * h * 4 + min(self.cap_rows, rows) * h * 4
         if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
-                or spec["expert_bytes"] > self.wslot_size or layer_idx not in self.aux):
+                or spec["expert_bytes"] > self.wslot_size or layer_idx not in self.aux
+                or not self._proj_rates_uniform(spec)):
             return fixed, 0
         aux = self.aux[layer_idx]
         pd = spec["proj_dims"]
@@ -2231,6 +2243,11 @@ class MoeCpuHost:
                         y, out, ec, tok, wts,
                         fbufs[0], fbufs[1], fbufs[2], fbufs[3],
                         spec["activation"], Kg, Ku, Kd,
+                        # None x3: the per-expert bitrate tables added for mixed-K (SAGE) packs.
+                        # This tier's spec describes one uniform rate per projection (see
+                        # register_layer's proj_dims and the uniform expert_bytes the streamed
+                        # DMA copies); mixed-rate packs are held out of the streamed path
+                        None, None, None,
                         tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
                         tblt[6], tblt[7], tblt[8],
                         False, True, False, True, False, True,

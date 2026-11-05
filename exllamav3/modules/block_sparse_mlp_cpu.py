@@ -438,6 +438,16 @@ class BlockSparseMLP_CPU:
         self.cpu_split_first = None   # split offload: first CPU-resident (tail) expert index
         self._split_map = None        # dynamic placement: router id -> physical slot
 
+    def _cpu_proj_rates(self, gate_ls, up_ls, down_ls):
+        """Per-expert bitrates of the offloaded slice, {proj: tuple}; read from checkpoint
+        headers only. register_layer's proj_dims/expert_bytes describe ONE rate per
+        projection, so the host holds mixed-rate packs (SAGE) out of streamed prefill"""
+        stc = self.config.stc
+        def rates(ls):
+            return tuple(trellis_rate(stc.list_tensors(l.key)[l.key + ".trellis"]["shape"][-1])
+                         for l in ls)
+        return dict(g = rates(gate_ls) if self.gated else None, u = rates(up_ls), d = rates(down_ls))
+
     def cpu_maybe_offload_load(self, device, **kwargs) -> bool:
         """Whole-layer offload claim: when the budget allows and the layer is eligible,
         register the routed experts with the CPU worker instead of loading them; the caller
@@ -787,6 +797,7 @@ class BlockSparseMLP_CPU:
             float(self.act_limit or 0.0),
             hi, ho, self.num_experts_per_tok,
             proj_dims = dict(g = gd, u = ud, d = dd),
+            proj_rates = self._cpu_proj_rates(self.gates if self.gated else [], self.ups, self.downs),
             aux = aux,
             interm_fp32 = self.interm_dtype == torch.float,
         )
@@ -926,6 +937,8 @@ class BlockSparseMLP_CPU:
             float(self.act_limit or 0.0),
             hi, ho, self.num_experts_per_tok,
             proj_dims = dict(g = gd, u = ud, d = dd),
+            proj_rates = self._cpu_proj_rates(self.gates[first:] if self.gated else [],
+                                              self.ups[wfirst:], self.downs[wfirst:]),
             aux = aux,
             interm_fp32 = self.interm_dtype == torch.float,
         )
