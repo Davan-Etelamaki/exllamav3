@@ -890,7 +890,12 @@ class Generator:
                 self._gs_ms_max = max(self._gs_ms_max, slice_ms)
                 self._gs_tok += gs_computed
                 self._gs_dec += 1 if decoders_waiting else 0
-                if self._gs_n >= self._gov_stats_every:
+                # Wall-clock floor (owner absolute law 2026-10-16): a count divisor alone
+                # makes this line's rate proportional to engine speed, so every kernel win
+                # would buy more logging and hand part of it back. The counters still cover
+                # whatever window elapsed; 60 s is the fastest this may print.
+                if self._gs_n >= self._gov_stats_every and \
+                        time.monotonic() - getattr(self, "_gov_stats_ts", 0.0) >= 60.0:
                     logger.info(
                         "[GS] govstats {}".format(
                             {
@@ -909,6 +914,7 @@ class Generator:
                     self._gs_ms_max = 0.0
                     self._gs_tok = 0
                     self._gs_dec = 0
+                    self._gov_stats_ts = time.monotonic()
 
         if live_shrink:
             self.max_chunk_size = live_shrink
@@ -2642,10 +2648,14 @@ class Generator:
                         pt = getattr(self, "_pool_tick", 0) + 1
                         self._pool_tick = pt
                         rc = getattr(self, "recurrent_cache", None)
-                        if rc is not None and pt % 512 == 0:
+                        if rc is not None and pt % 512 == 0 and \
+                                time.monotonic() - getattr(self, "_pool_print_ts", 0.0) >= 60.0:
                             # [POOL] witness (law 5): the eviction-graceful claim for
                             # widened replay on recurrent models rests on these counters;
-                            # silent metrics are unfalsifiable. Every 512 recorded rounds.
+                            # silent metrics are unfalsifiable. Every 512 recorded rounds,
+                            # floored at 60 s wall-clock: a bare count divisor ties this
+                            # line's rate to engine speed (owner log-rate law 2026-10-16).
+                            self._pool_print_ts = time.monotonic()
                             m = rc.metrics
                             print(f"[POOL] stashed={len(rc)} size={rc.current_size / 2**30:.2f}GiB "
                                   f"evict={m['stash_evictions']} stranded={m['stash_evictions_stranded']} "
