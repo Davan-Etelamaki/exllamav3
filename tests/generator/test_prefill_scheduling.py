@@ -41,6 +41,7 @@ def make_generator(jobs, shared_chunk_size = 2048, prefill_cooldown = 0):
     g.active_jobs = list(jobs)
     g.max_batch_size = 16  # read by Generator.iterate (3a0cc165 admission check)
     g.recurrent_cache = None
+    g.pipeline = None
     g.draft_model = None
     g.dflash_draft = False
     g.mtp_draft = False

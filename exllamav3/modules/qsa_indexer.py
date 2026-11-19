@@ -156,6 +156,13 @@ class QSAIndexer(Module):
         return self.index_qk_proj.optimizer_targets()
 
     @override
+    def unload(self):
+        super().unload()
+        # The selection weights are created lazily and owned by the indexer rather than g_tensor_cache, so
+        # release them with the module (layer streaming would otherwise keep one per unloaded layer)
+        self._sel_w = None
+
+    @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
         raise RuntimeError("QSAIndexer is not a standalone graph module; use project()/select()")
 
@@ -273,12 +280,17 @@ class QSAIndexer(Module):
     # comes from the host-side cache lengths: no per-layer H2D copy, no sync, and none of the
     # arange/where/cat elementwise chains of the torch references kept below for the tests
 
+    # Selection scores stay fp32 through the top-k, as the reference computes them: the scores
+    # around the block_topk-th are closer together than fp16 resolves, and rounding them turns
+    # the boundary into index-ordered ties
+    SCORE_DTYPE = torch.float
+
     # Rows per launch (also the expand kernel's fixed SEQ constexpr) and pools per score tile.
-    # Selection scores are computed tile by tile into a fixed SEL_SLAB x SEL_TILE fp16 slab
-    # (16 MiB, sharing the DSA indexer's backing) with a running top-k candidate set, so the
-    # workspace never scales with the context (a single rows x T buffer would be 128 MiB per
-    # slab at 256K). The slab stays wide: the scorer's pooled-key reuse is per row slab, so
-    # narrower slabs cost more than the extra top-k passes save
+    # Selection scores are computed tile by tile into a fixed SEL_SLAB x SEL_TILE slab with a
+    # running top-k candidate set, so the workspace never scales with the context (a single
+    # rows x T buffer would grow with every slab of a long prompt). The slab stays wide: the
+    # scorer's pooled-key reuse is per row slab, so narrower slabs cost more than the extra
+    # top-k passes save
     SEL_SLAB = 1024
     SEL_TILE = int(os.environ.get("EXL3_QSA_SCORE_TILE", 8192))
     # Row count up to which the plane-update workspaces come from g_tensor_cache (decode-class
@@ -324,7 +336,7 @@ class QSAIndexer(Module):
         # Fixed score-row stride for every tile: it is a constexpr of the scoring kernel, so a
         # stride that followed the visible length recompiled it at every new 128-pool boundary
         s_stride = -(-t_tile // 128) * 128
-        s_backing = g_tensor_cache.get(dev, (self.SEL_SLAB * s_stride,), torch.half, "dsa_stile")
+        s_backing = g_tensor_cache.get(dev, (self.SEL_SLAB * s_stride,), self.SCORE_DTYPE, "dsa_stile")
 
         def tile_scores(q_slab, rows, t0, t1):
             # Tile [t0, t1) of the pooled plane scored as if it started at pool 0: the row-0
@@ -369,12 +381,13 @@ class QSAIndexer(Module):
                 # The accumulator is cleared below and the merge kernel clamps the count it
                 # reads. run_tiled in tests/kernels/dsa/test_dsa_topk_tiles.py zero-inits its
                 # workspace, so it cannot catch a dirty slot; test_qsa_tiled_slot0.py poisons
-                # the slot on purpose
+                # the slot on purpose. Scratch dtype follows upstream's SCORE_DTYPE, not a
+                # remembered half: the score plane is float since upstream commit at v1.6.7
                 ws = []
                 for slot in (0, 1):
                     ws.append((
                         g_tensor_cache.get_bucketed(dev, rows * 2 * kp, torch.int32, f"qsa_sel_ws{slot}_idx")[:rows * 2 * kp].view(rows, 2, kp),
-                        g_tensor_cache.get_bucketed(dev, rows * 2 * kp, torch.half, f"qsa_sel_ws{slot}_scr")[:rows * 2 * kp].view(rows, 2, kp),
+                        g_tensor_cache.get_bucketed(dev, rows * 2 * kp, self.SCORE_DTYPE, f"qsa_sel_ws{slot}_scr")[:rows * 2 * kp].view(rows, 2, kp),
                         g_tensor_cache.get_bucketed(dev, rows * 2, torch.int32, f"qsa_sel_ws{slot}_cnt")[:rows * 2].view(rows, 2),
                     ))
                 # The first merge below reduces slots 0 and 1, but by then only slot 1 has been
