@@ -28,6 +28,16 @@ from .cpu_cache import _align
 
 logger = logging.getLogger(__name__)
 
+
+def _is_capture_conflict(e: BaseException) -> bool:
+    """True when a CUDA call failed because another thread is mid stream-capture.
+
+    While a capture is in progress, cudaEventSynchronize is not permitted and the driver answers
+    900 (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED). The tier is healthy when that happens: the wait
+    simply landed inside someone else's graph capture."""
+    msg = str(e)
+    return "stream is capturing" in msg or "CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED" in msg
+
 PAGE_MAGIC = b"EXL3KVP1"
 STATE_MAGIC = b"EXL3RCS1"
 _HEADER = struct.Struct("<II")       # (header json length, payload-descriptor length)
@@ -369,6 +379,9 @@ class DiskPageCache:
         # when files are removed. Writes also stop while the free space is below min_free
         self.min_free = min_free
         self._space_pause_until = 0.0
+        # A CUDA-graph capture on another thread makes cudaEventSynchronize unsupported (error 900).
+        # That is a scheduling collision, so it pauses writes briefly instead of striking out
+        self._capture_pause_until = 0.0
         self._space_checked = 0.0
         self._space_ok = True
 
@@ -1177,12 +1190,15 @@ class DiskPageCache:
 
     def _can_write(self) -> bool:
         """Main thread. Return False when no new write may start: closed, disabled, paused after a full disk,
-        or free space below min_free (examined at most each 5 seconds)"""
+        paused after a stream-capture conflict, or free space below min_free (examined at most each 5 seconds)"""
         if self._closed or self.write_disabled:
             return False
         now = time.time()
         if now < self._space_pause_until:
             self.metrics["skipped_low_space"] = self.metrics.get("skipped_low_space", 0) + 1
+            return False
+        if now < self._capture_pause_until:
+            self.metrics["skipped_capture"] = self.metrics.get("skipped_capture", 0) + 1
             return False
         if now - self._space_checked > 5.0:
             self._space_checked = now
@@ -1482,6 +1498,15 @@ class DiskPageCache:
                 self._state_written(op[1])
             out_of_space = isinstance(e, OSError) and e.errno in (errno.ENOSPC, errno.EDQUOT)
             if self.write_disabled:
+                return
+            if _is_capture_conflict(e):
+                # Someone else's CUDA-graph capture made our event wait fail. The tier is healthy, so
+                # this must not spend the consecutive-failure budget: 3 of those, over a few
+                # milliseconds of capture, spent the disk tier for a whole prod session (2026-11-19)
+                if time.time() >= self._capture_pause_until:
+                    logger.warning(f"Disk cache tier: {kind} failed ({e}); writes paused for 5 seconds "
+                          f"(restores from what is already on disk continue)")
+                self._capture_pause_until = time.time() + 5.0
                 return
             if out_of_space:
                 # Pause, do not stop: space comes back when files are removed. A full disk is not a fault of

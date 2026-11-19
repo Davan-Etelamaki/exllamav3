@@ -14,8 +14,11 @@ Safety contract:
   disables the runner for the process (logged once), never the round.
 """
 
+import logging
 import os
 import torch
+
+logger = logging.getLogger(__name__)
 
 _ENABLED = os.environ.get("EXL3_FWD_GRAPH", "1") != "0"
 _WARMUPS = int(os.environ.get("EXL3_FWD_WARMUPS", "2"))
@@ -71,6 +74,9 @@ class ForwardGraphRunner:
                 if os.environ.get("EXL3_FWD_GRAPH_DEBUG"):
                     raise
                 self.disabled_reason = f"{type(e).__name__}: {e}"
+                # The module docstring promises this is "logged once": without it the whole-forward
+                # graph can die silently and decode quietly runs eager (law 5: no silent zero-emitter).
+                logger.warning(f"Whole-forward CUDA graph disabled for this process: {self.disabled_reason}")
                 torch.cuda.synchronize()
                 self.stats["eager"] += 1
                 return forward_fn(**forward_kwargs)
