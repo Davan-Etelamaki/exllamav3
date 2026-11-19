@@ -61,7 +61,7 @@ def _event_racer(box, stop):
     syncs = 0
     while not stop.is_set():
         ev = torch.cuda.Event()
-        a.add_(1.0, non_blocking=True)
+        a.add_(1.0)
         ev.record()
         try:
             ev.synchronize()
@@ -112,6 +112,9 @@ def test_routing_graph_capture_survives_concurrent_event_waits():
 
     print(f"VERDICT capture_failures={len(failures)}/{CONSTRUCTIONS} "
           f"racer_conflicts_total={box.get('conflicts', 'n/a')}")
+    if not box.get("syncs"):
+        raise AssertionError("HARNESS: the racer thread emitted no event waits, so this arm measured "
+                             "nothing -- a zero-emitting check must not read green (law 5)")
     assert not failures, ("routing-graph capture died under a concurrent event wait: "
                           + "; ".join(failures))
 
