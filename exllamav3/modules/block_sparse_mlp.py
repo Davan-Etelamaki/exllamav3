@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import logging
 import os
 import torch
 import torch.nn.functional as F
@@ -56,6 +57,7 @@ FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 # first). Live py-spy: block_sparse_mlp routing glue ~8% of generator wall, ~8 tiny eager
 # launches per MoE layer per step. Replay = 2 copy-ins + graph replay. Only used on the
 # all-fused fast path (no host expert counts); any capture failure falls back to eager, sticky.
+logger = logging.getLogger(__name__)
 _ROUTE_GRAPH = os.environ.get("EXL3_ROUTE_GRAPH", "1") != "0"
 _RG_MAX_A = int(os.environ.get("EXL3_ROUTE_GRAPH_MAX_A", 65536))  # [GS] dsh-route-wide: cover A_rt beyond fused_rows
 
@@ -73,7 +75,14 @@ class _RoutingGraph:
                 self._prelude()
         torch.cuda.current_stream().wait_stream(s)
         self.g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.g):
+        # thread_local, NOT torch's default (global). A global capture forbids every OTHER thread from
+        # touching CUDA events, so the disk tier's writer thread (disk_cache._do_write_page ->
+        # ev.synchronize()) both fails with cudaErrorStreamCaptureUnsupported and invalidates THIS
+        # capture. Prod boot 2026-11-19 12:21: three such pages spent the L3 tier for the rest of the
+        # session. Measured on dot26 (Launchers/repro_capture_event_sync_2026-11-19.py): global ->
+        # CAPTURE=INVALIDATED WAIT=CONFLICT; thread_local and relaxed -> CAPTURE=ok WAIT=ok.
+        # graph.cu:63 already captures ThreadLocal; fwd_graph.py already passes relaxed.
+        with torch.cuda.graph(self.g, capture_error_mode = "thread_local"):
             self.outs = self._prelude()
 
     def _prelude(self):
@@ -1336,7 +1345,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             rg = _RoutingGraph(flat_expert_global, flat_weight, num_tokens, top_k,
                                                E, _first, y.device)
                             _rgc[_rgk] = rg
-                        except Exception:
+                        except Exception as e:
+                            # Sticky, so this line prints once per key: without it the routing glue
+                            # silently returns to the ~8 eager launches/layer/step the graph replaced.
+                            logger.warning(f"MoE routing graph disabled for A_rt={A_rt}: "
+                                           f"{type(e).__name__}: {e}")
                             _rgc[_rgk] = False
                             rg = None
                     if rg is not None:
@@ -1347,7 +1360,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                 graph_route = True
                             else:
                                 planner_route = True
-                        except Exception:
+                        except Exception as e:
+                            logger.warning(f"MoE routing graph replay failed for A_rt={A_rt}, going "
+                                           f"eager: {type(e).__name__}: {e}")
                             _rgc[_rgk] = False
                             rg = None
 
