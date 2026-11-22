@@ -60,6 +60,13 @@ FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 logger = logging.getLogger(__name__)
 _ROUTE_GRAPH = os.environ.get("EXL3_ROUTE_GRAPH", "1") != "0"
 _RG_MAX_A = int(os.environ.get("EXL3_ROUTE_GRAPH_MAX_A", 65536))  # [GS] dsh-route-wide: cover A_rt beyond fused_rows
+# One graph per distinct (A_rt, experts, routing_first) per layer, and A_rt walks many values under mixed
+# batch load, so an unbounded cache grows until the driver refuses cuMemAddressReserve (2026-11-22 17:26,
+# every layer dead and logging its own retry). Bounded FIFO keeps the working shapes and caps the rest.
+_RG_MAX_CACHED = max(1, int(os.environ.get("EXL3_ROUTE_GRAPH_MAX_CACHED", 4)))
+# A capture failure is process-wide news, not per-key: once the address space is gone, every other layer's
+# attempt fails the same way and each retry burns more of it. Matches ForwardGraphRunner's disable rule.
+_RG_STATE = {"disabled": False}
 
 class _RoutingGraph:
     def __init__(self, sel, w, num_tokens, top_k, E, first, device):
@@ -1331,8 +1338,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # planner then runs unchanged. Prod shapes (512 experts × top-10) exceeded
                 # 256 rows at 26 tokens, so eager routing cost 23% of decode wall (flame).
                 if (
-                    _ROUTE_GRAPH and self.fused_mode_buffers is not None and
-                    A_rt <= _RG_MAX_A
+                    not _RG_STATE["disabled"] and _ROUTE_GRAPH and
+                    self.fused_mode_buffers is not None and A_rt <= _RG_MAX_A
                 ):
                     _rgc = self.__dict__.setdefault("_route_graphs", {})
                     _rgk = (A_rt, self.num_local_experts, self.routing_first)
@@ -1345,11 +1352,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             rg = _RoutingGraph(flat_expert_global, flat_weight, num_tokens, top_k,
                                                E, _first, y.device)
                             _rgc[_rgk] = rg
+                            while len(_rgc) > _RG_MAX_CACHED:
+                                _rgc.pop(next(iter(_rgc)), None)
                         except Exception as e:
-                            # Sticky, so this line prints once per key: without it the routing glue
-                            # silently returns to the ~8 eager launches/layer/step the graph replaced.
-                            logger.warning(f"MoE routing graph disabled for A_rt={A_rt}: "
-                                           f"{type(e).__name__}: {e}")
+                            # Once per process, not once per key: after the address space is exhausted every
+                            # other layer's attempt fails the same way, and each retry spends more of it.
+                            if not _RG_STATE["disabled"]:
+                                _RG_STATE["disabled"] = True
+                                logger.warning(f"MoE routing graph disabled for this process "
+                                               f"(A_rt={A_rt}): {type(e).__name__}: {e}")
                             _rgc[_rgk] = False
                             rg = None
                     if rg is not None:

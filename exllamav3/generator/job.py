@@ -1869,11 +1869,18 @@ class Job:
             self.last_recurrent_checkpoint_pos != seq.kv_position:
             assert seq.kv_position % PAGE_SIZE == 0
 
-            self.last_recurrent_checkpoint_pos = seq.kv_position
             last_page = (seq.kv_position - 1) // PAGE_SIZE
 
             page = seq.allocated_pages[last_page]
-            assert page.kv_position == PAGE_SIZE
+            if page.kv_position != PAGE_SIZE:
+                # is_checkpoint_boundary tests only seq.kv_position % PAGE_SIZE, so a position that is
+                # page-aligned but backed by fewer committed tokens reaches here: a draft ahead of the
+                # committed token, or a tier restore that left the page partial. A checkpoint must anchor
+                # to committed data, so this boundary is skipped and the next one stashes. Asserting here
+                # killed the generator, after which tabbyAPI spent the disk tier for the whole session.
+                return
+
+            self.last_recurrent_checkpoint_pos = seq.kv_position
             cache.put(page.phash, self.recurrent_state, owner = self)
 
             # Prevent setting the same checkpoint twice in a row if prefill ends on the first page of a chunk
