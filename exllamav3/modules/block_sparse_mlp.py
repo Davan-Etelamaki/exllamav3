@@ -67,6 +67,9 @@ _RG_MAX_CACHED = max(1, int(os.environ.get("EXL3_ROUTE_GRAPH_MAX_CACHED", 4)))
 # A capture failure is process-wide news, not per-key: once the address space is gone, every other layer's
 # attempt fails the same way and each retry burns more of it. Matches ForwardGraphRunner's disable rule.
 _RG_STATE = {"disabled": False}
+# Shared capture pool, created once on first use. Every routing graph captures into this one pool, so
+# adding a shape does not add another private address-space reservation.
+_RG_POOL = None
 
 class _RoutingGraph:
     def __init__(self, sel, w, num_tokens, top_k, E, first, device):
@@ -89,7 +92,14 @@ class _RoutingGraph:
         # session. Measured on dot26 (Launchers/repro_capture_event_sync_2026-11-19.py): global ->
         # CAPTURE=INVALIDATED WAIT=CONFLICT; thread_local and relaxed -> CAPTURE=ok WAIT=ok.
         # graph.cu:63 already captures ThreadLocal; fwd_graph.py already passes relaxed.
-        with torch.cuda.graph(self.g, capture_error_mode = "thread_local"):
+        # ONE shared pool for every routing graph. Without it each capture reserves its own private
+        # pool, so one graph per (layer, A_rt) becomes a separate cuMemAddressReserve until the driver
+        # answers CUDA_ERROR_OUT_OF_MEMORY (prod 2026-11-22 17:26). These graphs replay serially in
+        # stream order, which is what makes sharing the pool legal.
+        global _RG_POOL
+        if _RG_POOL is None:
+            _RG_POOL = torch.cuda.graph_pool_handle()
+        with torch.cuda.graph(self.g, pool = _RG_POOL, capture_error_mode = "thread_local"):
             self.outs = self._prelude()
 
     def _prelude(self):
