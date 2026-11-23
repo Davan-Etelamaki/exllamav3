@@ -12,6 +12,7 @@ relative-position bias and per-token sinks are not expressible in the paged kern
 from __future__ import annotations
 from typing_extensions import override
 import math
+import os as _os
 import torch
 import torch.nn.functional as F
 
@@ -23,6 +24,20 @@ from ...constants import PAGE_SIZE
 from .. import Module, Linear, RMSNorm
 
 KEY_FLOW = "inkling_flow"
+
+
+def _fresh_flow() -> dict:
+    return {"bank": [], "pre_bank": None, "pre_hidden": None, "prev_bank": None, "prev_hidden": None}
+
+
+def flow_of(params: dict) -> dict:
+    # prepare_inputs normally installs the flow; entry paths that bypass it (a load-time warmup
+    # forward) must still get a fresh one rather than crash.
+    flow = params.get(KEY_FLOW)
+    if flow is None:
+        flow = _fresh_flow()
+        params[KEY_FLOW] = flow
+    return flow
 
 
 def rmsnorm_f(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -145,12 +160,19 @@ class InklingLayerState:
             self.v_state[idx].zero_()
 
     def rewind(self, slot: int, last_history: int, num_tokens: int):
-        # Speculative decoding is off for v1: last_history is always 0 and the rewind is a
-        # position correction on the state object only (see ShortConvLayerState)
+        # Speculative decoding is off for v1 and the whole-forward CUDA graph is not
+        # graph-safe for this eager-torch attention, so the only rewind the lane issues
+        # undoes a warmup/probe forward that had no prior real history. Zeroing the slot
+        # returns it to the pristine state that forward advanced from.
         assert num_tokens >= 0 and (last_history == 0 or num_tokens <= last_history + 1), \
             f"inkling rewind: {num_tokens} tokens outside recorded history of {last_history}"
-        if last_history > 0:
-            raise NotImplementedError("inkling conv history rewind")
+        if self.device is None:
+            return
+        for t in self.conv_states.values():
+            t[slot].zero_()
+        if self.module.sliding:
+            self.k_state[slot].zero_()
+            self.v_state[slot].zero_()
 
     def stash(self, slot, position: int = 0):
         st = {n: host_copy(t[slot, :, :self.module.conv_kernel_size])
@@ -689,6 +711,13 @@ class InklingAttention(Module):
         lens = [int(host_seqlens[i]) + t for i in range(b)]
         maxlen = max(lens)
 
+        _dbg = _os.environ.get("INKLING_DEBUG")
+        def _st(x):
+            return float(x.float().std()) if (x is not None and x.numel()) else float("nan")
+        if _dbg:
+            print(f"GATHER L{self.layer_idx:02d} i{inst} cls={type(layer).__name__} "
+                  f"kh={_st(kh):.4f}/{kh.dtype} vh={_st(vh):.4f} lens={lens}", flush = True)
+
         if hasattr(layer, "stage_range"):
             # NVFP4: dequantize only the used pages into a contiguous fp16 staging pool whose
             # per-sequence page runs are contiguous (stage_range's remapped block_table)
@@ -700,6 +729,9 @@ class InklingAttention(Module):
             for i, (s, n, l) in enumerate(zip(starts, nbs, lens)):
                 kk[i, :l] = ks[s:s + n].reshape(-1, ks.shape[2], ks.shape[3])[:l]
                 vv[i, :l] = vs[s:s + n].reshape(-1, vs.shape[2], vs.shape[3])[:l]
+            if _dbg:
+                print(f"  NVFP4 ks={_st(ks):.4f} vs={_st(vs):.4f} kk={_st(kk):.4f} vv={_st(vv):.4f}",
+                      flush = True)
             return kk, vv, lens
 
         k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, -1)
@@ -825,7 +857,7 @@ class InklingOutputRead(InklingBlockRead):
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype = None) -> torch.Tensor:
-        flow = params[KEY_FLOW]
+        flow = flow_of(params)
         return self.read(flow["bank"], x)[0].to(x.dtype)
 
 
@@ -1107,7 +1139,7 @@ class InklingLayer(Module):
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype = None) -> torch.Tensor:
-        flow = params[KEY_FLOW]
+        flow = flow_of(params)
         inst = params.get("layer_instance") or 0
         dtype = x.dtype
 
@@ -1150,7 +1182,9 @@ class InklingLayer(Module):
                 hv = self.v_norm.forward(self.gate_v.forward(hs_v, m_v), params)
 
         attn_out = self.attn.forward_attn(hq, hk, hv, params)
+        ao_raw = attn_out
         attn_out = self.convs.conv("attn", attn_out, params)
+        ao_conv = attn_out
 
         attn_out = attn_out.float()
         if self.is_boundary:
@@ -1164,8 +1198,22 @@ class InklingLayer(Module):
             m_in = self.gate_mlp.forward(m_in, messages[3])
         m_in = self.mlp_norm.forward(m_in, params)
         m_out = self.moe.forward(m_in, params)
+        mo_raw = m_out
         m_out = self.convs.conv("mlp", m_out, params)
+        mo_conv = m_out
         out = (residual + m_out.float()).to(dtype)
+
+        import os as _os
+        if _os.environ.get("INKLING_DEBUG"):
+            def _s(t):
+                return float(t.float().std()) if (t is not None and t.numel()) else float("nan")
+            _o = out[0].detach().float()
+            _cos = float(torch.nn.functional.cosine_similarity(_o[:-1], _o[1:], dim=-1).mean())
+            _tv = float(_o.var(dim=0).sum())
+            print(f"DBG L{self.layer_idx:02d} i{inst} sl={int(self.sliding)} bd={int(self.is_boundary)} "
+                  f"x{_s(x)} hq{_s(hq)} ao_raw{_s(ao_raw)} ao_cv{_s(ao_conv)} m_in{_s(m_in)} "
+                  f"mo_raw{_s(mo_raw)} mo_cv{_s(mo_conv)} out{_s(out)} adj_cos={_cos:.3f} tok_var={_tv:.2f} "
+                  f"bank{len(flow['bank'])}", flush=True)
 
         if not self.is_loop and self.layer_idx == self.loop_start - 1:
             flow["pre_hidden"] = out

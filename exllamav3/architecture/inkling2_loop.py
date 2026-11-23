@@ -40,9 +40,10 @@ class Inkling2LoopConfig(Config):
         core_start = int(lc["core_start"])
         core_end = int(lc["core_end"])
         num_passes = int(lc["num_passes"])
+        num_passes = int(os.environ.get("INKLING_PASSES", num_passes))
         num_layers = int(tc["num_hidden_layers"])
         assert not lc["is_varloop"], "Inkling: variable-depth loop is not supported"
-        assert num_passes >= 2 and 0 < core_start < core_end <= num_layers, \
+        assert num_passes >= 1 and 0 < core_start < core_end <= num_layers, \
             f"Inkling: bad loop_config {lc}"
         layer_map = ",".join(
             ([f"0..{core_start - 1}"] if core_start > 0 else []) +
@@ -50,6 +51,10 @@ class Inkling2LoopConfig(Config):
             ([f"{core_end}..{num_layers - 1}"] if core_end < num_layers else [])
         )
 
+        # This architecture derives its own layer_map from loop_config; a caller-supplied
+        # layer_map (e.g. tabbyAPI forwarding one) is overridden, not collided with.
+        kwargs.pop("layer_map", None)
+        kwargs.pop("config_key", None)
         super().__init__(
             directory,
             {"text": Inkling2LoopTextModel},
