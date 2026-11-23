@@ -341,7 +341,7 @@ class InklingConvs(Module):
             else:
                 state[slot][:, :kdim].copy_(full[0, :, -kdim:])
             y = F.conv1d(full, weight.unsqueeze(1), None, padding = kdim - 1, groups = chan)
-            ys.append(y[:, :, :seqlen])
+            ys.append(y[:, :, kdim:kdim + seqlen])
 
         out = torch.cat(ys, dim = 0).transpose(1, 2)                    # (B, T, C)
         out = (out + residual) / math.sqrt(kdim + 1)
