@@ -307,8 +307,13 @@ class Sequence:
         if recurrent_cache is not None:
             while cached_pages > 0:
                 stashed_recurrent_state = recurrent_cache.get_stashed(page_hashes[cached_pages - 1])
-                if stashed_recurrent_state is not None:
+                if stashed_recurrent_state is not None and \
+                    stashed_recurrent_state["position"] == cached_pages * PAGE_SIZE:
                     break
+                # A checkpoint that is missing, unreadable, or recorded at a position this resume cannot
+                # derive is a miss: fall back to the next lower one. find_recurrent_stash filters the same
+                # way; restoring a drifted one would abort inside GDNState.unstash.
+                stashed_recurrent_state = None
                 lower = [pi for pi in recurrent_pages if pi < cached_pages - 1]
                 resume = (max(lower) + 1) if lower else 0
                 pagetable.metrics["alloc_cached_pages"] -= cached_pages - resume

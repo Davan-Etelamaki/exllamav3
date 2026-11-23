@@ -2277,10 +2277,23 @@ class Generator:
             from exllamav3.modules.block_sparse_mlp import BlockSparseMLP
             from exllamav3.modules.block_sparse_mlp_cpu import BlockSparseMLP_CPU
             from exllamav3.modules.gated_delta_net import GatedDeltaNet
+            from exllamav3.modules.module import Module
+            # Graph-managed state lives INSIDE a TransformerBlock: qwen3_5 hands GatedDeltaNet to
+            # TransformerBlock as block.attn (qwen3_5.py:331), the block registers it
+            # (transformer.py:68), and fwd_modules lists the blocks (model.py:132). A flat isinstance
+            # test on the block therefore never saw it, the runner warmed up and tried to capture a
+            # forward that cannot be captured, and the boot logged a pinned-memory error that reads
+            # like lost decode throughput. Module.__iter__ (module.py:53) yields a module plus its
+            # registered submodules, so iterating the block reaches the recurrent layer. Once per
+            # generator: the first match short-circuits the walk.
+            unsafe_types = (BlockSparseMLP, BlockSparseMLP_CPU, GatedDeltaNet)
             self._fwd_unsafe = next(
-                (m for m, _, _ in self.model.fwd_modules
-                 if isinstance(m, (BlockSparseMLP, BlockSparseMLP_CPU, GatedDeltaNet))), None,
+                (sub for m, _, _ in self.model.fwd_modules if isinstance(m, Module)
+                 for sub in m if isinstance(sub, unsafe_types)), None,
             )
+            if self._fwd_unsafe is not None and self._fwd_graph.enabled:
+                logger.info(f"[GS] whole-forward graph not eligible: model carries graph-managed "
+                            f"state ({type(self._fwd_unsafe).__name__}); decode runs eager by design")
         if (fwd_graph.enabled and fwd_graph.disabled_reason is None
                 and ids_staged and not active_embeddings
                 and self._fwd_unsafe is None):

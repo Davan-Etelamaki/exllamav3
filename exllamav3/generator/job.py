@@ -1869,6 +1869,16 @@ class Job:
             self.last_recurrent_checkpoint_pos != seq.kv_position:
             assert seq.kv_position % PAGE_SIZE == 0
 
+            state = self.recurrent_state
+            if state is not None and not state.settled_at(seq.kv_position):
+                # The state runs ahead of the committed K/V position while a draft window is unsettled, and
+                # a checkpoint is keyed by the page that ends at THIS boundary. Filing an ahead-of-boundary
+                # state records a position no resume can derive: Sequence.allocate_pages restores at
+                # cached_pages * PAGE_SIZE, and GDNState.unstash asserts the two agree, so the request dies
+                # with a bare AssertionError. The next boundary stashes instead. commit_recurrent_checkpoint
+                # demands the same thing (state.settled_at) before it files the ending state.
+                return
+
             last_page = (seq.kv_position - 1) // PAGE_SIZE
 
             page = seq.allocated_pages[last_page]
