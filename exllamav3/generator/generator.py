@@ -2277,10 +2277,19 @@ class Generator:
             from exllamav3.modules.block_sparse_mlp import BlockSparseMLP
             from exllamav3.modules.block_sparse_mlp_cpu import BlockSparseMLP_CPU
             from exllamav3.modules.gated_delta_net import GatedDeltaNet
+            # Graph-managed state usually lives INSIDE a TransformerBlock (qwen3_5 puts GatedDeltaNet in
+            # block.attn), and fwd_modules lists the blocks, so a flat isinstance pass never sees it: the
+            # runner then warms up and tries to capture a forward that cannot be captured, logging a
+            # pinned-memory error that reads like a performance bug. Search the subtree, once per generator.
+            unsafe_types = (BlockSparseMLP, BlockSparseMLP_CPU, GatedDeltaNet)
             self._fwd_unsafe = next(
-                (m for m, _, _ in self.model.fwd_modules
-                 if isinstance(m, (BlockSparseMLP, BlockSparseMLP_CPU, GatedDeltaNet))), None,
+                (sub for m, _, _ in self.model.fwd_modules
+                 for sub in (m.modules() if hasattr(m, "modules") else (m,))
+                 if isinstance(sub, unsafe_types)), None,
             )
+            if self._fwd_unsafe is not None and self._fwd_graph.enabled:
+                logger.info(f"[GS] whole-forward graph not eligible: model carries graph-managed "
+                            f"state ({type(self._fwd_unsafe).__name__}); decode runs eager by design")
         if (fwd_graph.enabled and fwd_graph.disabled_reason is None
                 and ids_staged and not active_embeddings
                 and self._fwd_unsafe is None):
