@@ -29,6 +29,7 @@ from .gpt_oss import GptOssModel
 from .hcxvisionv2 import HCXVisionV2Model
 from .hy_v3 import HyV3Model
 from .hyperclovax import HyperClovaxModel
+from .inkling2_loop import Inkling2LoopTextModel
 from .iquestcoder import IQuestCoderModel
 from .kimi_linear import KimiLinearModel
 from .bailing_hybrid import BailingHybridModel
@@ -109,6 +110,7 @@ ARCHITECTURES = {
         HCXVisionV2Model,
         HyV3Model,
         HyperClovaxModel,
+        Inkling2LoopTextModel,
         IQuestCoderModel,
         LagunaModel,
         Lfm2Model,
