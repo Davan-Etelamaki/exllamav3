@@ -741,6 +741,7 @@ class Generator:
             self.pending_jobs.remove(job)
         elif job in self.active_jobs:
             job.commit_recurrent_checkpoint()
+            self._offer_job_pages_to_disk(job)
             job.deallocate_pages()
             self.active_jobs.remove(job)
         if num_jobs and not self.num_remaining_jobs():
@@ -1162,6 +1163,45 @@ class Generator:
                     pages.extend(seq.allocated_pages[:max(0, seq.kv_position // PAGE_SIZE - 2)])
         self._queue_pages_to_disk(pages, budget)
 
+
+    @torch.inference_mode()
+    def _offer_job_pages_to_disk(self, job, budget: int | None = None) -> int:
+        """
+        Queue a leaving job's complete pages for the disk tier before its VRAM is handed back, and return how
+        many were queued. write_behind offers the pages of ACTIVE jobs on an interval; a job that is cancelled
+        or reaped stops being active in the very call that frees its pages, so its already-prefilled pages would
+        otherwise wait for the idle transition (on_queue_drained) that busy traffic never brings, and be
+        recycled for the next request instead of written down. Measured on dot26 2026-11-24: six aborted 40k-token
+        ingests left the tier 5 pages, and the lane's external load keeps it from ever idling.
+
+        The tier skips pages that are incomplete, already stored or still queued (_queue_pages_to_disk), so this
+        costs nothing when write_behind already covered the job. The last two pages before a sequence's position
+        are left out for the same reason write_behind leaves them: speculative decoding can still rewind them and
+        the MTP draft writes a page's last slot a step later. Budget matches write_behind's so a burst of
+        cancellations cannot make the tier wait on the writer.
+        """
+        disk = self.disk_page_cache
+        if disk is None or disk.write_disabled or self.cpu_page_cache is None:
+            return 0
+        if budget is None:
+            budget = self.cpu_page_cache.max_slots // 4 - len(disk.pending_pages)
+            # Never queue more than the tier has free: a store that must steal a busy slot waits for the
+            # writer, and a cancellation runs on the caller's thread rather than the engine's. write_behind
+            # can afford to wait there, a request handler cannot.
+            entries = getattr(self.cpu_page_cache, "entries", None)
+            if entries is not None:
+                budget = min(budget, self.cpu_page_cache.max_slots - len(entries))
+        if budget <= 0:
+            return 0
+        # A sequence's position runs ahead of the devices while prefill chunks are in flight
+        if self.pipeline is not None:
+            self.pipeline.flush()
+        pages = []
+        for seq in job.sequences:
+            if seq.allocated_pages:
+                pages.extend(seq.allocated_pages[:max(0, seq.kv_position // PAGE_SIZE - 2)])
+        queued, _ = self._queue_pages_to_disk(pages, budget)
+        return queued
 
     def _idle_flush_budget(self) -> int:
         """Pages for one idle flush step: half the CPU tier, less the writes still queued"""
@@ -2888,6 +2928,14 @@ class Generator:
         escaping to _run_iteration, which latches AsyncGenerator.error permanently and kills
         the iteration task for every job.
         """
+        try:
+            self._offer_job_pages_to_disk(job)
+        except Exception:
+            logger.error(
+                "reap_failed_job: offering the failed job's pages to the disk tier raised; "
+                "the tier keeps what it already holds",
+                exc_info = True,
+            )
         try:
             job.deallocate_pages()
         except Exception:

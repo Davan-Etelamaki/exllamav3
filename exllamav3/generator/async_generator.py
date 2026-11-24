@@ -2,11 +2,14 @@ from __future__ import annotations
 from .generator import Generator
 from .job import Job
 import asyncio
+import logging
 import torch
 
 # Sentinel pushed to an AsyncJob's queue on cancellation so a consumer parked in queue.get() wakes up and
 # exits, rather than waiting forever for results that will no longer be produced
 _CANCELLED_SENTINEL = object()
+
+logger = logging.getLogger(__name__)
 
 import os as _ag_os, time as _ag_time
 _AG_DEC = float(_ag_os.environ.get("EXL3_SCHED_DEC", "0.001"))
@@ -88,6 +91,20 @@ class AsyncGenerator:
             disk = getattr(self.generator, "disk_page_cache", None)
             if disk is not None:
                 disk.abort()
+            # Return what the jobs still held by the sync generator own. A contained failure is released by
+            # Generator.reap_failed_job; a failure that escapes iterate() ends the iteration task here, and
+            # nothing else ever visits those jobs: their VRAM pages and recurrent state slots stay referenced,
+            # and cancel() can no longer reach them, because it refuses to poke a generator that latched (see
+            # cancel below). Each release is best-effort: the generator's state is suspect after the error, and
+            # raising from here would replace the error the consumers are about to receive.
+            for stranded in list(getattr(self.generator, "pending_jobs", [])) + \
+                            list(getattr(self.generator, "active_jobs", [])):
+                try:
+                    self.generator.cancel(stranded)
+                except Exception:
+                    logger.warning(
+                        "Generator error: releasing %s failed; its pages or recurrent state may be stranded",
+                        stranded, exc_info = True)
             for async_job in self.jobs.values():
                 async_job.put_result(e)
             self.jobs.clear()
