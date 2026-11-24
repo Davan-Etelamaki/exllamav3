@@ -224,8 +224,11 @@ class DiskPageCache:
     previous hash and token ids, stable across processes), so a context that was generated in one process can
     be resumed in the next.
 
-    Layout: <root>/<fingerprint>/manifest.json, index.sqlite, pages/<hh>/<phash>.kv, states/<phash>.rs. Each
-    file is self-describing (its header carries the hash, the parent hash, the tokens and the fingerprint), so
+    Layout: <root>/<fingerprint>/manifest.json, index.sqlite, pages/<hh>/<phash>.kv, states/<phash>.rs. Where
+    O_DIRECT is available the page images go to append-only segment files under segments/ instead; a dropped
+    record is freed in place by blanking its magic (the layout does not change) and the index carries each
+    record's location, so adopted pages and reclaiming siblings find records without a scan.
+    Each file is self-describing (its header carries the hash, the parent hash, the tokens and the fingerprint), so
     the SQLite index is a rebuildable cache of the metadata and the directory is reconciled against it at open.
     The fingerprint covers the model weights (safetensors headers and samples), the cache configuration (layer
     types, bit widths, the slot segment table), the checkpoint layout, the page size and the format version, so
@@ -444,6 +447,7 @@ class DiskPageCache:
         self._seg_w_id = -1
         self._seg_w_off = 0
         self._seg_rfds: dict[int, int] = {}            # O_RDONLY direct fds, guarded by _lock
+        self._seg_complete: set[int] = set()           # segment ids fully walked at the last open
         self._order = deque()
         self._order_pops = 0
         self._order_rebuild = 64
@@ -517,6 +521,14 @@ class DiskPageCache:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("CREATE TABLE IF NOT EXISTS pages (phash BLOB PRIMARY KEY, prev_hash BLOB, size INTEGER, "
                      "last_access INTEGER)")
+        # The location of a segment record lives in the index (bookkeeping only, never part of the segment
+        # layout): adopt() and a reclaiming sibling find a page's record through these columns instead of
+        # scanning. An index written before the segment store gains them here
+        for col in ("seg", "seg_off", "seg_hdrp"):
+            try:
+                conn.execute(f"ALTER TABLE pages ADD COLUMN {col} INTEGER")
+            except sqlite3.OperationalError:
+                pass        # already there
         conn.execute("CREATE TABLE IF NOT EXISTS states (phash BLOB PRIMARY KEY, size INTEGER, last_access INTEGER, "
                      "position INTEGER)")
         return conn
@@ -548,6 +560,8 @@ class DiskPageCache:
                     conn.rollback()
                     self.pages.clear()
                     self.states.clear()
+                    self.page_seg.clear()
+                    self.seg_members.clear()
                     time.sleep(0.1 * (attempt + 1))
         finally:
             conn.close()
@@ -559,10 +573,23 @@ class DiskPageCache:
     def _reconcile(self, conn):
         # The reads complete before the first write, so the writes begin their own transaction and wait on the
         # busy handler like any other writer instead of failing on a stale read snapshot
-        page_rows = conn.execute("SELECT phash, prev_hash, size, last_access FROM pages").fetchall()
+        #
+        # The segment store is scanned before the rows are matched: a page row is a live entry when its
+        # segment record or its per-page file exists, and the scan is what knows the records
+        records = self._scan_segments() if self.segments_on else {}
+        page_rows = conn.execute("SELECT phash, prev_hash, size, last_access, seg, seg_off, seg_hdrp "
+                                 "FROM pages").fetchall()
         state_rows = conn.execute("SELECT phash, size, last_access, position FROM states").fetchall()
-        for phash, prev_hash, size, last_access in page_rows:
-            if os.path.exists(self._page_path(phash)):
+        for phash, prev_hash, size, last_access, seg, seg_off, seg_hdrp in page_rows:
+            loc = (seg, seg_off, seg_hdrp) if seg is not None and seg_off is not None else None
+            if phash in records:
+                if loc is None:
+                    loc = records[phash][0]         # row of a page written before the index carried the location
+                    conn.execute("UPDATE pages SET seg = ?, seg_off = ?, seg_hdrp = ? WHERE phash = ?",
+                                 (*loc, phash))
+                self.pages[phash] = {"prev_hash": prev_hash, "size": size, "last_access": last_access}
+                self.page_seg[phash] = loc
+            elif os.path.exists(self._page_path(phash)):
                 self.pages[phash] = {"prev_hash": prev_hash, "size": size, "last_access": last_access}
             else:
                 conn.execute("DELETE FROM pages WHERE phash = ?", (phash,))
@@ -591,10 +618,20 @@ class DiskPageCache:
                         os.remove(path)
                         continue
                     self.pages[phash] = {"prev_hash": meta["prev_hash"], "size": os.path.getsize(path), "last_access": 0}
-                    conn.execute("INSERT OR REPLACE INTO pages VALUES (?, ?, ?, ?)",
+                    conn.execute("INSERT OR REPLACE INTO pages (phash, prev_hash, size, last_access) "
+                                 "VALUES (?, ?, ?, ?)",
                                  (phash, meta["prev_hash"], self.pages[phash]["size"], 0))
+            # Records with no row at all (a lost index, a write killed between append and insert, or a row a
+            # sibling reclaimed): restored under the nominal currency the tier budgets in
+            for phash, (loc, prev_hash, size) in records.items():
+                if phash in self.pages:
+                    continue
+                self.pages[phash] = {"prev_hash": prev_hash, "size": size, "last_access": 0}
+                self.page_seg[phash] = loc
+                conn.execute("INSERT OR REPLACE INTO pages (phash, prev_hash, size, last_access, seg, seg_off, "
+                             "seg_hdrp) VALUES (?, ?, ?, ?, ?, ?, ?)", (phash, prev_hash, size, 0, *loc))
             if self.segments_on:
-                self._scan_segments(conn)
+                self._purge_spent_segments()
             for name in os.listdir(self.states_dir):
                 path = os.path.join(self.states_dir, name)
                 try:
@@ -627,9 +664,15 @@ class DiskPageCache:
 
     @staticmethod
     def _dir_size(path: str) -> int:
+        """Bytes a directory holds on disk, as the root budget charges them. SQLite's write-ahead sidecars
+        are not among them: they are volatile (checkpointed away), and the process that opens a sibling's
+        index to reclaim from it spawns them there itself — counting them would make the sibling grow from
+        the reclaiming's own visit and the budget flap"""
         total = 0
         for dirpath, _, filenames in os.walk(path):
             for name in filenames:
+                if name.endswith(("-wal", "-shm", "-journal")):
+                    continue
                 try:
                     total += os.path.getsize(os.path.join(dirpath, name))
                 except OSError:
@@ -692,28 +735,32 @@ class DiskPageCache:
         others = 0
         for path in self._sibling_dirs():
             index = os.path.join(path, "index.sqlite")
-            overhead = 0
-            # The index files count toward the root like everything else in the directory (_reclaim_root sizes
-            # a directory by walking it; this must agree)
-            for name in ("index.sqlite", "index.sqlite-wal", "index.sqlite-shm", "manifest.json"):
-                try:
-                    overhead += os.path.getsize(os.path.join(path, name))
-                except OSError:
-                    pass
             try:
                 conn = sqlite3.connect(index, timeout = 60)
             except sqlite3.Error:
                 others += self._dir_size(path)
                 continue
             try:
-                pages = {h: (ph, sz, la) for h, ph, sz, la in conn.execute("SELECT phash, prev_hash, size, last_access FROM pages")}
+                try:
+                    pages = {h: (ph, sz, la, None if sg is None else (sg, so, sh))
+                             for h, ph, sz, la, sg, so, sh
+                             in conn.execute("SELECT phash, prev_hash, size, last_access, seg, seg_off, seg_hdrp "
+                                             "FROM pages")}
+                except sqlite3.OperationalError:
+                    # an index written before the location columns: entries can still be taken, but only
+                    # their per-page files can be removed — a segment record of such a directory stays
+                    conn.rollback()
+                    pages = {h: (ph, sz, la, None) for h, ph, sz, la
+                             in conn.execute("SELECT phash, prev_hash, size, last_access FROM pages")}
                 states = {h: (sz, la) for h, sz, la in conn.execute("SELECT phash, size, last_access FROM states")}
             except sqlite3.Error:
                 conn.close()
                 others += self._dir_size(path)
                 continue
-            used = sum(v[1] for v in pages.values()) + sum(v[0] for v in states.values()) + overhead
-            others += used
+            # What a directory holds is what it measures: the same walk _reclaim_root charges the root
+            # budget with, so the two views of the root cannot drift apart (segment records carry their
+            # _ODIO padding here, the index files and the manifest with them)
+            others += self._dir_size(path)
             sibs.append({"path": path, "conn": conn, "pages": pages, "states": states, "dirty": False})
         return sibs, others
 
@@ -736,7 +783,7 @@ class DiskPageCache:
         heap = []
         for i, s in enumerate(sibs):
             children = {h: 0 for h in s["pages"]}
-            for h, (ph, _, _) in s["pages"].items():
+            for h, (ph, _, _, _) in s["pages"].items():
                 if ph is not None and ph in children:
                     children[ph] += 1
             s["children"] = children
@@ -783,8 +830,12 @@ class DiskPageCache:
                 _, i, kind, h = heapq.heappop(heap)
                 s = sibs[i]
                 if kind == "page":
-                    ph, sz, _ = s["pages"].pop(h)
+                    ph, sz, _, loc = s["pages"].pop(h)
                     self._remove_file(os.path.join(s["path"], "pages", h[:1].hex(), h.hex() + ".kv"))
+                    if loc is not None:
+                        # blank the sibling's segment record as our own drops do, so the page does not
+                        # rise again when that directory opens
+                        self._punch_record(os.path.join(s["path"], "segments", f"seg-{loc[0]:06d}.kv"), loc[1])
                     s["conn"].execute("DELETE FROM pages WHERE phash = ?", (h,))
                     self.metrics["pages_reclaimed"] = self.metrics.get("pages_reclaimed", 0) + 1
                     if h in s["states"]:
@@ -1026,7 +1077,8 @@ class DiskPageCache:
                     marks = ",".join("?" * len(chunk))
                     if table == "pages":
                         rows = self._query_conn.execute(
-                            f"SELECT phash, prev_hash, size, last_access FROM pages WHERE phash IN ({marks})", chunk
+                            f"SELECT phash, prev_hash, size, last_access, seg, seg_off, seg_hdrp FROM pages "
+                            f"WHERE phash IN ({marks})", chunk
                         ).fetchall()
                     else:
                         rows = self._query_conn.execute(
@@ -1035,10 +1087,15 @@ class DiskPageCache:
                     with self._lock:
                         for row in rows:
                             if table == "pages":
-                                phash, prev_hash, size, last_access = row
+                                phash, prev_hash, size, last_access, seg, seg_off, seg_hdrp = row
                                 if phash in self.pages:
                                     continue
-                                self.pages[phash] = {"prev_hash": prev_hash, "size": size, "last_access": last_access}
+                                self.pages[phash] = {"prev_hash": prev_hash, "size": size,
+                                                     "last_access": last_access}
+                                if seg is not None and seg_off is not None:
+                                    # the row of the other process carries where its record sits, so the
+                                    # adopted page reads from the segment instead of missing on the old path
+                                    self.page_seg[phash] = (seg, seg_off, seg_hdrp)
                                 self.metrics["pages_adopted"] += 1
                             else:
                                 phash, size, last_access, position = row
@@ -1063,7 +1120,15 @@ class DiskPageCache:
     @property
     def page_file_size(self) -> int:
         """Size of one page file, as write_page reserves it"""
-        return len(PAGE_MAGIC) + _HEADER.size + 256 + PAGE_SIZE * 8 + self.image_size
+        return self.nominal_page_size(PAGE_SIZE * 8)
+
+
+    def nominal_page_size(self, tokens_len: int) -> int:
+        """The budget currency of one page: the bytes write_page reserves and the bytes a store publishes,
+        in the file layout and in the segment store alike. _make_room, room_for and the idle flush's
+        hold-back all price pages at this unit, so reserved and published must agree (a segment record
+        physically spans rec_len bytes of _ODIO-padded blocks — that is layout, not accounting)"""
+        return len(PAGE_MAGIC) + _HEADER.size + 256 + tokens_len + self.image_size
 
 
     def chain_prev(self, phash: bytes):
@@ -1113,7 +1178,7 @@ class DiskPageCache:
             self.metrics["skipped_mm"] += 1
             return False
         tokens_bytes = tokens.contiguous().numpy().tobytes()
-        size = len(PAGE_MAGIC) + _HEADER.size + 256 + len(tokens_bytes) + self.image_size
+        size = self.nominal_page_size(len(tokens_bytes))
         markers = None
         if self.tp_groups:
             # The ranks write straight into the file, so it has to exist before they are told; the dispatch
@@ -1134,7 +1199,8 @@ class DiskPageCache:
                 if markers is not None:
                     self._remove_tmp(tmp)
                 return False
-            self.total_size += size         # reserved; corrected to the file size once written
+            self.total_size += size         # reserved in the nominal currency; the segment store publishes it unchanged,
+                                # the file store corrects it to the written file size (near-identical)
             self.pending_pages.add(phash)
             self._enqueue(("page", phash, prev_hash, tokens_bytes, slot, events, size, markers))
         return True
@@ -1943,7 +2009,8 @@ class DiskPageCache:
             self.total_size += actual - size
             if phash in self.state_candidates:
                 self._ready_states.append(phash)
-        conn.execute("INSERT OR REPLACE INTO pages VALUES (?, ?, ?, ?)", (phash, prev_hash, actual, stamp))
+        conn.execute("INSERT OR REPLACE INTO pages (phash, prev_hash, size, last_access) VALUES (?, ?, ?, ?)",
+                     (phash, prev_hash, actual, stamp))
         self.metrics["page_writes"] += 1
         self.metrics["page_write_bytes"] += actual
 
@@ -2086,11 +2153,9 @@ class DiskPageCache:
             self.metrics["skipped_no_segment"] += 1
             return False
         os.makedirs(self.segments_dir, exist_ok = True)
+        # The file grows with its content (_write_seg_page extends it per record): a pre-allocated empty
+        # tail would inflate _dir_size, and the root budget charges a directory by the bytes it holds
         fd = os.open(self._seg_path(sid), os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_DIRECT, 0o644)
-        try:
-            os.posix_fallocate(fd, 0, _SEG_CAP)
-        except OSError:
-            pass
         self._seg_wfd = fd
         self._seg_w_id = sid
         self._seg_w_off = 0
@@ -2128,19 +2193,23 @@ class DiskPageCache:
         pad_tail = _round_odio(img) - img
         if pad_tail:
             buf.view[hdr_pad + img:rec_len] = b"\0" * pad_tail
-        os.pwritev(self._seg_wfd, [buf.view[:rec_len]], self._seg_w_off)
         off = self._seg_w_off
+        try:
+            os.posix_fallocate(self._seg_wfd, off, rec_len)     # the file grows with its content
+        except OSError:
+            pass                                                # extents are a favour; the write extends too
+        os.pwritev(self._seg_wfd, [buf.view[:rec_len]], off)
         self._seg_w_off += rec_len
         with self._lock:
             self.pending_pages.discard(phash)
             stamp = self._stamp()
-            self.pages[phash] = {"prev_hash": prev_hash, "size": rec_len, "last_access": stamp}
-            self.total_size += rec_len - size
+            self.pages[phash] = {"prev_hash": prev_hash, "size": size, "last_access": stamp}
             self.page_seg[phash] = (self._seg_w_id, off, hdr_pad)
             self.seg_members[self._seg_w_id].add(phash)
             if phash in self.state_candidates:
                 self._ready_states.append(phash)
-        conn.execute("INSERT OR REPLACE INTO pages VALUES (?, ?, ?, ?)", (phash, prev_hash, rec_len, stamp))
+        conn.execute("INSERT OR REPLACE INTO pages (phash, prev_hash, size, last_access, seg, seg_off, seg_hdrp) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?)", (phash, prev_hash, size, stamp, self._seg_w_id, off, hdr_pad))
         self.metrics["page_writes"] += 1
         self.metrics["page_write_bytes"] += rec_len
 
@@ -2190,11 +2259,17 @@ class DiskPageCache:
         return tokens
 
 
-    def _scan_segments(self, conn):
+    def _scan_segments(self) -> dict:
         """At open: index every valid record of the existing segment files (header blocks only, buffered —
-        the images stay out of the page cache because they are read back through O_DIRECT)"""
+        the images stay out of the page cache because they are read back through O_DIRECT). Returns
+        phash -> ((seg, offset, header_pad), prev_hash, nominal size); _reconcile matches the rows against
+        it and does the inserts. A record whose magic was blanked by an eviction or a reclaim is stepped
+        over and stays out of the result (this is what keeps a dropped page from coming back at the next
+        open, without any change to the segment layout)"""
+        records: dict = {}
+        self._seg_complete = set()
         if not os.path.isdir(self.segments_dir):
-            return
+            return records
         for name in sorted(os.listdir(self.segments_dir)):
             if not (name.startswith("seg-") and name.endswith(".kv")):
                 continue
@@ -2210,13 +2285,16 @@ class DiskPageCache:
             except OSError:
                 continue
             if size <= 0:
+                self._remove_file(path)
+                self._seg_complete.add(sid)
                 continue
+            complete = False
             fd = os.open(path, os.O_RDONLY)
             try:
                 off = 0
                 while off + 2 * _ODIO <= size:
                     base = os.pread(fd, len(SEG_MAGIC) + _HEADER.size, off)
-                    if len(base) < len(SEG_MAGIC) + _HEADER.size or base[:len(SEG_MAGIC)] != SEG_MAGIC:
+                    if len(base) < len(SEG_MAGIC) + _HEADER.size:
                         break
                     hlen, tlen = _HEADER.unpack(base[len(SEG_MAGIC):])
                     hdr_pad = _round_odio(len(SEG_MAGIC) + _HEADER.size + hlen + tlen)
@@ -2225,6 +2303,15 @@ class DiskPageCache:
                     rec_len = hdr_pad + _round_odio(self.image_size)
                     if off + rec_len > size:
                         break
+                    if base[:len(SEG_MAGIC)] != SEG_MAGIC:
+                        # A record freed by an eviction or a sibling reclaim keeps its descriptor (its magic
+                        # is blanked in place), so its length is known and the walk steps over it; an
+                        # all-zero block is the unused tail
+                        if hlen == 0:
+                            complete = True
+                            break
+                        off += rec_len
+                        continue
                     blk = os.pread(fd, hdr_pad, off)
                     try:
                         meta = json.loads(blk[len(SEG_MAGIC) + _HEADER.size:
@@ -2234,24 +2321,65 @@ class DiskPageCache:
                     if meta.get("fingerprint") != self.fingerprint:
                         break
                     phash = bytes.fromhex(meta["phash"])
-                    if phash not in self.pages:
-                        prev = bytes.fromhex(meta["prev_hash"]) if meta["prev_hash"] else None
-                        self.pages[phash] = {"prev_hash": prev, "size": rec_len, "last_access": 0}
-                        self.page_seg[phash] = (sid, off, hdr_pad)
-                        members.add(phash)
-                        conn.execute("INSERT OR REPLACE INTO pages VALUES (?, ?, ?, ?)",
-                                     (phash, prev, rec_len, 0))
-                        self.metrics["scanned"] = self.metrics.get("scanned", 0) + 1
+                    prev = bytes.fromhex(meta["prev_hash"]) if meta["prev_hash"] else None
+                    loc = (sid, off, hdr_pad)
+                    members.add(phash)
+                    if phash in records:
+                        stale = self.seg_members.get(records[phash][0][0])
+                        if stale is not None:
+                            stale.discard(phash)
+                    records[phash] = (loc, prev, len(PAGE_MAGIC) + _HEADER.size + 256 + tlen + self.image_size)
+                    self.metrics["scanned"] = self.metrics.get("scanned", 0) + 1
                     off += rec_len
+                else:
+                    complete = True
             finally:
                 os.close(fd)
+            if complete and not members:
+                self._remove_file(path)
+                self.metrics["seg_unlinked"] = self.metrics.get("seg_unlinked", 0) + 1
+                self._seg_complete.add(sid)
+            elif complete:
+                self._seg_complete.add(sid)
         self.seg_next = 0
+        return records
+
+    def _purge_spent_segments(self):
+        """At open, after the mirror settled: a segment every record of which was freed (their magics
+        blanked by evictions or reclaims, none of them read back into the mirror) has nothing left to
+        hold it: unlink it and give the space back"""
+        live: set = set()
+        for loc in self.page_seg.values():
+            live.add(loc[0])
+        for sid in self._seg_complete - live:
+            try:
+                os.unlink(self._seg_path(sid))
+                self.metrics["seg_unlinked"] = self.metrics.get("seg_unlinked", 0) + 1
+            except OSError:
+                pass
+
+
+    @staticmethod
+    def _punch_record(path: str, off: int):
+        """Free one segment record in place: blank its magic. The descriptor bytes stay, so a later scan
+        still knows the record's length and steps over it, but the page it held never comes back. This is
+        the delete of the segment store — the record's bytes stay until the whole segment is unlinked"""
+        try:
+            fd = os.open(path, os.O_WRONLY)
+            try:
+                os.pwrite(fd, b"\x00" * len(SEG_MAGIC), off)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
 
 
     def _seg_forget(self, phash: bytes):
-        """Writer thread: a dropped page releases its record; an emptied sealed segment is unlinked"""
+        """Writer thread: a dropped page releases its record; an emptied sealed segment is unlinked, any
+        other keeps the record's slot but loses the record (punched, so a reopen cannot resurrect it)"""
         dead = None
         rfd = None
+        punch = None
         with self._lock:
             loc = self.page_seg.pop(phash, None)
             if loc is None:
@@ -2265,6 +2393,8 @@ class DiskPageCache:
                     self.seg_seen.discard(sid)
                     dead = sid
                     rfd = self._seg_rfds.pop(sid, None)
+                else:
+                    punch = loc
         if dead is not None:
             if rfd is not None:
                 try:
@@ -2276,6 +2406,8 @@ class DiskPageCache:
                 self.metrics["seg_unlinked"] += 1
             except OSError:
                 pass
+        elif punch is not None:
+            self._punch_record(self._seg_path(punch[0]), punch[1])
 
 
     def _seg_sync(self):

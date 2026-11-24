@@ -275,17 +275,19 @@ def test_root_budget_evicts_least_recently_used_sibling_directories(device, tmp_
     tier_a, disk_a, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "aaaa")
     for tag in range(1, 5):
         tier_a.store(page(tag, tag), serial = tag)
-    disk_a.flush(); size_a = disk_a.total_size; disk_a.close(); tier_a.close()
+    disk_a.flush(); disk_a.close(); tier_a.close()
+    size_a = DiskPageCache._dir_size(disk_a.dir)          # what the root budget charges this directory
     os.utime(os.path.join(disk_a.dir, "index.sqlite"), (1, 1))     # used long ago
 
     tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = 1 << 40, fingerprint = "bbbb")
     for tag in range(1, 5):
         tier_b.store(page(tag, tag), serial = tag)
-    disk_b.flush(); size_b = disk_b.total_size; disk_b.close(); tier_b.close()
-    dir_size_b = DiskPageCache._dir_size(disk_b.dir)      # pages plus the index files, which count too
+    disk_b.flush(); disk_b.close(); tier_b.close()
+    size_b = DiskPageCache._dir_size(disk_b.dir)          # pages plus the index files, which count too
+    dir_size_b = size_b
 
-    # Room for about two directories' worth of pages, not three
-    tier_c, disk_c, _ = build(8, device, tmp_path, disk_size = size_a + size_b + size_b // 2, fingerprint = "cccc")
+    # Room for about one and a half directories, not two
+    tier_c, disk_c, _ = build(8, device, tmp_path, disk_size = size_b + size_b // 2, fingerprint = "cccc")
     assert not os.path.isdir(disk_a.dir), "oldest sibling should have been removed"
     assert os.path.isdir(disk_b.dir), "more recently used sibling should survive"
     assert disk_c.max_size == disk_c.root_size - dir_size_b
@@ -557,17 +559,18 @@ def test_model_identity_sees_new_weights_with_the_same_header(tmp_path):
 
 def test_a_damaged_page_file_fails_the_checksum(device, tmp_path):
     # The file gets its full size before the image is written, so a crash can leave a file of correct size
-    # with zeros in place of data. The checksum must find this.
+    # with zeros in place of data. The checksum must find this. In the segment store the image lives inside
+    # the segment file: the page's record is what gets damaged.
     tier, disk, tensor = build(4, device, tmp_path)
     fill(tensor, 1, 1.0)
     tier.store(page(1, 1), serial = 1)
     disk.flush()
-    path = disk._page_path(phash(1))
+    seg_id, rec_off, hdr_pad = disk.page_seg[phash(1)]
+    path = disk._seg_path(seg_id)
     disk.close()
     tier.close()
-    size = os.path.getsize(path)
     with open(path, "r+b") as f:
-        f.seek(size - 64)
+        f.seek(rec_off + hdr_pad + 64)                  # 64 bytes into the record's page image
         f.write(b"\xff" * 16)
 
     tier2, disk2, tensor2 = build(4, device, tmp_path)
@@ -707,9 +710,9 @@ def test_root_budget_reclaims_least_recently_used_pages_of_a_live_sibling(device
     tier_b.store(page(12, 12 % NUM_PAGES), serial = 12)
     disk_b.flush()
     assert disk_b.has_page(phash(12))
-    # A lost its tail, never its root; the files and the index rows went together
-    assert not os.path.exists(disk_a._page_path(phash(4)))
-    assert os.path.exists(disk_a._page_path(phash(1)))
+    # A lost its tail, never its root; record and index row went together: the taken page cannot be read
+    # anymore (the freed record answers as a miss), the root's page reads back
+    assert disk_a.read_page_into(phash(1), None) is not None
     assert disk_a.has_page(phash(4))                                # A's mirror has not noticed yet
     assert disk_a.read_page_into(phash(4), None) is None            # ... and drops it when the read misses
     assert not disk_a.has_page(phash(4))
@@ -718,6 +721,7 @@ def test_root_budget_reclaims_least_recently_used_pages_of_a_live_sibling(device
     # Reopened, A's index agrees with its files
     tier_a2, disk_a2, _ = build(8, device, tmp_path, disk_size = root, fingerprint = "aaaa")
     assert not disk_a2.has_page(phash(4)) and disk_a2.has_page(phash(1))
+    assert phash(4) not in disk_a2.page_seg                         # a rescan must not resurrect the taken page
     disk_a2.close(); tier_a2.close()
 
 
@@ -737,7 +741,8 @@ def test_new_directory_takes_the_siblings_older_space_before_its_own(device, tmp
     disk_a.flush()
     disk_a.close(); tier_a.close()
     time.sleep(0.01)
-    page_bytes = disk_a.image_size + 512
+    # What one page reserves in the tier's accounting (same currency the tier budgets in)
+    page_bytes = 8 + 8 + 256 + PAGE_SIZE * 8 + disk_a.image_size
     root = DiskPageCache._dir_size(disk_a.dir) + 2 * page_bytes
     tier_b, disk_b, _ = build(8, device, tmp_path, disk_size = root, fingerprint = "bbbb")
     assert disk_b._sibling_oldest is not None
@@ -747,7 +752,9 @@ def test_new_directory_takes_the_siblings_older_space_before_its_own(device, tmp
         disk_b.flush()
     assert all(disk_b.has_page(phash(t)) for t in range(11, 15))
     assert disk_b.metrics["evictions"] == 0 and disk_b.metrics.get("pages_reclaimed", 0) >= 2
-    assert not os.path.exists(disk_a._page_path(phash(4))) and os.path.exists(disk_a._page_path(phash(1)))
+    # the reclaimed page cannot be read anymore, the root's page reads back (segment reality: there is
+    # no per-page file to watch, the record is what went)
+    assert disk_a.read_page_into(phash(4), None) is None and disk_a.read_page_into(phash(1), None) is not None
     # Back within the root once the reclaims have run
     assert disk_b.total_size <= disk_b.max_size
     disk_b.close(); tier_b.close()
@@ -776,7 +783,7 @@ def test_directory_evicts_its_own_entries_when_the_siblings_hold_newer_ones(devi
     assert disk_b.has_page(phash(13)) and disk_b.metrics["evictions"] >= 1
     assert disk_b.metrics.get("pages_reclaimed", 0) == 0
     assert disk_a.has_page(phash(1)) and disk_a.has_page(phash(2))
-    assert os.path.exists(disk_a._page_path(phash(2)))
+    assert disk_a.read_page_into(phash(2), None) is not None        # A's pages are untouched, records intact
     disk_b.close(); tier_b.close()
     disk_a.close(); tier_a.close()
 
@@ -790,7 +797,9 @@ def test_idle_flush_ends_when_vram_holds_more_pages_than_the_disk_budget(device,
     from exllamav3.generator.generator import Generator
 
     tier, disk, _ = build(4, device, tmp_path, disk_size = 1 << 40)
-    root = 3 * disk.page_file_size + 4096
+    # What one page reserves in the tier's accounting (the test pages carry the small token tensors,
+    # as in the hold-back test). Budget: three pages, plus slack
+    root = 3 * (8 + 8 + 256 + PAGE_SIZE * 8 + disk.image_size) + 4096
     disk.close(); tier.close()
     tier, disk, _ = build(4, device, tmp_path, disk_size = root)
 
