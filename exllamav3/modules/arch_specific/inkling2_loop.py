@@ -441,7 +441,7 @@ class InklingConvs(Module):
         for b, slot in enumerate(slots):
             pos = int(positions[b])
             lo = max(0, pos + seqlen - self.sliding_window)
-            cnt = pos - lo
+            cnt = max(0, pos - lo)
             if cnt > 0:
                 idx = (lo + torch.arange(cnt, device = s.device)) % n
                 ks.append(s[slot, idx])
@@ -451,7 +451,7 @@ class InklingConvs(Module):
                 vs.append(st.v_state[slot, :0])
             los.append(lo)
             lens.append(cnt)
-        mlen = max(max(lens), 1)
+        mlen = max(lens)
         def pad(rows):
             if all(r.shape[0] == mlen for r in rows):
                 return torch.stack(rows)
