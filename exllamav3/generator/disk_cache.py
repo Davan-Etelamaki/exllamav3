@@ -160,7 +160,15 @@ def cache_fingerprint(caches: list, canonical: list[dict], image_size: int) -> t
     """(fingerprint, its inputs in clear) for page images in the canonical layout `canonical` (one entry per
     cache tensor: rows, row bytes, dtype, image offset), which does not depend on a tensor-parallel split"""
     parts = {
-        "exllamav3": __version__,
+        # The public release, not the local build tag: the tag is the wheel's git sha, so folding it in
+        # orphans the whole persistent tier on every rebuild. Measured on dot26 2026-11-24: four wheels
+        # in one day => four fingerprint directories (560ab3f36460a993 4.87 GB, 101315e9d7990c07 1.51 GB,
+        # 98d8282055331c63 56.7 MB, the active 1f3fe6018694d0a9 empty), their manifests identical except
+        # this one field, so a cold-boot lookup could never consult a page and promotions/restores/
+        # gated_restores were pinned at zero for the whole day. Page-byte changes still rotate the key
+        # through DISK_CACHE_FORMAT_VERSION (its documented duty, line 114-116), and a different release
+        # still rotates it; the writing build is recorded beside the key below for diagnosis.
+        "exllamav3": __version__.split("+")[0],
         "format": DISK_CACHE_FORMAT_VERSION,
         "page_size": PAGE_SIZE,
         "image_size": image_size,
@@ -183,7 +191,11 @@ def cache_fingerprint(caches: list, canonical: list[dict], image_size: int) -> t
         }
         parts["caches"].append(c)
     text = json.dumps(parts, sort_keys = True)
-    return hashlib.blake2b(text.encode(), digest_size = 16).hexdigest(), parts
+    digest = hashlib.blake2b(text.encode(), digest_size = 16).hexdigest()
+    # Recorded beside the key, never inside it: a stale page under an unchanged key is diagnosable
+    # from the manifest without the key rotating on every build.
+    parts["build"] = __version__
+    return digest, parts
 
 
 def _raw(t: torch.Tensor) -> memoryview:
