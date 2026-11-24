@@ -2620,8 +2620,9 @@ class DiskPageCache:
 
     def prefetch(self, hashes: list, serial: int):
         """Promote the pages of a coming allocation from disk into the CPU tier ahead of time, in prefix order,
-        up to the in-flight bound; the allocation promotes synchronously whatever this did not reach. Pages
-        another process wrote to the directory are adopted first, so they are promoted like any other"""
+        up to the in-flight bound; the allocation starts the promotion itself for whatever this did not reach
+        and consumes it in stream order. Pages another process wrote to the directory are adopted first, so
+        they are promoted like any other"""
         self.adopt(hashes)
         pt = self.pagetable
         for h in hashes:

@@ -1,10 +1,19 @@
 from __future__ import annotations
 import heapq
 import threading
+import numpy as np
 import torch
 from collections import deque
 from ..constants import PAGE_SIZE
+from ..ext import exllamav3_ext as ext
 from ..util.pinned_arena import PinnedArena
+
+# Promotion flag bank: one cache line per slot, as in the CPU MoE handoff's flag words (moe_handoff.h). The
+# reader publishes the slot's promotion sequence in it once the slab holds the page, and a restore that was
+# ordered while the read was still running waits on it as a stream memory operation. 32-bit cells because
+# CUDA's cuStreamWaitValue32 compares them cyclically, which is exact across a wrap.
+FLAG_LINE = 64
+FLAG_CELLS = FLAG_LINE // 4
 
 
 def _align(n: int, a: int) -> int:
@@ -34,8 +43,14 @@ class CPUPageCache:
 
     With a disk tier attached (DiskPageCache) every stored page is also queued for writing from its slot, and
     pages found on disk are promoted into a slot (asynchronously by the enqueue-time prefetch, synchronously by
-    the allocation) and then restored as any other entry; fetch() waits on a promotion still in flight. A slot
-    with a write or a read in flight is passed over by eviction.
+    promote()) and then restored as any other entry. A promotion still in flight is consumed in stream order:
+    the reader publishes the slot's sequence number in a device-addressable flag line when its bytes have
+    landed, and fetch() puts a wait for that line on the current stream before the host-to-device copies, so
+    the request thread keeps walking instead of sitting on the promotion's Event. The flag line has to be
+    page-locked memory for the stream to be able to wait on it at all; where it is not, and on a slot with a part
+    in the tensor-parallel ranks (which lands on a rank-side worker queue this process can only poll through
+    marker files), fetch() falls back to waiting on the Event. A slot with a write or a read in flight is
+    passed over by eviction.
     """
 
     def __init__(
@@ -143,6 +158,8 @@ class CPUPageCache:
             "evictions": 0,     # tier entries dropped to make room
             "promotions": 0,    # pages brought in from the disk tier
             "promotion_failures": 0,
+            "gated_restores": 0,    # restores ordered onto the stream over a promotion still reading
+            "restore_waits": 0,     # of those, the ones settle_restores still had to wait for
         }
 
         # This process's half of every slot: slot i is the slab_size bytes at i * slab_size. Each rank holds
@@ -150,6 +167,31 @@ class CPUPageCache:
         self.arena = None
         if self.segments:
             self.arena = PinnedArena(self.max_slots * self.slab_size, "CPU page cache")
+
+        # Promotion flags: one line per slot, then one line for the wait's abort cell. Written by the reader
+        # thread when the page's bytes are in the slab, read by the stream the restore was ordered onto. A
+        # slot with a part in the ranks is not gated: that part lands on a rank-side worker queue whose
+        # completion this process learns about from marker files, which no stream here can wait on.
+        self.promo_flags = None
+        self.flag_words = None
+        self.flags_dev_ptr = 0
+        self.abort_dev_ptr = 0
+        self.gate_ok = False
+        self._promo_seq = 0
+        self._gated = []   # (phash, entry, apply) of restores ordered while their promotion was reading
+        if self.segments and not self.tp:
+            self.promo_flags = PinnedArena((self.max_slots + 1) * FLAG_LINE, "CPU page cache promotion flags",
+                                           mapped = True)
+            self.flag_words = np.frombuffer(self.promo_flags.map, dtype = np.uint32)
+            self.gate_ok = self.promo_flags.pinned
+            if self.gate_ok:
+                try:
+                    # The host pointer is not a device pointer under WDDM, so take the alias the driver
+                    # hands out for the registered region, as the CPU MoE handoff does for its flags
+                    self.flags_dev_ptr = ext.cuda_host_get_device_pointer(self.promo_flags.ptr)
+                    self.abort_dev_ptr = self.flags_dev_ptr + self.max_slots * FLAG_LINE
+                except Exception:
+                    self.gate_ok = False
 
 
     def attach(self, pagetable):
@@ -349,7 +391,8 @@ class CPUPageCache:
         """
         Start bringing a page from the disk tier into a slot: the entry exists from here on (so the hash is
         found by `in` and by the chain walks) with its promotion event pending until the read completes;
-        fetch() waits on it. Returns the entry, or None if the page is not on disk.
+        fetch() orders the consuming stream behind that completion instead of waiting on it. Returns the
+        entry, or None if the page is not on disk.
         """
         e = self.entries.get(phash)
         if e is not None:
@@ -358,6 +401,7 @@ class CPUPageCache:
         if disk is None or not disk.has_page(phash):
             return None
         slot = self._new_slot(protect)
+        self._promo_seq = (self._promo_seq + 1) & 0xFFFFFFFF
         e = {
             "slot": slot,
             "prev_hash": disk.page_prev_hash(phash),
@@ -366,6 +410,12 @@ class CPUPageCache:
             "pending": threading.Event(),
             "failed": False,
             "from_disk": True,
+            # Sequence the reader publishes in the slot's flag line when the bytes have landed, and the set
+            # of devices whose current stream already waits on it. The line is per slot but only one
+            # promotion occupies it at a time (a busy slot is passed over by eviction), so a rising sequence
+            # cannot be confused with an older one.
+            "seq": self._promo_seq,
+            "gated": set(),
         }
         self.entries[phash] = e
 
@@ -374,6 +424,11 @@ class CPUPageCache:
                 e["failed"] = True
             else:
                 e["tokens"] = tokens
+            # Publish the bytes, then the flag that releases the waits on them. A failed read publishes too:
+            # whatever the reader left in the slab is then copied to the pages that were gated on it, and
+            # settle_restores leaves those pages to prefill instead of counting them as cached.
+            if self.gate_ok:
+                self.flag_words[slot * FLAG_CELLS] = e["seq"]
             e["pending"].set()
 
         # The slot's previous tenant may still have copies in flight on the streams (a restore of it enqueued
@@ -385,7 +440,8 @@ class CPUPageCache:
 
     def promote(self, phash: bytes, serial: int, protect: set | None = None) -> dict | None:
         """Bring a page from the disk tier into a slot and wait for it; None if it is not on disk or the file
-        turned out unreadable"""
+        turned out unreadable. The synchronous form of a promotion: an allocation that would rather keep
+        walking calls begin_promote and lets fetch() order the restore onto the stream."""
         e = self.begin_promote(phash, serial, protect)
         if e is None:
             return None
@@ -404,21 +460,52 @@ class CPUPageCache:
         self.metrics["promotion_failures"] += 1
 
 
-    def fetch(self, phash: bytes, page_index: int, serial: int) -> dict | None:
+    def fetch(self, phash: bytes, page_index: int, serial: int, apply = None) -> dict | None:
         """
         Copy a stored page back into the GPU cache at page_index (host-to-device, async on the current stream).
         The entry remains in the tier; the restored copy may well be evicted again before this one goes stale.
         Returns the entry so the caller can restore page metadata (token IDs), or None when the entry was a
         promotion from disk that failed (the page is then left to prefill).
+
+        A promotion still reading is not waited for: the copies go onto the stream behind a wait on the
+        slot's promotion flag, which is what makes them read the slab only after the reader has finished
+        writing it. Nothing on that stream runs before them, so the walk keeps issuing the rest of the
+        allocation while the disk is still busy. Such a restore has no page metadata yet (the token ids come
+        with the read), so `apply` is not run here but queued for settle_restores(), which the allocation walk
+        calls at its end. Without `apply`, the caller attaches the metadata itself and the gated restore is
+        simply ordered onto the stream.
         """
         e = self.entries[phash]
         pending = e.get("pending")
-        if pending is not None:
-            pending.wait()
-            if e.get("failed"):
-                self._drop_failed(phash, e)
-                return None
+        if pending is not None and not pending.is_set():
+            if not self.gate_ok:
+                # No device-addressable flag line to order the copies behind (pageable host memory), or a
+                # slot whose completion is decided in the ranks: wait for the read here
+                pending.wait()
+                if e.get("failed"):
+                    self._drop_failed(phash, e)
+                    return None
+            else:
+                e["access_serial"] = serial
+                self._gate_stream(e)
+                self._issue_restore(e, page_index)
+                self.metrics["gated_restores"] += 1
+                if apply is not None:
+                    self._gated.append((phash, e, apply))
+                return e
+        elif pending is not None and e.get("failed"):
+            self._drop_failed(phash, e)
+            return None
         e["access_serial"] = serial
+        self._issue_restore(e, page_index)
+        if apply is not None:
+            apply(e)
+        return e
+
+
+    def _issue_restore(self, e: dict, page_index: int):
+        """Enqueue one slot's slab onto the cache page, then record the stream events the slot's next tenant
+        has to wait for before it writes the slab again"""
         for v, (t, _, _, _) in zip(self.slot_views[e["slot"]] if self.segments else (), self.segments):
             t[page_index].copy_(v, non_blocking = True)
         for m, ids in self.tp_groups:
@@ -426,7 +513,47 @@ class CPUPageCache:
         if self.disk_tier is not None:
             self.slot_events[e["slot"]] = self._copy_events()
         self.metrics["restores"] += 1
-        return e
+
+
+    def _gate_stream(self, e: dict):
+        """
+        Order the current stream of every device the slot's segments sit on behind the promotion's flag line.
+        This is the same stream memory operation the CPU MoE handoff waits on, with its spin-kernel fallback
+        inside the call: no host synchronization, no query, nothing that a stream capture could trip over.
+        Issued once per device per promotion, because everything the walk submits later on that stream is
+        already behind the first one.
+        """
+        line = e["slot"] * FLAG_LINE
+        seq = e["seq"]
+        for dev in self._devices:
+            if dev.index in e["gated"]:
+                continue
+            with torch.cuda.device(dev):
+                ext.exl3_moe_flag_wait(self.flags_dev_ptr + line, seq, self.abort_dev_ptr)
+            e["gated"].add(dev.index)
+
+
+    def settle_restores(self):
+        """
+        Run the metadata step of the restores that fetch() ordered onto the stream while their promotion was
+        still reading, and drop the entries whose file turned out unreadable (only the checksum over the
+        whole image can tell that, which is why the walk could not know it earlier). Call this once at the
+        end of an allocation walk, before its pages are counted as cached: it is the one point where waiting
+        for a read is still honest, and it costs only the tail of a read that had the whole walk to overlap.
+        A page whose promotion failed keeps kv_position 0, so prefill writes it as if the tier had missed.
+        """
+        if not self._gated:
+            return
+        for phash, e, apply in self._gated:
+            pending = e.get("pending")
+            if pending is not None and not pending.is_set():
+                self.metrics["restore_waits"] += 1
+                pending.wait()
+            if e.get("failed"):
+                self._drop_failed(phash, e)
+            else:
+                apply(e)
+        self._gated.clear()
 
     def close(self):
         """
@@ -437,6 +564,18 @@ class CPUPageCache:
         if self.arena is not None:
             self.arena.close()
             self.arena = None
+        if self.promo_flags is not None:
+            # Release any stream still waiting on a promotion this tier is dropping, so the unregister
+            # sync below cannot be left waiting on a read nobody will finish
+            for e in self.entries.values():
+                pending = e.get("pending")
+                if pending is not None and not pending.is_set():
+                    self.flag_words[e["slot"] * FLAG_CELLS] = e["seq"]
+            self.flag_words = None
+            self.promo_flags.close()
+            self.promo_flags = None
+        self.gate_ok = False
+        self._gated.clear()
         self.segments = []
         self.entries = {}
         self.free_slots.clear()

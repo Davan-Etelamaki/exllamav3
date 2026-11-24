@@ -619,22 +619,34 @@ class PageTable:
                     tier = self.cpu_tier
                     if tier is not None and (restore_limit is None or lp < restore_limit):
                         entry = None
-                        if h in tier:
-                            entry = tier.fetch(h, op.page_index, self.access_serial)
-                        elif tier.disk_tier is not None and tier.disk_tier.has_page(h):
-                            # On disk only: promote into a slot (waiting for the read) and restore from there
-                            if tier.promote(h, self.access_serial, protected_hashes) is not None:
-                                entry = tier.fetch(h, op.page_index, self.access_serial)
-                        if entry is not None:
-                            op.sequence.copy_(entry["tokens"])
-                            op.prev_hash = page_hashes[lp - 1] if lp > 0 else None
-                            op.kv_position = PAGE_SIZE
+
+                        def restore_applied(entry, page = op, prev_hash = page_hashes[lp - 1] if lp > 0 else None):
+                            # What a restore does to the page once its bytes are ordered into the stream:
+                            # right away for a slot whose slab is complete, at the end of the walk for one
+                            # still being read, whose token ids arrive with the read
+                            page.sequence.copy_(entry["tokens"])
+                            page.prev_hash = prev_hash
+                            page.kv_position = PAGE_SIZE
                             self.metrics["alloc_tier_pages"] += 1
                             # A promotion is attributed to the disk the first time it is restored, whether
                             # the prefetch or this allocation brought it in; from then on it is a tier entry
                             if entry.pop("from_disk", False):
                                 self.metrics["alloc_disk_pages"] += 1
+
+                        if h in tier:
+                            entry = tier.fetch(h, op.page_index, self.access_serial, apply = restore_applied)
+                        elif tier.disk_tier is not None and tier.disk_tier.has_page(h):
+                            # On disk only: start the promotion and restore from its slot. The walk does not
+                            # sit on the read: fetch() puts the copy behind it on the stream and the settle
+                            # below picks up whatever the disk did not finish in time
+                            if tier.begin_promote(h, self.access_serial, protected_hashes) is not None:
+                                entry = tier.fetch(h, op.page_index, self.access_serial, apply = restore_applied)
                     allocated_pages.append(op)
+
+        # Promotions that were still reading when the walk asked for their pages were not waited for; their
+        # pages get their metadata here, or stay uncached and are prefilled if the file proved unreadable
+        if self.cpu_tier is not None:
+            self.cpu_tier.settle_restores()
 
         # Allocate unique pages
         prev = allocated_pages[-1] if allocated_pages else None

@@ -13,6 +13,7 @@ slot size and something to copy. The fingerprint is overridden so no model is ne
 import errno
 import os
 import shutil
+import threading
 import time
 from types import SimpleNamespace
 
@@ -20,6 +21,7 @@ import pytest
 import torch
 
 from exllamav3.cache.recurrent import host_pool
+from exllamav3.generator import cpu_cache
 from exllamav3.generator.cpu_cache import CPUPageCache
 from exllamav3.generator.disk_cache import DiskPageCache
 from exllamav3.tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
@@ -76,7 +78,7 @@ def test_pages_round_trip_through_a_fresh_tier(device, tmp_path):
     tier2.close()
 
 
-def test_prefetch_promotes_asynchronously_and_fetch_waits(device, tmp_path):
+def test_prefetch_promotes_asynchronously_and_fetch_orders_the_restore(device, tmp_path):
     tier, disk, tensor = build(8, device, tmp_path)
     for tag in range(1, 6):
         fill(tensor, tag, float(tag))
@@ -88,18 +90,191 @@ def test_prefetch_promotes_asynchronously_and_fetch_waits(device, tmp_path):
     tier2, disk2, tensor2 = build(8, device, tmp_path)
     disk2.prefetch([phash(t) for t in range(1, 6)], serial = 1)
     # Entries exist from the moment the read is queued, pending or not; the prefetch stops at its in-flight
-    # bound and the allocation promotes the rest itself
+    # bound and the allocation starts the promotion itself for the rest
     queued = sum(phash(t) in tier2 for t in range(1, 6))
     assert 2 <= queued <= 5
     for tag in range(1, 6):
         if phash(tag) not in tier2:
             assert tier2.promote(phash(tag), serial = 20) is not None
         e = tier2.fetch(phash(tag), 0, serial = 20)
-        assert e is not None and e["pending"].is_set()
-        torch.cuda.synchronize()
-        assert torch.all(tensor2[0] == float(tag))
-    disk2.close()
+        assert e is not None and (e["pending"].is_set() or e["gated"]), \
+            "fetch neither waited for the promotion nor ordered the stream behind it"
+    disk2.close()     # the reader pool drains whatever was still reading
+    torch.cuda.synchronize()
+    assert torch.all(tensor2[0] == 5.0), "a restore ordered over a running promotion did not deliver its page"
     tier2.close()
+
+
+def park_readers(disk, held):
+    """Leave the reader pool's tasks unrun, so a promotion provably has not finished while the tier is asked
+    to restore it. The parked tasks are collected in `held` and run by the test when it wants them to land"""
+    disk._readers.submit = held.append
+
+
+def timed_release(held, after = 1.0):
+    """Run the parked tasks from a timer thread. Only a guard: it keeps a tier that insists on waiting for a
+    parked read from hanging the suite, and the test cancels it as soon as the read is released by hand"""
+    timer = threading.Timer(after, lambda: [task() for task in list(held)])
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def spy_on_event_waits(monkeypatch):
+    """Replace the Event class the CPU tier builds promotions with, and record every wait entered on it"""
+    waits = []
+    class SpyEvent(threading.Event):
+        def wait(self, timeout = None):
+            waits.append(self)
+            return super().wait(timeout)
+    monkeypatch.setattr(cpu_cache, "threading", SimpleNamespace(Event = SpyEvent))
+    return waits
+
+
+def test_a_restore_of_a_still_reading_promotion_does_not_block_the_request_thread(device, tmp_path, monkeypatch):
+    # The allocation walk must not sit on a promotion's Event: the copy goes onto the stream behind the
+    # reader's flag instead. The reader pool is parked here, so the read provably has not finished at the
+    # moment fetch() returns, and no wait on the promotion's Event may have been entered.
+    tier, disk, tensor = build(8, device, tmp_path)
+    fill(tensor, 1, 1.0)
+    fill(tensor, 2, 2.0)
+    tier.store(page(1, 1), serial = 1)
+    tier.store(page(2, 2), serial = 2)
+    disk.flush()
+    tier.close(); disk.close()
+
+    tier2, disk2, tensor2 = build(8, device, tmp_path)
+    held = []
+    park_readers(disk2, held)
+    waits = spy_on_event_waits(monkeypatch)
+
+    tier2.begin_promote(phash(1), serial = 10)
+    assert held and not tier2.entries[phash(1)]["pending"].is_set()
+    timer = timed_release(held)         # a tier that insists on waiting returns here after 1 s, not never
+    e = tier2.fetch(phash(1), 0, serial = 11)
+    timer.cancel()
+    assert not waits, f"fetch() entered {len(waits)} Event.wait() on a parked read instead of gating the stream"
+    assert tier2.gate_ok, "promotion flags are not device-addressable, so the gated path is not in use"
+    assert e is not None and e["gated"] and not e["pending"].is_set(), "the promotion was still reading"
+    assert tier2.metrics["gated_restores"] == 1
+
+    for task in list(held):
+        task()                          # the read lands and publishes the slot's flag line
+    torch.cuda.synchronize()
+    assert torch.all(tensor2[0] == 1.0), "the bytes the stream waited for did not arrive in the page"
+
+    # Its metadata still arrives late, at the walk's settle step: the token ids come with the read
+    applied = []
+    tier2.begin_promote(phash(2), serial = 16)
+    timer = timed_release(held)
+    e2 = tier2.fetch(phash(2), 1, serial = 17, apply = applied.append)
+    timer.cancel()
+    assert e2["gated"] and not applied and len(tier2._gated) == 1, "the metadata step ran before the read"
+    for task in list(held):
+        task()
+    tier2.settle_restores()
+    assert applied == [e2] and not tier2._gated
+    assert torch.equal(e2["tokens"], torch.full((PAGE_SIZE,), 2, dtype = torch.long))
+    torch.cuda.synchronize()
+    assert torch.all(tensor2[1] == 2.0)
+    assert tier2.metrics["restore_waits"] == 0, "the settle step waited although the reads had landed"
+    disk2.close(); tier2.close()
+
+
+def test_a_gated_restore_leaves_the_slot_stream_bookkeeping(device, tmp_path, monkeypatch):
+    # Ordering a restore over a running promotion must not skip the slot's copy events: they are what the
+    # next tenant of that slot waits on before it writes the slab again (see submit_promotion's wait_events)
+    tier, disk, tensor = build(8, device, tmp_path)
+    fill(tensor, 1, 1.0)
+    fill(tensor, 2, 2.0)
+    tier.store(page(1, 1), serial = 1)
+    tier.store(page(2, 2), serial = 2)
+    disk.flush()
+    tier.close(); disk.close()
+
+    tier2, disk2, tensor2 = build(8, device, tmp_path)
+    assert tier2.gate_ok
+    held = []
+    park_readers(disk2, held)
+
+    tier2.begin_promote(phash(1), serial = 10)
+    timer = timed_release(held)
+    e = tier2.fetch(phash(1), 0, serial = 11)
+    timer.cancel()
+    assert e["gated"]
+    slot = e["slot"]
+    assert tier2.slot_events.get(slot), "the gated restore recorded no stream events for its slot"
+    assert all(isinstance(ev, torch.cuda.Event) for ev in tier2.slot_events[slot])
+
+    for task in list(held):
+        task()
+    torch.cuda.synchronize()
+    assert torch.all(tensor2[0] == 1.0)
+
+    # The next promotion of this slot has to be handed exactly those events
+    handed = []
+    real_submit = disk2.submit_promotion
+    def spy(phash_, slot_, done, wait_events = ()):
+        handed.append(wait_events)
+        return real_submit(phash_, slot_, done, wait_events)
+    monkeypatch.setattr(disk2, "submit_promotion", spy)
+    tier2.free_slots.append(slot)
+    tier2.begin_promote(phash(2), serial = 12)
+    assert handed and handed[0], "the slot's next promotion was not handed the restore's stream events"
+    assert all(isinstance(ev, torch.cuda.Event) for ev in handed[0])
+    disk2.close(); tier2.close()
+
+
+def test_repeated_fetch_of_a_pending_promotion_gates_once(device, tmp_path, monkeypatch):
+    # Two sequences sharing one cached page fetch it twice while its promotion is still reading. Each needs
+    # its own copy, but the stream wait is per slot and stream, not per fetch: repeating it would queue a
+    # wait per page, and forgetting it altogether would let the second copy race the reader.
+    tier, disk, tensor = build(8, device, tmp_path)
+    fill(tensor, 1, 1.0)
+    fill(tensor, 2, 2.0)
+    tier.store(page(1, 1), serial = 1)
+    tier.store(page(2, 2), serial = 2)
+    disk.flush()
+    tier.close(); disk.close()
+
+    tier2, disk2, tensor2 = build(8, device, tmp_path)
+    assert tier2.gate_ok
+    held = []
+    park_readers(disk2, held)
+    waits = spy_on_event_waits(monkeypatch)
+    gated = []
+    real_wait = cpu_cache.ext.exl3_moe_flag_wait
+    def spy(flag, value, abort):
+        gated.append((flag, value))
+        return real_wait(flag, value, abort)
+    monkeypatch.setattr(cpu_cache.ext, "exl3_moe_flag_wait", spy)
+
+    tier2.begin_promote(phash(1), serial = 10)
+    timer = timed_release(held)
+    first = tier2.fetch(phash(1), 0, serial = 11)
+    second = tier2.fetch(phash(1), 1, serial = 12)
+    timer.cancel()
+    assert first is second and second["gated"]
+    assert len(gated) == 1, f"one pending promotion was gated {len(gated)} times"
+    assert not waits and tier2.metrics["gated_restores"] == 2 and tier2.metrics["restores"] == 2
+    assert len(tier2.slot_events[first["slot"]]) == len(tier2._devices)
+
+    for task in list(held):
+        task()
+    torch.cuda.synchronize()
+    assert torch.all(tensor2[0] == 1.0) and torch.all(tensor2[1] == 1.0)
+
+    # A second promotion waits on its own line, with a higher sequence
+    tier2.begin_promote(phash(2), serial = 13)
+    timer = timed_release(held)
+    tier2.fetch(phash(2), 2, serial = 14)
+    timer.cancel()
+    assert len(gated) == 2 and gated[1][0] != gated[0][0] and gated[1][1] > gated[0][1]
+    for task in list(held):
+        task()                    # let the last promotion land before the tier tears down
+    torch.cuda.synchronize()
+    assert torch.all(tensor2[2] == 2.0), "the second gated restore did not deliver its page"
+    disk2.close(); tier2.close()
 
 
 def test_a_slot_with_a_queued_write_is_not_recycled(device, tmp_path):
@@ -252,7 +427,9 @@ def test_pages_and_checkpoints_of_another_process_are_adopted_without_a_reopen(d
         if phash(tag) not in tier_b:
             assert tier_b.promote(phash(tag), serial = 20) is not None
         e = tier_b.fetch(phash(tag), 0, serial = 20)
-        assert e is not None and e["pending"].is_set()
+        assert e is not None and (e["pending"].is_set() or e["gated"]), \
+            "fetch neither waited for the promotion nor ordered the stream behind it"
+        e["pending"].wait()     # what the allocation walk's settle step does before it counts the page
         torch.cuda.synchronize()
         assert torch.all(tensor_b[0] == float(tag))
 
