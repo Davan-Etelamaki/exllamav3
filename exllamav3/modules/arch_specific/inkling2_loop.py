@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from ...cache import Cache
 from ...cache.recurrent import host_copy
 from ...model.config import Config
-from ...util.tensor import get_for_device
+from ...util.tensor import get_for_device, host_values, stage_host
 from ...constants import PAGE_SIZE
 from .. import Module, Linear, RMSNorm
 
@@ -720,8 +720,12 @@ class InklingAttention(Module):
         if position_ids is not None:
             return position_ids.to(torch.long)
         positions = get_for_device(params, "positions", self.device, None)
-        base = positions.long() if positions is not None else torch.tensor(
-            params.get("position", 0), device = self.device).expand(b)
+        # The fallback spells a scalar position as a device tensor. stage_host rather than
+        # torch.tensor(..., device=...): inside a capture torch refuses a copy whose host side is
+        # pageable, which is what generator._fwd_unsafe's "pinned-memory error" boot note was.
+        base = positions.long() if positions is not None else stage_host(
+            [params.get("position", 0)], self.device, ("inkling2", "position"),
+            torch.long).expand(b)
         return base[:, None] + torch.arange(t, device = self.device)[None, :]
 
     def _gather_global(self, cache, cache_seqlens, block_table, inst, kh, vh, t, params):
@@ -970,15 +974,29 @@ class InklingMoE(Module):
         sel_flat = sel.reshape(-1)
         w_flat = w.reshape(-1)
         out = torch.zeros((b * t, h), dtype = torch.float, device = x.device)
-        sel_cpu = sel_flat.tolist()
+        # Expert dispatch happens in Python, so the selection has to reach the host and the chosen
+        # row indices have to go back. Neither may be a pageable copy: while the whole-forward CUDA
+        # graph records, torch refuses a CPU<->CUDA copy whose host side is not pinned, which is how
+        # every capture of this model died (dot26 journal 2026-11-24 03:34:47). host_values /
+        # stage_host take both directions through a pinned slot - synchronous and byte-identical
+        # when eager, recorded and re-readable when capturing. Routing stays the capture round's
+        # (census deferred item A: device routing tables + a grouped expert tier own that next).
+        sel_cpu = host_values(sel_flat, ("inkling2", "moe_sel")).tolist()
         order = sorted(range(len(sel_cpu)), key = lambda i: sel_cpu[i])
         n = 0
+        gi = 0
         while n < len(order):
             e = sel_cpu[order[n]]
             m = n
             while m < len(order) and sel_cpu[order[m]] == e:
                 m += 1
-            entries = torch.tensor(order[n:m], device = x.device, dtype = torch.long)
+            # One pinned slot per group: while capturing, every group's upload reads its own
+            # address, so the recorded graph cannot have two launches sharing one source that the
+            # next group's fill overwrites. Slot index is stable across rounds, which is what makes
+            # the recorded addresses meaningful on replay.
+            entries = stage_host(order[n:m], x.device, ("inkling2", "moe_entries", gi),
+                                 torch.long)
+            gi += 1
             tokens = torch.div(entries, self.top_k, rounding_mode = "floor")
             n = m
             xs = flat.index_select(0, tokens)

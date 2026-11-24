@@ -70,12 +70,14 @@ ALLOWED = {
     # when the lengths really are device-resident. That caller is outside a capture today
     # (prefill and the draft verifier hand device tensors and never graph-capture).
     "_host_lens": {"cpu": 1},
-    # Deferred item A: router selection is computed ON DEVICE, so this tolist() is a genuine
-    # D2H sync in the capture region and cannot be replaced without changing the algorithm -
-    # per-expert weights are separate Linear modules, so a Python expert index (not a device
-    # value) must pick them. Needs the device-side routing tables + a grouped/stacked-weight
-    # expert tier (see module docstring of block_sparse_mlp._RoutingGraph for the capture-safe
-    # prelude this should reuse).
+    # Deferred item A: router selection is computed ON DEVICE, so the values must cross to the host.
+    # They now cross through a pinned snapshot (util.tensor.host_values) rather than a pageable
+    # .cpu(), because a capture refuses the pageable copy outright - that refusal was blocker #3
+    # (see test_capture_region_host_uploads.py). The copy is legal; the decision is still made in
+    # Python from a value the capture cannot have yet, so a replay re-runs the capture round's
+    # expert sets. Making that faithful needs the device-side routing tables + a grouped/stacked-
+    # weight expert tier (see module docstring of block_sparse_mlp._RoutingGraph for the
+    # capture-safe prelude this should reuse) - still deferred, still item A.
     "InklingMoE.forward": {"tolist": 1},
     "InklingLayer.forward": {"int": 2, "float": 2},      # INKLING_DEBUG print (item D)
     "InklingLayer.forward._s": {"float": 2},             # INKLING_DEBUG readback (item D)

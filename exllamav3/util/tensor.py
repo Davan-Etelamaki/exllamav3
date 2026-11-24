@@ -226,6 +226,87 @@ def get_for_device(
     return dv
 
 
+# ---------------------------------------------------------------------------------------------
+# Pinned staging: the host<->device copies a CUDA graph capture accepts
+# ---------------------------------------------------------------------------------------------
+
+_pin_stages: dict = {}
+_PIN_STAGE_MIN = 64
+
+
+def _pinned_empty(numel: int, dtype: torch.dtype) -> torch.Tensor:
+    """Allocate one pinned host buffer. Isolated in a function so a machine without a usable CUDA
+    context (tests/graph/) can stand in for the allocator instead of dropping the claim."""
+    with torch.inference_mode(False):
+        return torch.empty((numel,), dtype = dtype, pin_memory = True)
+
+
+def pinned_stage(key, numel: int, dtype: torch.dtype) -> torch.Tensor:
+    """Reusable pinned host buffer for `key`, at least `numel` elements.
+
+    The same contract as Generator._staging and Embedding._pinned_staging: the address is stable
+    for the life of the process, so a graph that recorded a copy involving this buffer re-reads
+    current values on every replay. First use is always an eager round (fwd_graph.py runs two
+    warmups before it captures), so the pinned allocation itself never happens inside a capture.
+    """
+    buf = _pin_stages.get(key)
+    if buf is None or buf.numel() < numel or buf.dtype != dtype:
+        # Cap is well above any real key count (one per call site and per expert group of one MoE
+        # forward) so the dict never clears while a capture is recording, which would mean
+        # cudaHostAlloc inside the capture. Entries are small: MIN slots, decode-sized payloads.
+        if len(_pin_stages) > 512:
+            _pin_stages.clear()
+        buf = _pinned_empty(max(numel, _PIN_STAGE_MIN), dtype)
+        _pin_stages[key] = buf
+    return buf
+
+
+def host_values(t: torch.Tensor, key) -> torch.Tensor:
+    """Values of a 1-D tensor, readable on the host, without a pageable copy.
+
+    Outside a capture this is the blocking .cpu() (or, for a tensor already on the host, the tensor
+    itself) that the call site did before, so the caller reads exactly the values it read before.
+    Inside a capture the values go into a pinned slot with a non-blocking copy: a pageable
+    destination raises there ("Cannot copy between CPU and CUDA tensors during CUDA graph capture
+    unless the CPU tensor is pinned") and a blocking copy would synchronize the recording stream.
+    A capture therefore reads the slot's previous contents - the value is frozen for every replay.
+    That is inherent, not a shortcut: a captured region cannot branch on a value it has not
+    produced yet, which is why the device-side routing tier (tests/graph/ census, deferred item A)
+    stays the durable fix for choosing experts inside a graph.
+    """
+    if t.device.type == "cpu":
+        return t
+    if not _capturing():
+        return t.cpu()
+    view = pinned_stage(key, t.numel(), t.dtype)[:t.numel()]
+    view.copy_(t, non_blocking = True)
+    return view
+
+
+def stage_host(values, device, key, dtype: torch.dtype = torch.long) -> torch.Tensor:
+    """Host values onto DEVICE, replacing `torch.tensor(values, device = ...)` at call sites that
+    can run inside a capture.
+
+    That factory builds a PAGEABLE host temporary and copies it up, which is the copy the driver
+    refuses while a stream is capturing. Outside a capture the behaviour is unchanged: a fresh
+    temporary, uploaded non-blocking (CUDA stages a non-blocking copy from pageable memory before
+    the call returns, so the temporary may die immediately - see device_copy.host_to_device).
+    While capturing, the values are written into the pinned slot for `key` and the upload reads
+    that address, which is stable and re-readable across replays.
+    """
+    if isinstance(values, torch.Tensor):
+        source = values if values.dtype == dtype else values.to(dtype)
+        numel = source.numel()
+    else:
+        source = torch.tensor(list(values), dtype = dtype)   # host->host: never a CUDA operand
+        numel = source.numel()
+    if not _capturing():
+        return host_to_device(source, device)
+    view = pinned_stage(key, numel, dtype)[:numel]
+    view.copy_(source.reshape(-1))
+    return host_to_device(view, device)
+
+
 buffered_aranges = {}
 def buffered_arange(r: int, device: torch.device):
     if r not in buffered_aranges:

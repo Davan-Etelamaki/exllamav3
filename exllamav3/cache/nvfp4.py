@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 from ..constants import PAGE_SIZE
+from ..util.tensor import host_values
 from .cache import CacheLayer
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -245,7 +246,13 @@ class CacheLayer_nvfp4(CacheLayer):
         O(used) work and allocation instead of O(pool); the resulting (k_stage, v_stage, bt_stage)
         triple has the pool layout the generic-tier backends already understand."""
         bsz = block_table.shape[0]
-        nblocks = [max(1, (int(cache_seqlens[b]) + extra + PAGE_SIZE - 1) // PAGE_SIZE) for b in range(bsz)]
+        # The page counts are Python row counts, so they must reach the host without a pageable
+        # copy: inside a CUDA graph capture torch refuses a CPU<->CUDA copy whose host side is not
+        # pinned, and the inkling2 global gather calls this from inside that region. host_values
+        # snapshots through a pinned slot - blocking and exact when eager, recorded when capturing.
+        host_lens = host_values(cache_seqlens, ("nvfp4", "stage_lens"))
+        nblocks = [max(1, (int(host_lens[b]) + extra + PAGE_SIZE - 1) // PAGE_SIZE)
+                   for b in range(bsz)]
         total = sum(nblocks)
         h, half_d = self.shape4[2], self.shape4[3]
         ks = torch.empty((total, PAGE_SIZE, h, half_d * 2), dtype = torch.float16, device = self.k.device)
