@@ -37,6 +37,49 @@ def make_key(rows, ids_width, use_offsets, has_draft, state_ids, max_pages_batch
     return (rows, ids_width, use_offsets, has_draft, state_ids, max_pages_batch, max_seq_len)
 
 
+def unsafe_types():
+    """Modules whose forward carries graph-managed internal state, so an outer whole-forward
+    capture freezes work the module redoes every round. Lives here (not inline in generator.py)
+    so the eligibility rule has one home and one fence.
+
+    - BlockSparseMLP / BlockSparseMLP_CPU: under an outer capture the fused run_bszN tier declines
+      its own graph and the eager fallback tiers mix a host sync (expert_count.tolist()) with
+      dynamic-shape ops (nonzero) whose replay semantics are unfenced.
+    - GatedDeltaNet: histpool launches its own captured graphs and alternates slots on host-side
+      logic (gated_delta_net.h:196,202) that capture would freeze.
+    - InklingAttention: _gather_global sizes the gathered K/V from HOST-side sequence extents
+      (inkling2_loop.py:735-756: _host_lens -> lens -> maxlen -> torch.zeros shapes) while the NVFP4
+      staging pool counts pages from the DEVICE cache_seqlens. The two length sources disagree once a
+      round's visible extent exceeds the staged pool: dot26 2026-11-24 17:38:59 failed at
+      inkling2_loop.py:756 with "The expanded size of the tensor (10880) must match the existing
+      size (256) at non-singleton dimension 0. Target sizes: [10880, 8, 128]. Tensor sizes:
+      [256, 8, 128]". Even where a round fits, maxlen moves with context, so every decode step is a
+      new capture: whole-forward replay cannot pay for this path until the gather is padded to a
+      fixed ceiling and driven from device lengths.
+    - InklingMoE: routed-expert host syncs in the inkling wrapper, carried on BlockSparseMLP's
+      measured grounds (not yet separately measured on this pack).
+    """
+    from exllamav3.modules.arch_specific.inkling2_loop import InklingAttention, InklingMoE
+    from exllamav3.modules.block_sparse_mlp import BlockSparseMLP
+    from exllamav3.modules.block_sparse_mlp_cpu import BlockSparseMLP_CPU
+    from exllamav3.modules.gated_delta_net import GatedDeltaNet
+    return (BlockSparseMLP, BlockSparseMLP_CPU, GatedDeltaNet, InklingAttention, InklingMoE)
+
+
+def first_unsafe_module(fwd_modules):
+    # Graph-managed state lives INSIDE a TransformerBlock (qwen3_5 hands GatedDeltaNet to
+    # TransformerBlock as block.attn, the block registers it, fwd_modules lists the blocks), so a
+    # flat isinstance test on the block never sees it. Module.__iter__ (module.py:53) yields a
+    # module plus its registered submodules, so iterating the block reaches the layer. First match
+    # short-circuits the walk.
+    types = unsafe_types()
+    from exllamav3.modules.module import Module
+    return next(
+        (sub for m, _, _ in fwd_modules if isinstance(m, Module)
+         for sub in m if isinstance(sub, types)), None,
+    )
+
+
 class ForwardGraphRunner:
     def __init__(self):
         self.enabled = _ENABLED
