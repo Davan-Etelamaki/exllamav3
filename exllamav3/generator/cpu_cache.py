@@ -1,6 +1,8 @@
 from __future__ import annotations
 import heapq
+import logging
 import threading
+import time
 import numpy as np
 import torch
 from collections import deque
@@ -14,6 +16,8 @@ from ..util.pinned_arena import PinnedArena
 # CUDA's cuStreamWaitValue32 compares them cyclically, which is exact across a wrap.
 FLAG_LINE = 64
 FLAG_CELLS = FLAG_LINE // 4
+
+logger = logging.getLogger(__name__)
 
 
 def _align(n: int, a: int) -> int:
@@ -161,6 +165,9 @@ class CPUPageCache:
             "gated_restores": 0,    # restores ordered onto the stream over a promotion still reading
             "restore_waits": 0,     # of those, the ones settle_restores still had to wait for
         }
+        # [CACHE] witness state: the counter snapshot and the wall clock of the last emitted line
+        self._rs_last = dict(self.metrics)
+        self._rs_ts = 0.0
 
         # This process's half of every slot: slot i is the slab_size bytes at i * slab_size. Each rank holds
         # the same for its own shard, so there is nothing to allocate here for a cache that is entirely TP.
@@ -533,6 +540,25 @@ class CPUPageCache:
             e["gated"].add(dev.index)
 
 
+    def _log_restore_stats(self):
+        """
+        [CACHE] witness (law 5): whether a restore was gated onto the stream or parked the request thread is a
+        claim about two counters, and a silent metric is unfalsifiable. Emits only when a counter moved, on a
+        60 s wall-clock floor (owner log-rate law): a per-walk divisor would tie the line's rate to engine
+        speed and hand back part of every win.
+        """
+        m = self.metrics
+        if m == self._rs_last:
+            return
+        now = time.monotonic()
+        if now - self._rs_ts < 60.0:
+            return
+        self._rs_ts = now
+        self._rs_last = dict(m)
+        logger.info("[CACHE] restorestats {}".format({k: m[k] for k in (
+            "gated_restores", "restore_waits", "promotions", "promotion_failures", "restores", "evictions")}))
+
+
     def settle_restores(self):
         """
         Run the metadata step of the restores that fetch() ordered onto the stream while their promotion was
@@ -542,6 +568,7 @@ class CPUPageCache:
         for a read is still honest, and it costs only the tail of a read that had the whole walk to overlap.
         A page whose promotion failed keeps kv_position 0, so prefill writes it as if the tier had missed.
         """
+        self._log_restore_stats()
         if not self._gated:
             return
         for phash, e, apply in self._gated:
