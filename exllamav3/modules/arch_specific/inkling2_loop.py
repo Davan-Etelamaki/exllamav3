@@ -40,6 +40,27 @@ def flow_of(params: dict) -> dict:
     return flow
 
 
+def _host_lens(params: dict, seqlens) -> torch.Tensor:
+    """Cache lengths as host values, without a device->host sync.
+
+    The generator stages cache_seqlens in a persistent pinned CPU buffer (generator._staging)
+    and get_for_device uploads that buffer to the compute device, so params already holds the
+    host original of the device copy. Reading the copy back with .cpu() is a blocking D2H:
+    harmless when eager, fatal while a CUDA graph records the very stream it would
+    synchronize (cuStreamSynchronize -> CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED, 900), which is
+    how every whole-forward capture of this model died. The two operands hold the same
+    values and the same dtype - the device tensor IS that upload - so taking the host side
+    changes no result. Callers that hand the model genuinely device-resident lengths (no CPU
+    original in params) still pay the copy.
+    """
+    src = params.get("cache_seqlens")
+    if isinstance(src, torch.Tensor) and src.device.type == "cpu":
+        return src
+    if isinstance(seqlens, torch.Tensor):
+        return seqlens.cpu()
+    return torch.tensor(list(seqlens))
+
+
 def rmsnorm_f(x: torch.Tensor, eps: float) -> torch.Tensor:
     x = x.float()
     return x * torch.rsqrt(x.square().mean(-1, keepdim = True) + eps)
@@ -674,7 +695,7 @@ class InklingAttention(Module):
             inst = params.get("layer_instance") or 0
             cache.update_layer_direct(self.layer_idx, cache_seqlens, block_table, kh, vh, t, inst)
             kv_cat_k, kv_cat_v, kv_lens = self._gather_global(
-                cache, cache_seqlens, block_table, inst, kh, vh, t)
+                cache, cache_seqlens, block_table, inst, kh, vh, t, params)
 
         outs = []
         for bi in range(b):
@@ -703,9 +724,10 @@ class InklingAttention(Module):
             params.get("position", 0), device = self.device).expand(b)
         return base[:, None] + torch.arange(t, device = self.device)[None, :]
 
-    def _gather_global(self, cache, cache_seqlens, block_table, inst, kh, vh, t):
-        host_seqlens = cache_seqlens.cpu() if isinstance(cache_seqlens, torch.Tensor) \
-            else torch.tensor(list(cache_seqlens))
+    def _gather_global(self, cache, cache_seqlens, block_table, inst, kh, vh, t, params):
+        # Host-side lengths only feed Python row counts (lens/maxlen), so they must not cost a
+        # stream sync: take them from the staging buffer they were uploaded from (_host_lens).
+        host_seqlens = _host_lens(params, cache_seqlens)
         layer = cache.layers[self.layer_idx, inst]
         b = kh.shape[0]
         lens = [int(host_seqlens[i]) + t for i in range(b)]
