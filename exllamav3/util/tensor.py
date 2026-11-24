@@ -168,7 +168,18 @@ def get_for_device(
         v_cap = input_dict[key]
         if v_cap is None:
             return None
-        return to_device(v_cap, device, non_blocking = False)
+        # A capture records work; it may not wait for it. A blocking copy here calls
+        # cuStreamSynchronize, which the driver refuses with CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED
+        # (900): that one call invalidated every whole-forward CUDA graph, so decode ran eager on
+        # every boot (dot26 journal 2026-11-24: model_ls.run_section -> inkling2_loop._pos_row ->
+        # get_for_device -> to_device). Upload the way the eager branch below already does for host
+        # sources: an async, stream-ordered copy that the graph records. Its source is the
+        # generator's persistent pinned staging buffer (generator._staging, pin_memory=True),
+        # refilled in place each round, which is exactly the address fwd_graph.py needs the graph to
+        # re-read on every replay.
+        if v_cap.device.type == "cpu" and torch.device(device).type != "cpu":
+            return host_to_device(v_cap, device)
+        return to_device(v_cap, device, non_blocking = True)
 
     if key not in input_dict and default is not no_default:
         return default
