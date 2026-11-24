@@ -2346,14 +2346,18 @@ class Generator:
                 ein = emod.prepare_for_device(batch_ids, params)
                 emod.forward(ein, params)
                 params.pop("layer_instance", None)
-                fwd_key = (
+                from exllamav3.generator import fwd_graph as _fg_mod
+                # Geometry joins the signature: see fwd_graph.make_key. The block-table width and the
+                # longest sequence set every host-derived extent the captured region builds shapes from,
+                # so a graph captured at one geometry must not be replayed at another.
+                fwd_key = _fg_mod.make_key(
                     batch_ids.shape[0], batch_ids.shape[1], use_offsets,
                     self.draft_model is not None,
                     tuple(id(s) for s in batch_states) if batch_states is not None else (),
+                    max_pages_batch, max_seq_len,
                 )
                 on_warm = None
                 if batch_states:
-                    from exllamav3.generator import fwd_graph as _fg_mod
                     def on_warm(states = batch_states, n = _fg_mod._WARMUPS):
                         for st in states:
                             st.rewind(n)  # exactly the warmup executions
