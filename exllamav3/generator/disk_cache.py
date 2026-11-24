@@ -63,6 +63,9 @@ def _odirect_supported() -> bool:
     return hasattr(os, "O_DIRECT") and hasattr(os, "preadv") and hasattr(os, "pwritev")
 
 
+_DROPPED_STATES_CAP = 4096    # bound of the write-suppression map (see write_state): recent drops only
+
+
 class _AlignedBuf:
     """A reusable buffer whose start address is _ODIO-aligned, for O_DIRECT transfers"""
 
@@ -416,6 +419,13 @@ class DiskPageCache:
         # dropped if the checkpoint leaves RAM before that
         self.state_candidates: dict[bytes, dict] = {}
         self._ready_states = deque()
+        # Checkpoints the tier dropped (eviction, prune, rekey): phash -> their index row's position. An offer
+        # of the same anchor at the same position would rewrite a file byte-identical to the one just dropped
+        # (the stash regenerates deterministically for a chain prefix), so it is suppressed until something
+        # changes; see write_state. Bounded FIFO: only recent drops, since only the flush of a conversation
+        # that is still live re-offers a dropped checkpoint
+        self._dropped_states: dict[bytes, int] = {}
+        self._dropped_fifo = deque()
         self.min_state_distance = int(min_state_distance)
         self._deferred_release: dict[int, tuple] = {}     # id(stash) -> (stash, release fn)
         self._promotions = 0                              # reads in flight
@@ -452,7 +462,7 @@ class DiskPageCache:
             "page_writes": 0, "page_write_bytes": 0, "page_reads": 0, "page_read_bytes": 0,
             "page_read_failures": 0, "state_writes": 0, "state_reads": 0, "evictions": 0, "skipped_mm": 0,
             "write_errors": 0, "states_pruned": 0, "state_candidates_dropped": 0, "skipped_low_space": 0,
-            "pages_adopted": 0, "states_adopted": 0,
+            "pages_adopted": 0, "states_adopted": 0, "skipped_budget": 0, "state_rewrites_suppressed": 0,
             "seg_rotations": 0, "seg_unlinked": 0, "skipped_no_segment": 0,
         }
         # Read-only connection of the main thread for adopt(), opened on first use
@@ -977,6 +987,14 @@ class DiskPageCache:
         return phash in self.states or phash in self.pending_states
 
 
+    def room_for(self, nbytes: int) -> bool:
+        """Whether a write of nbytes fits this directory's share without evicting anything. The offer-side
+        test the idle flush uses to keep from rewriting the disk full of cold pages (see _make_room,
+        which makes room by evicting instead)"""
+        with self._lock:
+            return self.total_size + nbytes <= self.max_size
+
+
     def page_prev_hash(self, phash: bytes):
         return self.pages[phash]["prev_hash"]
 
@@ -1185,6 +1203,9 @@ class DiskPageCache:
         """
         if phash in self.states or phash in self.pending_states or not self._can_write():
             return False
+        if self._unchanged_redrop(phash, stashed.get("position", 0)):
+            self.metrics["state_rewrites_suppressed"] += 1
+            return False
         if not force and not self._spaced(phash, stashed.get("position", 0)):
             self.metrics["state_candidates_dropped"] += 1
             return False
@@ -1205,6 +1226,24 @@ class DiskPageCache:
             return False
         self._enqueue(("state", phash, stashed, size, layout))
         return True
+
+
+    def _unchanged_redrop(self, phash: bytes, position: int) -> bool:
+        """
+        Whether an offer of a checkpoint the tier already dropped is unchanged: the same anchor page (the key
+        is its content hash, covering the whole chain below it) at the same position (the index row's field).
+        Such an offer would write bytes identical to the file the drop removed, so the rewrite is suppressed;
+        an offer whose position moved drops the record and writes for real.
+        """
+        with self._lock:
+            prev = self._dropped_states.get(phash)
+            if prev is None:
+                return False
+            if prev != position:
+                del self._dropped_states[phash]
+                self._dropped_fifo.remove(phash)
+                return False
+            return True
 
 
     def _state_layout(self, phash: bytes, top: dict, sides: dict) -> dict:
@@ -1574,6 +1613,11 @@ class DiskPageCache:
         table = self.pages if kind == "page" else self.states
         meta = table.pop(phash)
         self.total_size -= meta["size"]
+        if kind == "state":
+            if len(self._dropped_fifo) >= _DROPPED_STATES_CAP:
+                self._dropped_states.pop(self._dropped_fifo.popleft(), None)
+            self._dropped_states[phash] = meta["position"]
+            self._dropped_fifo.append(phash)
         self._enqueue(("delete", kind, phash))
 
 
@@ -1978,6 +2022,7 @@ class DiskPageCache:
             stamp = self._stamp()
             self.states[phash] = {"size": actual, "last_access": stamp, "position": position}
             self.total_size += actual - size
+            self._dropped_states.pop(phash, None)
             self._state_written(phash)
         conn.execute("INSERT OR REPLACE INTO states VALUES (?, ?, ?, ?)", (phash, actual, stamp, position))
         self.metrics["state_writes"] += 1

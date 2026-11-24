@@ -300,10 +300,12 @@ class CPUPageCache:
         self._order_pops = 0
 
 
-    def store(self, page, serial: int, protect: set | None = None):
+    def store(self, page, serial: int, protect: set | None = None, persist: bool = True):
         """
         Copy a dying page's cache state into the tier (device-to-host, async on the current stream). Duplicate
-        hashes only refresh the entry's recency.
+        hashes only refresh the entry's recency. With persist = False the page only enters this tier: a caller
+        that must not evict a resident disk entry (the idle flush at its budget) keeps the RAM copy but
+        leaves the write-through alone.
         """
         e = self.entries.get(page.phash)
         if e is not None:
@@ -326,7 +328,7 @@ class CPUPageCache:
             "pending": None,
         }
         self.metrics["pushes"] += 1
-        if self.disk_tier is not None:
+        if self.disk_tier is not None and persist:
             events = self._copy_events()
             self.slot_events[slot] = events
             # Write-through: the writer waits for the copies above before it reads the slab

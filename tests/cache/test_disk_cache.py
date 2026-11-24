@@ -840,3 +840,84 @@ def test_processes_sharing_a_root_must_agree_on_the_budget(device, tmp_path):
         json.dump({"root_size": 1 << 20, "pid": 2 ** 22 - 1, "time": time.time()}, f)
     tier_d, disk_d, _ = build(8, device, tmp_path, disk_size = 1 << 29, fingerprint = "model_d")
     disk_d.close(); tier_d.close()
+
+
+def test_an_unchanged_checkpoint_re_offer_is_not_written_again(device, tmp_path):
+    # Under flush-on-idle every idle moment re-offers the checkpoints still in RAM. A re-write whose index
+    # row and anchor are unchanged is suppressed: the stash of a given anchor regenerates identical bytes at
+    # the same position, so rewriting it after the tier dropped it only burns NVMe wear. A checkpoint that
+    # moved (new position) is written again.
+    tier, disk, tensor = build(4, device, tmp_path)
+    tier.store(page(1, 1), serial = 1)
+    stashed = {"position": 2048, "checkpoint_size": 4096, "x": torch.ones(16)}
+    assert disk.write_state(phash(1), stashed)
+    disk.flush()
+    writes = disk.metrics["state_writes"]
+    assert writes == 1, "positive control: the first write must be counted before anything can be suppressed"
+    path = disk._state_path(phash(1))
+    assert os.path.exists(path)
+    # The tier drops it (what eviction and prune both do through _drop). The file is really gone: the
+    # suppression below is not a dedup against a surviving entry
+    with disk._lock:
+        disk._drop("state", phash(1))
+    disk.flush()
+    assert not disk.has_state(phash(1)) and not os.path.exists(path)
+    # Re-offered unchanged: same anchor, same position
+    assert not disk.write_state(phash(1), stashed, force = True)
+    assert not disk.note_state(phash(1), stashed)
+    disk.flush()
+    assert disk.metrics["state_writes"] == writes, "an unchanged re-offer wrote a second copy"
+    assert disk.metrics["state_rewrites_suppressed"] == 2
+    # A read of the suppressed entry degrades to the ordinary miss (the allocation falls back to a lower
+    # checkpoint), it does not fail
+    assert disk.read_state(phash(1)) is None
+    # What changed is rewritten: same anchor, new position
+    moved = dict(stashed, position = 6144)
+    assert disk.write_state(phash(1), moved, force = True)
+    disk.flush()
+    assert disk.metrics["state_writes"] == writes + 1 and disk.has_state(phash(1))
+    back = disk.read_state(phash(1))
+    assert back["position"] == 6144 and torch.equal(back["x"], moved["x"])
+    host_pool.give(back)
+    disk.close()
+    tier.close()
+
+
+def test_the_idle_flush_holds_back_pages_the_budget_cannot_keep(device, tmp_path):
+    # The disk tier at its budget share: the idle flush copies its pages into the RAM tier only, instead of
+    # rewriting the disk full of cold pages by evicting resident ones. When room appears again (here: the
+    # share grows), the page is written.
+    from exllamav3.constants import PAGE_SIZE as KV_PAGE_SIZE
+    from exllamav3.generator.generator import Generator
+    tier, disk, _ = build(4, device, tmp_path, disk_size = 1 << 40)
+    # What one page reserves in the tier's accounting (the test pages carry the small token tensors)
+    page_bytes = 8 + 8 + 256 + PAGE_SIZE * 8 + disk.image_size
+    root = 2 * page_bytes + 4096
+    disk.close(); tier.close()
+    tier, disk, _ = build(4, device, tmp_path, disk_size = root)
+
+    def vram_page(tag):
+        p = page(tag, tag % NUM_PAGES)
+        return SimpleNamespace(phash = p.phash, prev_hash = None, page_index = p.page_index, sequence = p.sequence,
+                               persistable = True, kv_position = KV_PAGE_SIZE, access_serial = tag)
+
+    pages = {phash(t): vram_page(t) for t in (1, 2, 3)}
+    gen = Generator.__new__(Generator)
+    gen.disk_page_cache, gen.cpu_page_cache, gen.recurrent_cache = disk, tier, None
+    gen.pagetable = SimpleNamespace(unreferenced_pages = pages, referenced_pages = {}, access_serial = 100)
+    gen.pending_jobs, gen.active_jobs = [], []
+    gen._flush_pass = None
+
+    gen.flush_cache_to_disk()
+    disk.flush()
+    assert disk.metrics["page_writes"] == 2, "the idle flush wrote past its budget"
+    assert disk.has_page(phash(1)) and disk.has_page(phash(2))
+    assert phash(3) in tier and not disk.has_page(phash(3)), "the over-budget page displaced a resident one"
+    assert not gen.has_idle_work()
+    # Room came back: the next offer is written
+    disk.max_size += 4 * (8 + 8 + 256 + PAGE_SIZE * 8 + disk.image_size)
+    pages[phash(4)] = vram_page(4)
+    gen.flush_cache_to_disk()
+    disk.flush()
+    assert disk.metrics["page_writes"] == 3 and disk.has_page(phash(4))
+    disk.close(); tier.close()
