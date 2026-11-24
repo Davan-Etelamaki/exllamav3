@@ -1,5 +1,6 @@
 from __future__ import annotations
 import atexit
+import ctypes
 import errno
 import hashlib
 import heapq
@@ -41,6 +42,64 @@ def _is_capture_conflict(e: BaseException) -> bool:
 PAGE_MAGIC = b"EXL3KVP1"
 STATE_MAGIC = b"EXL3RCS1"
 _HEADER = struct.Struct("<II")       # (header json length, payload-descriptor length)
+
+# The segment store (the "skip the DRAM tier" layout): page images are appended to large segment files
+# instead of one small file per page, and segment IO goes through O_DIRECT with aligned bounce buffers, so a
+# cold restore streams from the device without detouring through the page cache — nothing large is left in
+# RAM to evict under memory pressure, and per-page open/close and metadata churn disappears. States and
+# tensor-parallel pages keep the per-page-file layout (the ranks write their shards into the page file);
+# when the segment store is off or unsupported the page path keeps the per-page-file layout too.
+SEG_MAGIC = b"EXL3KVS1"
+_SEG_CAP = 256 * 1024 * 1024          # segment capacity, bytes
+_ODIO = 4096                          # alignment of O_DIRECT offsets, lengths and buffers
+_FADV_DONTNEED = getattr(os, "POSIX_FADV_DONTNEED", None)
+
+
+def _round_odio(n: int) -> int:
+    return (n + _ODIO - 1) // _ODIO * _ODIO
+
+
+def _odirect_supported() -> bool:
+    return hasattr(os, "O_DIRECT") and hasattr(os, "preadv") and hasattr(os, "pwritev")
+
+
+class _AlignedBuf:
+    """A reusable buffer whose start address is _ODIO-aligned, for O_DIRECT transfers"""
+
+    __slots__ = ("size", "_ba", "_c", "_off", "view", "addr")
+
+    def __init__(self, nbytes: int):
+        self.size = _round_odio(max(nbytes, _ODIO))
+        self._ba = bytearray(self.size + _ODIO)
+        self._c = (ctypes.c_char * len(self._ba)).from_buffer(self._ba)
+        self._off = (-ctypes.addressof(self._c)) % _ODIO
+        self.view = memoryview(self._ba)[self._off:self._off + self.size]
+        self.addr = ctypes.addressof(self._c) + self._off
+
+
+_tls = threading.local()
+
+
+def _tls_buf(name: str, nbytes: int) -> _AlignedBuf:
+    buf = getattr(_tls, name, None)
+    if buf is None or buf.size < _round_odio(nbytes):
+        buf = _AlignedBuf(nbytes)
+        setattr(_tls, name, buf)
+    return buf
+
+
+def _fadvise_dontneed(fd: int, off: int, length: int):
+    """Best-effort page-cache drop for buffered reads (the legacy per-page-file path)"""
+    if _FADV_DONTNEED is None:
+        return
+    try:
+        os.posix_fadvise(fd, off, length, _FADV_DONTNEED)
+    except OSError:
+        pass
+
+
+def _ct_array(buf) -> ctypes.Array:
+    return (ctypes.c_char * len(buf)).from_buffer(buf)
 
 # Several processes can use the same root. A process does not remove a file that it does not know (a temporary
 # file, a rank marker) if the file changed in the last _STRAY_AGE seconds: the file can belong to a write of
@@ -234,6 +293,7 @@ class DiskPageCache:
         fingerprint: str | None = None,
         min_state_distance: int = 4096,
         min_free: int | None = None,
+        segments: bool = True,
     ):
         """
         :param root_dir:
@@ -255,6 +315,10 @@ class DiskPageCache:
         :param min_state_distance:
             Minimum spacing, in tokens, between the recurrent checkpoints kept along any root-to-leaf chain of
             pages on disk; closer ones are pruned at idle (see prune_states). 0 keeps every checkpoint
+
+        :param segments:
+            Store page images in O_DIRECT segment files instead of one file per page (default). Ignored when
+            the platform lacks O_DIRECT or the caches are tensor-parallel
         """
         self.cpu_tier = cpu_tier
         self.root_dir = root_dir
@@ -357,6 +421,19 @@ class DiskPageCache:
         self._promotions = 0                              # reads in flight
         self.max_promotions = max(2, cpu_tier.max_slots // 4)
 
+        # Segment store: page images appended to _SEG_CAP-sized files, IO through O_DIRECT aligned bounce
+        # buffers. Allocation and appends happen on the writer thread only; readers open shared O_RDONLY
+        # direct fds on first touch. Maps sit beside the mirror under the same _lock
+        self.segments_on = bool(segments) and _odirect_supported() and not self.tp_groups
+        self.segments_dir = os.path.join(self.dir, "segments")
+        self.page_seg: dict[bytes, tuple] = {}         # phash -> (seg_id, record offset, header pad)
+        self.seg_members: dict[int, set] = {}          # seg_id -> live phashes
+        self.seg_next = 0                              # rotation cursor
+        self.seg_seen: set[int] = set()                # segment ids that exist or existed on disk
+        self._seg_wfd = None                           # writer's O_DIRECT append fd
+        self._seg_w_id = -1
+        self._seg_w_off = 0
+        self._seg_rfds: dict[int, int] = {}            # O_RDONLY direct fds, guarded by _lock
         self._order = deque()
         self._order_pops = 0
         self._order_rebuild = 64
@@ -376,6 +453,7 @@ class DiskPageCache:
             "page_read_failures": 0, "state_writes": 0, "state_reads": 0, "evictions": 0, "skipped_mm": 0,
             "write_errors": 0, "states_pruned": 0, "state_candidates_dropped": 0, "skipped_low_space": 0,
             "pages_adopted": 0, "states_adopted": 0,
+            "seg_rotations": 0, "seg_unlinked": 0, "skipped_no_segment": 0,
         }
         # Read-only connection of the main thread for adopt(), opened on first use
         self._query_conn = None
@@ -505,6 +583,8 @@ class DiskPageCache:
                     self.pages[phash] = {"prev_hash": meta["prev_hash"], "size": os.path.getsize(path), "last_access": 0}
                     conn.execute("INSERT OR REPLACE INTO pages VALUES (?, ?, ?, ?)",
                                  (phash, meta["prev_hash"], self.pages[phash]["size"], 0))
+            if self.segments_on:
+                self._scan_segments(conn)
             for name in os.listdir(self.states_dir):
                 path = os.path.join(self.states_dir, name)
                 try:
@@ -1606,6 +1686,8 @@ class DiskPageCache:
                         except FileNotFoundError:
                             pass
                         conn.execute(f"DELETE FROM {'pages' if k == 'page' else 'states'} WHERE phash = ?", (phash,))
+                        if k == "page":
+                            self._seg_forget(phash)
                     elif kind == "reclaim":
                         try:
                             self._reclaim_siblings(*op[1:])
@@ -1621,10 +1703,12 @@ class DiskPageCache:
                     elif kind == "flush":
                         conn.commit()
                         self._touch_dir()
+                        self._seg_sync()
                         op[1].set()
                     elif kind == "stop":
                         conn.commit()
                         self._touch_dir()
+                        self._seg_close()
                         self._report_activity()
                         op[1].set()
                         return
@@ -1777,6 +1861,9 @@ class DiskPageCache:
     def _do_write_page(self, conn, phash, prev_hash, tokens_bytes, slot, events, size, markers = None):
         for ev in events:
             ev.synchronize()
+        if self.segments_on and markers is None:
+            self._write_seg_page(conn, phash, prev_hash, tokens_bytes, slot, size)
+            return
         path = self._page_path(phash)
         tmp = path + self._tmp_suffix
         slab = self.cpu_tier.slab_view(slot)
@@ -1909,6 +1996,268 @@ class DiskPageCache:
             deferred[1](deferred[0])
 
 
+    # -- segment store -----------------------------------------------------------------------------------------
+
+    def _seg_path(self, sid: int) -> str:
+        return os.path.join(self.segments_dir, f"seg-{sid:06d}.kv")
+
+
+    def _seg_allowed(self) -> int:
+        """How many segment files the current share of the root tolerates, plus one spare. The on-disk
+        footprint of the store stays within about _SEG_CAP of max_size however the budget grows"""
+        return max(2, (self.max_size + _SEG_CAP - 1) // _SEG_CAP + 1)
+
+
+    def _seg_rfd(self, sid: int) -> int:
+        """Direct read fd of a segment, opened on first read and shared afterwards"""
+        with self._lock:
+            fd = self._seg_rfds.get(sid)
+            if fd is None:
+                fd = os.open(self._seg_path(sid), os.O_RDONLY | os.O_DIRECT)
+                self._seg_rfds[sid] = fd
+            return fd
+
+
+    def _seg_rotate(self) -> bool:
+        """Writer thread: seal the current segment and open the next free one. A sealed segment is reused
+        (truncated) once every page of it has been evicted; False when no segment is free"""
+        if self._seg_wfd is not None:
+            try:
+                os.fsync(self._seg_wfd)
+            except OSError:
+                pass
+            os.close(self._seg_wfd)
+            self._seg_wfd = None
+        allowed = self._seg_allowed()
+        sid = None
+        for _ in range(allowed):
+            cand = self.seg_next % allowed
+            self.seg_next = (self.seg_next + 1) % allowed
+            if cand == self._seg_w_id or self.seg_members.get(cand):
+                continue
+            sid = cand
+            break
+        if sid is None:
+            self.metrics["skipped_no_segment"] += 1
+            return False
+        os.makedirs(self.segments_dir, exist_ok = True)
+        fd = os.open(self._seg_path(sid), os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_DIRECT, 0o644)
+        try:
+            os.posix_fallocate(fd, 0, _SEG_CAP)
+        except OSError:
+            pass
+        self._seg_wfd = fd
+        self._seg_w_id = sid
+        self._seg_w_off = 0
+        self.seg_members.setdefault(sid, set())
+        self.seg_seen.add(sid)
+        self.metrics["seg_rotations"] += 1
+        return True
+
+
+    def _write_seg_page(self, conn, phash, prev_hash, tokens_bytes, slot, size):
+        """
+        Writer thread: append the page image as one record of the current segment — a header block (magic,
+        descriptor, json header, token ids, zero-padded to _ODIO) and the image (zero-padded to _ODIO) —
+        through one aligned bounce buffer. IO errors propagate to the writer loop's failure path.
+        """
+        slab = self.cpu_tier.slab_view(slot)
+        crc = zlib.crc32(memoryview(slab.numpy()), zlib.crc32(tokens_bytes)) if slab is not None else None
+        hdr_json = self._page_header(phash, prev_hash, crc)
+        hlen, tlen = len(hdr_json), len(tokens_bytes)
+        hdr_pad = _round_odio(len(SEG_MAGIC) + _HEADER.size + hlen + tlen)
+        img = self.local_bytes
+        rec_len = hdr_pad + _round_odio(img)
+        if self._seg_wfd is None or self._seg_w_off + rec_len > _SEG_CAP:
+            if not self._seg_rotate():
+                with self._lock:
+                    self.pending_pages.discard(phash)
+                    self.total_size -= size
+                return
+        buf = _tls_buf("seg_write", rec_len)
+        head = SEG_MAGIC + _HEADER.pack(hlen, tlen) + hdr_json + tokens_bytes
+        buf.view[:hdr_pad] = head + b"\0" * (hdr_pad - len(head))
+        if slab is not None:
+            src = _ct_array(memoryview(slab.numpy()))
+            ctypes.memmove(buf.addr + hdr_pad, ctypes.addressof(src), img)
+        pad_tail = _round_odio(img) - img
+        if pad_tail:
+            buf.view[hdr_pad + img:rec_len] = b"\0" * pad_tail
+        os.pwritev(self._seg_wfd, [buf.view[:rec_len]], self._seg_w_off)
+        off = self._seg_w_off
+        self._seg_w_off += rec_len
+        with self._lock:
+            self.pending_pages.discard(phash)
+            stamp = self._stamp()
+            self.pages[phash] = {"prev_hash": prev_hash, "size": rec_len, "last_access": stamp}
+            self.total_size += rec_len - size
+            self.page_seg[phash] = (self._seg_w_id, off, hdr_pad)
+            self.seg_members[self._seg_w_id].add(phash)
+            if phash in self.state_candidates:
+                self._ready_states.append(phash)
+        conn.execute("INSERT OR REPLACE INTO pages VALUES (?, ?, ?, ?)", (phash, prev_hash, rec_len, stamp))
+        self.metrics["page_writes"] += 1
+        self.metrics["page_write_bytes"] += rec_len
+
+
+    def _read_seg_page(self, loc, phash: bytes, slab):
+        """Read a segment-backed page: header block and image through O_DIRECT into aligned buffers, the
+        image copied into the slab. Same contract as the file path: tokens back, entry dropped on damage"""
+        sid, off, hdr_pad = loc
+        try:
+            fd = self._seg_rfd(sid)
+            hbuf = _tls_buf("seg_head", hdr_pad)
+            if os.preadv(fd, [hbuf.view[:hdr_pad]], off) != hdr_pad:
+                raise ValueError("short header read")
+            raw = bytes(hbuf.view[:hdr_pad])
+            if raw[:len(SEG_MAGIC)] != SEG_MAGIC:
+                raise ValueError("bad magic")
+            hlen, tlen = _HEADER.unpack(raw[len(SEG_MAGIC):len(SEG_MAGIC) + _HEADER.size])
+            if hlen == 0 or _round_odio(len(SEG_MAGIC) + _HEADER.size + hlen + tlen) != hdr_pad:
+                raise ValueError("bad header sizes")
+            base = len(SEG_MAGIC) + _HEADER.size
+            meta = json.loads(raw[base:base + hlen])
+            if meta.get("fingerprint") != self.fingerprint or bytes.fromhex(meta["phash"]) != phash:
+                raise ValueError("bad header")
+            tokens = torch.frombuffer(bytearray(raw[base + hlen:base + hlen + tlen]), dtype = torch.long).clone()
+            if slab is not None:
+                n = self.local_bytes
+                ibuf = _tls_buf("seg_image", n)
+                if os.preadv(fd, [ibuf.view[:_round_odio(n)]], off + hdr_pad) < n:
+                    raise ValueError("short read")
+                dst = _ct_array(memoryview(slab.numpy()))
+                ctypes.memmove(ctypes.addressof(dst), ibuf.addr, n)
+                crc = meta.get("crc32")
+                if crc is not None and zlib.crc32(memoryview(slab.numpy()),
+                                                  zlib.crc32(tokens.numpy().tobytes())) != crc:
+                    raise ValueError("checksum mismatch")
+        except (OSError, ValueError):
+            self._read_missed()
+            with self._lock:
+                if phash in self.pages:
+                    self._drop("page", phash)
+            return None
+        with self._lock:
+            if phash in self.pages:
+                self._touch(self.pages[phash], "page", phash)
+        self.metrics["page_reads"] += 1
+        self.metrics["page_read_bytes"] += self.image_size
+        return tokens
+
+
+    def _scan_segments(self, conn):
+        """At open: index every valid record of the existing segment files (header blocks only, buffered —
+        the images stay out of the page cache because they are read back through O_DIRECT)"""
+        if not os.path.isdir(self.segments_dir):
+            return
+        for name in sorted(os.listdir(self.segments_dir)):
+            if not (name.startswith("seg-") and name.endswith(".kv")):
+                continue
+            try:
+                sid = int(name[4:-3])
+            except ValueError:
+                continue
+            self.seg_seen.add(sid)
+            members = self.seg_members.setdefault(sid, set())
+            path = os.path.join(self.segments_dir, name)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            if size <= 0:
+                continue
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                off = 0
+                while off + 2 * _ODIO <= size:
+                    base = os.pread(fd, len(SEG_MAGIC) + _HEADER.size, off)
+                    if len(base) < len(SEG_MAGIC) + _HEADER.size or base[:len(SEG_MAGIC)] != SEG_MAGIC:
+                        break
+                    hlen, tlen = _HEADER.unpack(base[len(SEG_MAGIC):])
+                    hdr_pad = _round_odio(len(SEG_MAGIC) + _HEADER.size + hlen + tlen)
+                    if hdr_pad > 4 * 1024 * 1024:
+                        break
+                    rec_len = hdr_pad + _round_odio(self.image_size)
+                    if off + rec_len > size:
+                        break
+                    blk = os.pread(fd, hdr_pad, off)
+                    try:
+                        meta = json.loads(blk[len(SEG_MAGIC) + _HEADER.size:
+                                              len(SEG_MAGIC) + _HEADER.size + hlen])
+                    except ValueError:
+                        break
+                    if meta.get("fingerprint") != self.fingerprint:
+                        break
+                    phash = bytes.fromhex(meta["phash"])
+                    if phash not in self.pages:
+                        prev = bytes.fromhex(meta["prev_hash"]) if meta["prev_hash"] else None
+                        self.pages[phash] = {"prev_hash": prev, "size": rec_len, "last_access": 0}
+                        self.page_seg[phash] = (sid, off, hdr_pad)
+                        members.add(phash)
+                        conn.execute("INSERT OR REPLACE INTO pages VALUES (?, ?, ?, ?)",
+                                     (phash, prev, rec_len, 0))
+                        self.metrics["scanned"] = self.metrics.get("scanned", 0) + 1
+                    off += rec_len
+            finally:
+                os.close(fd)
+        self.seg_next = 0
+
+
+    def _seg_forget(self, phash: bytes):
+        """Writer thread: a dropped page releases its record; an emptied sealed segment is unlinked"""
+        dead = None
+        rfd = None
+        with self._lock:
+            loc = self.page_seg.pop(phash, None)
+            if loc is None:
+                return
+            sid = loc[0]
+            members = self.seg_members.get(sid)
+            if members is not None:
+                members.discard(phash)
+                if not members and sid != self._seg_w_id:
+                    del self.seg_members[sid]
+                    self.seg_seen.discard(sid)
+                    dead = sid
+                    rfd = self._seg_rfds.pop(sid, None)
+        if dead is not None:
+            if rfd is not None:
+                try:
+                    os.close(rfd)
+                except OSError:
+                    pass
+            try:
+                os.unlink(self._seg_path(dead))
+                self.metrics["seg_unlinked"] += 1
+            except OSError:
+                pass
+
+
+    def _seg_sync(self):
+        """Writer thread: make appended records durable (on flush)"""
+        if self._seg_wfd is not None:
+            try:
+                os.fsync(self._seg_wfd)
+            except OSError:
+                pass
+
+
+    def _seg_close(self):
+        """Writer thread: sync and release the segment fds at stop"""
+        self._seg_sync()
+        if self._seg_wfd is not None:
+            os.close(self._seg_wfd)
+            self._seg_wfd = None
+        with self._lock:
+            rfds = list(self._seg_rfds.values())
+            self._seg_rfds.clear()
+        for fd in rfds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
     # -- read path ---------------------------------------------------------------------------------------------
 
     def _read_tokens(self, phash: bytes):
@@ -1935,6 +2284,11 @@ class DiskPageCache:
         """Read this process's part of the page image for phash into `slab` (a CPU-tier slab view, None when
         there is no local part). Returns the page's token ids, or None if the file is missing or invalid (the
         entry is then dropped from the index)"""
+        if self.segments_on:
+            with self._lock:
+                loc = self.page_seg.get(phash)
+            if loc is not None:
+                return self._read_seg_page(loc, phash, slab)
         r = self._read_tokens(phash)
         if r is None:
             return None
@@ -1945,6 +2299,7 @@ class DiskPageCache:
                     f.seek(meta["image_offset"])
                     if f.readinto(memoryview(slab.numpy())) != self.local_bytes:
                         raise ValueError("short read")
+                    _fadvise_dontneed(f.fileno(), 0, 0)
                 crc = meta.get("crc32")
                 if crc is not None and zlib.crc32(memoryview(slab.numpy()), zlib.crc32(tokens.numpy().tobytes())) != crc:
                     raise ValueError("checksum mismatch")
