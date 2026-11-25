@@ -45,12 +45,17 @@ entry `moe_route_to_coop_kernel`) ->
 `exl3_moe_coop_launch`. The hand-written `moe_group_gemv.cu` (int4 placeholder stream) is
 DEMOTED to the fallback/measurement comparator for fence 3; it must not serve a real pack.
 
-GATE FOUND WHILE READING (wheel-batch coupling): this lineage's coop act selector has only
-SILU/GELU/RELU2/SILU_OAI (`exl3_moe_coop_kernel.cuh:119-123`) — the softcap-swiglu selector
-(`MOE_COOP_ACT_SOFTCAP` + `up_cap`) landed on `dsh-softcap` (`aae2681f`), which is NOT in the
-`d48fe4c1` lineage. The coop path cannot serve Inkling-2 until that selector rides the same
-wheel batch or is reproduced on this branch; driving coop with a wrong act would be WORSE than
-today's python path (it was exactly this silent-SiLU bug class that aae2681f fixed).
+GATE FOUND WHILE READING, NOW LANDED (wheel-batch coupling RESOLVED 2026-11-25): this
+lineage originally lacked the softcap-swiglu coop selector (`MOE_COOP_ACT_SOFTCAP` +
+`up_cap`, landed on `dsh-softcap` `aae2681f`, not in the `d48fe4c1` lineage). `aae2681f` is
+now cherry-picked here as `020ce47c` (clean merge of all seven source files; the lane's test
+file `tests/kernels/moe/test_softcap_swiglu_lane.py` never existed in this lineage — branch
+divergence, not a deletion — and was adopted whole with its fence suite). Elementwise fence
+`tests/cpu/moe_softcap_elementwise.py` extracts the `MOE_COOP_ACT_SOFTCAP` return expression
+FROM THE TREE and compares it against the served epilogue (`inkling2_loop.py:1155-1158`,
+anchors asserted) at N=2^20 fp32: GREEN, max|delta| 7.6e-06; positive control (the classic
+single-cap mistake, `up_cap := gate cap`) breaches at 7.5e+01. No wheel-batch dependency on
+`dsh-softcap` remains for the act selector.
 
 ## Shape (updated after reading exl3.py 2026-11-25)
 
@@ -131,6 +136,22 @@ directory PER COMMIT, symbol dump as part of the check:
 
 Protocol going forward: scratch paths are named `<branch>-<sha12>`; every compile-verify ends
 with `cuobjdump --dump-elf-symbols` and the expected kernel-entry names in the report.
+- `fc7450d4` -> `~/kernel-scratch/dsh-moe-fc7450d4/` (six TUs + pure-host probe from
+  `git show`): route/gemv/adapter/probe all exit 0; entries
+  `_Z25moe_build_segments_kernel10MoERouting`, `_Z19moe_dev_topk_kernel10MoERouting`,
+  `_Z21moe_group_gemv_kernelILb0EE/ILb1EEv…`, `_Z24moe_route_to_coop_kernel…`; probe output
+  diffs EMPTY against the committed fixture.
+- `020ce47c` -> `~/kernel-scratch/dsh-moe-020ce47c/` (whole `exllamav3_ext` extracted with
+  `git archive 020ce47c`): `exl3_moe_coop.cu` exit 0 (entries `exl3_moe_coop_rot_kernel`,
+  `exl3_moe_coop_empty_kernel`), `moe_coop_adapter.cu` exit 0 (entry
+  `_Z24moe_route_to_coop_kernel…`), representative instantiation TU
+  `quant/comp_units/exl3_moe_coop_inst_k1.cu` exit 0 → entries
+  `exl3_moe_coop_ns::exl3_moe_coop_a/b_kernel<…>` (the templates that embed `act_gate`'s
+  softcap branch); `cuobjdump -sass` of one instantiation shows MUFU.TANH instructions —
+  the softcap math is really emitted, not dead-stripped. Standalone coop-TU compiles must
+  pass torch's default extension flags `--expt-relaxed-constexpr --expt-extended-lambda`
+  (torch `cpp_extension.py` injects them; the repo's own `cuda_flags.cuda_cflags` does not) —
+  without them CUDA 13 rejects the plain-`constexpr` tile helpers.
 
 ## Deferred to dot26 / the owner's wheel window (laws 13/31/38)
 
@@ -145,10 +166,11 @@ with `cuobjdump --dump-elf-symbols` and the expected kernel-entry names in the r
 
 ## Integration TODOs (next commits on this branch, before any wheel ride)
 
-1. **Act-selector alignment** (gate above): bring `MOE_COOP_ACT_SOFTCAP` + `up_cap` into this
-   lineage (cherry-pick `aae2681f` from `dsh-softcap` — same act family, `cg*tanh(g/cg)*
-   sigmoid(g) * cu*tanh(u/cu)`) and verify the selector matches `inkling2_loop.py:1155-1158`
-   elementwise before the coop path is allowed to serve Inkling-2.
+1. **Act-selector alignment — LANDED** (`aae2681f` cherry-picked as `020ce47c`; elementwise
+   fence vs `inkling2_loop.py:1155-1158` GREEN with single-cap control RED; see Integration
+   decision + Verification record above). Python callers that want softcap must set
+   `p.act = MOE_COOP_ACT_SOFTCAP`, `p.act_limit = 4.0`, `p.up_cap = 25.0` — done in TODO 2's
+   wiring, where the values come from the served module, not literals.
 2. Python wiring for the coop drive: build the nine int64 pointer tables from `experts_g/u/d[e]`
    LinearEXL3 tensors at load; scratch via `exl3_moe_coop_ctr_len` + this branch's capacity
    formula; fixed-address `sel64/rw16` + x/out slots per capture round (doorbell rule); expose
