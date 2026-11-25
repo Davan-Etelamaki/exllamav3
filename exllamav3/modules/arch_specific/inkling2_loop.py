@@ -747,8 +747,8 @@ class InklingAttention(Module):
         S = k.shape[0]
         grp = self.num_kv_groups
         kvh = self.num_kv_heads
-        kxf = k.transpose(0, 1).transpose(1, 2).unsqueeze(1).float()      # (kvh,1,d,S)
-        vx = v.transpose(0, 1).unsqueeze(1).expand(kvh, grp, S, d)        # (kvh,grp,S,d)
+        kxf = k.transpose(0, 1).transpose(1, 2).float()                   # (kvh,d,S), NOT broadcast
+        vx = v.transpose(0, 1)                                            # (kvh,S,d), NOT expanded
         q4 = q.view(kvh, grp, T, d).float()                               # heads grouped by kv head
 
         # dist/causal/bias are built per query tile, not once for the whole (h, T, S): the
@@ -768,13 +768,26 @@ class InklingAttention(Module):
             bias = torch.where((causal & (dist < self.rel_extent)).unsqueeze(0),
                                bias, torch.zeros_like(bias))
             bias4 = bias.view(kvh, grp, qe - qs, S)
-            sc = torch.matmul(q4[:, :, qs:qe], kxf) * self.scaling        # (kvh,grp,tt,S)
+            # grp is folded into M so the batch dims match and bmm broadcasts nothing. Passing
+            # (kvh,1,d,S) against (kvh,grp,tt,d) made bmm CLONE kxf to (kvh,grp,d,S) on every tile
+            # call: h*d*S*4 bytes = 12,288*S, so 768 MiB at S=65,536 and 3.0 GiB at the served
+            # 262,144 -- above ~43k context that copy, not the bias, was the largest allocation,
+            # and the byte-budget tile could not reach it. Each output element still contracts
+            # over d alone, so the arithmetic is unchanged; the fence proves it.
+            sc = torch.matmul(q4[:, :, qs:qe].reshape(kvh, grp * (qe - qs), d), kxf) \
+                   .view(kvh, grp, qe - qs, S) * self.scaling        # (kvh,grp,tt,S)
             sc = sc + bias4
             sc = sc.masked_fill(~causal[None, None, :, :], float("-inf"))
             snk = sink[qs:qe].T.view(kvh, grp, qe - qs).float()           # (kvh,grp,tt)
             comb = torch.cat([sc, snk.unsqueeze(-1)], dim = -1)
             w = F.softmax(comb, dim = -1)[..., :S].to(v.dtype)
-            outs.append(torch.matmul(w, vx))                              # (kvh,grp,tt,d)
+            # grp folded into the row axis on this side too. Expanding vx to (kvh,grp,S,d) made
+            # matmul CLONE the whole KV value tensor once per tile call: kvh*grp*S*d*2 bytes =
+            # 6,291,456*S, so 1.5 GiB at the served 262,144 -- the sibling of the K clone above,
+            # and equally out of reach for the tile dial. Contracting (kvh,grp*tt,S) against
+            # (kvh,S,d) needs no expand; each row's weighted sum over S is unchanged.
+            outs.append(torch.matmul(w.reshape(kvh, grp * (qe - qs), S), vx)
+                        .view(kvh, grp, qe - qs, d))                      # (kvh,grp,tt,d)
         attn = torch.cat(outs, dim = 2).reshape(h, T, d)
         return attn
 
