@@ -81,6 +81,13 @@ single-cap mistake, `up_cap := gate cap`) breaches at 7.5e+01. No wheel-batch de
 
 ## Numerics stance
 
+TIE-BREAK SPEC (supervisor charge C): on equal biased router scores the DEVICE rule is
+AUTHORITATIVE — lowest expert id wins (`moe_route.cu`'s butterfly reduces ties to the
+minimum index). `torch.topk`'s tie order is UNSPECIFIED and is never a parity reference:
+fence 1 asserts its seeded cases tie-free (`moe_grouped_sim.route()` sorted-neighbor
+scan), so a torch-specific tie can never be read as a grouped-vs-served parity failure,
+and at runtime the device selection — not any host-side topk — defines membership.
+
 Expert-order changes reorder the atomic accumulates, so a non-byte greedy result after
 integration is honest-to-FAIL and gets adjudicated (campaign card row 5), never waived.
 Fence 1 (this branch, `tests/cpu/test_moe_grouped_dispatch.py`) already prices the dispatch
