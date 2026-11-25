@@ -12,6 +12,12 @@ from .common import AttnArgs, get_non_causal_span_arglist
 from .smem import pick_config, shared_bytes, tile_ladder, halving_ladder
 from ...util.backend import ROCM, gfx_arch, attn_decode_config
 
+# L2 residency hint for the decode-path KV/scale loads. "" is Triton's own default (no hint), so the
+# default build emits today's PTX; EXL3_KV_L2_POLICY=evict_last pins the reused prefix in L2, which on
+# AD102 is a ~49.5 MiB persisting window against ~4 MiB per layer of hot KV. The effect is measured on
+# the decode lanes (rows 4/6), never assumed: pinning traffic that does not repeat costs L2.
+KV_L2_POLICY = tl.constexpr(os.environ.get("EXL3_KV_L2_POLICY", "").strip())
+
 
 _FAST_DISPATCH = None
 
@@ -944,9 +950,11 @@ def _qc_plane_kt(qwords_head, row_words, mask_n, pbase,
     cols = (garr // W) * BITS + pbase + (garr % W)
     if WPH_PAD > WPH:
         w = tl.load(qwords_head + row_words[None, :] + cols[:, None],
-                    mask = mask_n[None, :] & (garr < WPH)[:, None], other = 0)
+                    mask = mask_n[None, :] & (garr < WPH)[:, None], other = 0,
+                    eviction_policy = KV_L2_POLICY)
     else:
-        w = tl.load(qwords_head + row_words[None, :] + cols[:, None], mask = mask_n[None, :], other = 0)
+        w = tl.load(qwords_head + row_words[None, :] + cols[:, None], mask = mask_n[None, :], other = 0,
+                    eviction_policy = KV_L2_POLICY)
     nib = (w[:, None, :] >> (tl.arange(0, VPW) * W)[None, :, None]) & ((1 << W) - 1)
     return tl.reshape(nib, (HD_PAD, w.shape[1]))
 
@@ -962,9 +970,11 @@ def _qc_plane_v(qwords_head, row_words, mask_n, pbase,
     cols = (garr // W) * BITS + pbase + (garr % W)
     if WPH_PAD > WPH:
         w = tl.load(qwords_head + row_words[:, None] + cols[None, :],
-                    mask = mask_n[:, None] & (garr < WPH)[None, :], other = 0)
+                    mask = mask_n[:, None] & (garr < WPH)[None, :], other = 0,
+                    eviction_policy = KV_L2_POLICY)
     else:
-        w = tl.load(qwords_head + row_words[:, None] + cols[None, :], mask = mask_n[:, None], other = 0)
+        w = tl.load(qwords_head + row_words[:, None] + cols[None, :], mask = mask_n[:, None], other = 0,
+                    eviction_policy = KV_L2_POLICY)
     nib = (w[:, :, None] >> (tl.arange(0, VPW) * W)[None, None, :]) & ((1 << W) - 1)
     return tl.reshape(nib, (w.shape[0], HD_PAD))
 
@@ -1075,14 +1085,16 @@ def _nvfp4_decode_tile(codes_pool, scales_pool, tok_rows, kv_head, mask_n,
     pidx = tl.arange(0, PP)
     sidx = tl.arange(0, SS)
     b = tl.load(codes_pool + tok_rows[:, None] * BYTES_PER_ROW + kv_head * PAIRS_PER_HEAD + pidx[None, :],
-                mask=mask_n[:, None] & (pidx < PAIRS_PER_HEAD)[None, :], other=0).to(tl.int32)
+                mask=mask_n[:, None] & (pidx < PAIRS_PER_HEAD)[None, :], other=0,
+                eviction_policy=KV_L2_POLICY).to(tl.int32)
     code = tl.reshape(tl.join(b & 0xF, b >> 4), (b.shape[0], HD_PAD))
     m = code & 7
     bits = (((m >> 1) + 14) << 10) | ((m & 1) << 9)
     bits = tl.where(m == 0, 0, bits ^ ((code >> 3) << 15))
     v = bits.to(tl.int16).to(tl.float16, bitcast=True)
     sc = tl.load(scales_pool + tok_rows[:, None] * SCALES_PER_ROW + kv_head * SCALE_BLOCKS + sidx[None, :],
-                 mask=mask_n[:, None] & (sidx < SCALE_BLOCKS)[None, :], other=0.0).to(tl.float16)
+                 mask=mask_n[:, None] & (sidx < SCALE_BLOCKS)[None, :], other=0.0,
+                 eviction_policy=KV_L2_POLICY).to(tl.float16)
     scx = tl.reshape(tl.broadcast_to(sc[:, :, None], (sc.shape[0], SS, 16)), (sc.shape[0], HD_PAD))
     return v * scx
 
