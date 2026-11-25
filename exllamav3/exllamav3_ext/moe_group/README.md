@@ -24,6 +24,34 @@ table from exl3-shaped mocks and carries the swap positive control (names the pa
 across 24 field comparisons. Regenerate the fixture after any header change:
 `nvcc -arch=compute_89 moe_abi_probe.cu -o moe_abi_probe && ./moe_abi_probe`.
 
+## Integration decision (2026-11-25, supersedes "write our own grouped decode")
+
+Reading `exllamav3/exllamav3_ext/quant/exl3_moe_coop.{cuh,cu}` showed the tree ALREADY has the grouped
+decode tier phase 1 needs, in service for stacked-expert architectures:
+
+- `MoeCoopParams` is driven by PER-EXPERT POINTER TABLES (nine int64 device arrays:
+  {g,u,d}_{trellis,suh,svh} + bias tables) — the same design conclusion this branch reached
+  independently; bsz≤scratch decode regime; two ordinary launches (rot kernel only when bsz>1)
+  with device-side completion counters (ctr_a/ctr_b), run table and ksplit — no stream syncs,
+  graph-recordable like the rest of ext.
+- `exl3_moe_coop_launch` reads `sel` (int64) and `rw` (half) as DEVICE arrays — the served
+  Inkling-2 D2H at `inkling2_loop.py:1134` exists only because python dispatches, not because
+  the kernel needs host values.
+
+Primary path therefore: `moe_route.cu` (device top-k/renorm, this branch) ->
+`moe_coop_adapter.cu` (int32 sel -> int64, float w -> half at fixed addresses; compile-verified
+on dot26 2026-11-25, `nvcc -arch=compute_89 -std=c++20 -c` exit 0 with the venv's torch
+includes; positive control: the same command at -std=c++17 was RED with 100 header errors) ->
+`exl3_moe_coop_launch`. The hand-written `moe_group_gemv.cu` (int4 placeholder stream) is
+DEMOTED to the fallback/measurement comparator for fence 3; it must not serve a real pack.
+
+GATE FOUND WHILE READING (wheel-batch coupling): this lineage's coop act selector has only
+SILU/GELU/RELU2/SILU_OAI (`exl3_moe_coop_kernel.cuh:119-123`) — the softcap-swiglu selector
+(`MOE_COOP_ACT_SOFTCAP` + `up_cap`) landed on `dsh-softcap` (`aae2681f`), which is NOT in the
+`d48fe4c1` lineage. The coop path cannot serve Inkling-2 until that selector rides the same
+wheel batch or is reproduced on this branch; driving coop with a wrong act would be WORSE than
+today's python path (it was exactly this silent-SiLU bug class that aae2681f fixed).
+
 ## Shape (updated after reading exl3.py 2026-11-25)
 
 - `moe_sm89_common.cuh` — served geometry (128 experts, top_k 8, hidden 2304, inter 9216,
@@ -65,18 +93,18 @@ fence 3 (dot26 bench-lane decode delta + greedy parity, owner window) attach at 
 
 ## Integration TODOs (next commits on this branch, before any wheel ride)
 
-1. **Trellis stream substitution** (was: exl3 wire-in): the table side is DONE (MoEExl3Ref +
-   ABI fence). Remaining: replace the int4 placeholder unpack with the rotated-basis trellis
-   decode (bit-exact against ext's `reconstruct`/`BC_LinearEXL3` machinery), and fold the
-   Hadamard chain the exl3 forward path implies: x -> `had_r_128`(suh) before leg GU;
-   accumulator -> `had_r_128`(svh) in leg D's epilogue (128-wide output blocks; 2304/9216 are
-   128-divisible). The old `MoEWeightRef` (qbytes/scales/group_size) remains only as the mma
-   smoke-path placeholder until then and must not feed a real pack.
-2. Python wiring: table construction at load, buffer arena sized per max batch, `params`
-   plumbing, and retirement of the `host_values`/`stage_host` pinned-slot dance (census item A —
-   the by-value fixed-address exchange in `MoERouting` is the Strata-doorbell lesson adopted
-   2026-11-24, campaign §210; whole-forward graph capture becomes a by-product witness, fence 4,
-   never the gate: law 15).
-3. Host-side grid sizing (`cudaOccupancyMaxActiveBlocksPerMultiprocessor`), replacing the
-   draft's fixed `grid` argument.
-4. Shared-memory opt-in only if BLOCK_K grows; the draft fits 48 KB static.
+1. **Act-selector alignment** (gate above): bring `MOE_COOP_ACT_SOFTCAP` + `up_cap` into this
+   lineage (cherry-pick `aae2681f` from `dsh-softcap` — same act family, `cg*tanh(g/cg)*
+   sigmoid(g) * cu*tanh(u/cu)`) and verify the selector matches `inkling2_loop.py:1155-1158`
+   elementwise before the coop path is allowed to serve Inkling-2.
+2. Python wiring for the coop drive: build the nine int64 pointer tables from `experts_g/u/d[e]`
+   LinearEXL3 tensors at load; scratch via `exl3_moe_coop_ctr_len` + this branch's capacity
+   formula; fixed-address `sel64/rw16` + x/out slots per capture round (doorbell rule); expose
+   `moe_coop_launch_with_device_routing` through `bindings.cpp`; retire
+   `host_values`/`stage_host` in `inkling2_loop.py:1131-1160` behind the fence-2 trace arm.
+3. Fallback comparator only (`moe_group_gemv.cu`): host grid sizing
+   (`cudaOccupancyMaxActiveBlocksPerMultiprocessor`) and, if it is ever promoted to primary,
+   the trellis stream substitution (replace the int4 placeholder unpack; fold x*suh pre-GU and
+   the svh hadamard into leg D's epilogue). Until then its `MoEWeightRef` table must not feed
+   a real pack.
+4. Shared-memory opt-in in the fallback only if BLOCK_K grows; the draft fits 48 KB static.
