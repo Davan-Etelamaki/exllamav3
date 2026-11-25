@@ -5,7 +5,10 @@ compile-verified only** — nothing here is wired into the build or the served p
 
 ## What it replaces
 
-The served python dispatch at `exllamav3/modules/arch_specific/inkling2_loop.py:1134-1160`:
+The served python dispatch in `exllamav3/modules/arch_specific/inkling2_loop.py`,
+`Inkling2LoopSparseMoeBlock.forward` — bound by strings, not line numbers (they decay;
+at tip 7c03387b the block is :1225-1251, `sel_cpu = host_values(...)` through
+`return out.view(b, t, h)`; the coop branch enters at :1211):
 a per-MoE-layer D2H sync (`host_values(...).tolist()`), a python sort + 8-iteration grouping
 loop, and 24 launches per layer through independent per-expert `Linear` modules
 (`experts_g/u/d[e]`, built at :1072-1088 — per-expert qgroups, NOT the stacked `ExpertsCFG`
@@ -35,7 +38,8 @@ decode tier phase 1 needs, in service for stacked-expert architectures:
   with device-side completion counters (ctr_a/ctr_b), run table and ksplit — no stream syncs,
   graph-recordable like the rest of ext.
 - `exl3_moe_coop_launch` reads `sel` (int64) and `rw` (half) as DEVICE arrays — the served
-  Inkling-2 D2H at `inkling2_loop.py:1134` exists only because python dispatches, not because
+  Inkling-2 D2H (`host_values(sel_flat, ...)` in `inkling2_loop.py`, anchor-bound;
+  :1225 at tip 7c03387b) exists only because python dispatches, not because
   the kernel needs host values.
 
 Primary path therefore: `moe_route.cu` (device top-k/renorm, this branch) ->
