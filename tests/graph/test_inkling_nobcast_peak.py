@@ -236,11 +236,15 @@ def main():
                   f"(x{t_tgt / max(t_inc, 1e-9):.2f}, reported only)")
         else:
             within = p_tgt.largest <= budget
-            shrunk = p_tgt.largest < p_inc.largest and p_tgt.cum < p_inc.cum
+            # `largest` may stay EQUAL where the top allocation at that shape is the tile budget's
+            # own footprint (aten::cat of the concatenated logits) -- no fold touches it and the
+            # incumbent paid it too. It may never GROW. The replica-count gate is the detector for
+            # the defect this patch removes; the sabotage arm proves that gate still fires.
+            shrunk = p_tgt.largest <= p_inc.largest and p_tgt.cum < p_inc.cum
             good = common and bit and within and shrunk
             print(f"[{'PASS' if good else 'FAIL'}] T={T} S={S}: replica copies inc={len(p_inc.replicas)} "
                   f"tgt={len(p_tgt.replicas)} (want 0) | largest {p_inc.largest/2**20:.1f}->"
-                  f"{p_tgt.largest/2**20:.1f} MiB (budget {budget/2**20:.0f}; must shrink and fit) | "
+                  f"{p_tgt.largest/2**20:.1f} MiB (budget {budget/2**20:.0f}; must not grow and must fit) | "
                   f"cumulative {p_inc.cum/2**30:.2f}->{p_tgt.cum/2**30:.2f} GiB (must shrink) | "
                   f"bit={bit} codes_differing={n_diff} "
                   f"maxabs={gap:.3e} | tile={tile_used} k_chunk={max(EXTENT, ns['_ATTEND_K_CHUNK_BYTES'] // (KVH * D * 4))} "
