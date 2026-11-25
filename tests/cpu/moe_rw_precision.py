@@ -3,8 +3,10 @@
 
 Multiply sites (supervisor charge A, 2026-11-25 — exact lines):
   served:  Inkling2LoopSparseMoeBlock.forward — out.index_add_(..., y.float() * w_flat...)
-           fp32 weight (string anchor; at tip 92dbb4df this line is :1250 and w_flat is
-           built at :1216 — earlier cites to :1160 were moved by the coop wiring commit)
+           fp32 weight (string anchor; at tip fc4a5451 this line is :1250 and w_flat is
+           built at :1216; it was :1115 BEFORE the coop wiring commit — the earlier
+           :1160 cite came from the design brief and matched neither tree, supervisor
+           §R caught it)
   coop:    the half weight is cast back INSIDE the kernel at
            exl3_moe_coop_kernel.cuh:220 (si.w = __half2float(p.rw[s]), slot load of the B
            stage) and multiplied against the fp32 partial in the fp32 accumulate at
