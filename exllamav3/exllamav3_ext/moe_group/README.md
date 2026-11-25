@@ -11,7 +11,20 @@ loop, and 24 launches per layer through independent per-expert `Linear` modules
 (`experts_g/u/d[e]`, built at :1072-1088 — per-expert qgroups, NOT the stacked `ExpertsCFG`
 containers of `modules/block_sparse_mlp.py`, which belong to a different architecture).
 
-## Shape
+## ABI fence (instant, CPU + dot26 probe — added 2026-11-25)
+
+`moe_exl3_table.cuh` defines the REAL per-expert reference `MoEExl3Ref` (trellis/suh/svh/mcg/
+mul1 + dims, 64 B — fields taken from the served `LinearEXL3`, exllamav3/modules/quant/exl3.py)
+with expectation literals; `moe_abi_probe.cu` is a PURE-HOST probe (no CUDA runtime call) built
+and run on dot26; its raw output is the fixture `tests/cpu/moe_abi_probe_output.txt`.
+`tests/cpu/moe_abi_crosscheck.py` pins compiled layout == literals == python ctypes mirror ==
+simulation geometry, checks the arena capacity formula against the compiled values, builds the
+table from exl3-shaped mocks and carries the swap positive control (names the pair). GREEN
+2026-11-25: 9 offsets, 4 geometry ties, 4 capacity points, control flagged exactly (5, 97)
+across 24 field comparisons. Regenerate the fixture after any header change:
+`nvcc -arch=compute_89 moe_abi_probe.cu -o moe_abi_probe && ./moe_abi_probe`.
+
+## Shape (updated after reading exl3.py 2026-11-25)
 
 - `moe_sm89_common.cuh` — served geometry (128 experts, top_k 8, hidden 2304, inter 9216,
   gate cap 4 / up cap 25), the load-time `MoEPtrTable` (~12 KiB of pointers per layer — a
@@ -52,10 +65,13 @@ fence 3 (dot26 bench-lane decode delta + greedy parity, owner window) attach at 
 
 ## Integration TODOs (next commits on this branch, before any wheel ride)
 
-1. **exl3 wire-in**: replace `moe_unpack_int4x8` + the raw-nibble stream with the real exl3
-   trellis decode (quants machinery), keeping `MoEWeightRef` as the carrier (it already holds
-   the fields a pack needs: `qbytes`, `scales`, `group_size`). Until then the int4+qgroup-scale
-   placeholder also imposes `group_size % MOE_BLOCK_K == 0`, which the table builder must assert.
+1. **Trellis stream substitution** (was: exl3 wire-in): the table side is DONE (MoEExl3Ref +
+   ABI fence). Remaining: replace the int4 placeholder unpack with the rotated-basis trellis
+   decode (bit-exact against ext's `reconstruct`/`BC_LinearEXL3` machinery), and fold the
+   Hadamard chain the exl3 forward path implies: x -> `had_r_128`(suh) before leg GU;
+   accumulator -> `had_r_128`(svh) in leg D's epilogue (128-wide output blocks; 2304/9216 are
+   128-divisible). The old `MoEWeightRef` (qbytes/scales/group_size) remains only as the mma
+   smoke-path placeholder until then and must not feed a real pack.
 2. Python wiring: table construction at load, buffer arena sized per max batch, `params`
    plumbing, and retirement of the `host_values`/`stage_host` pinned-slot dance (census item A —
    the by-value fixed-address exchange in `MoERouting` is the Strata-doorbell lesson adopted

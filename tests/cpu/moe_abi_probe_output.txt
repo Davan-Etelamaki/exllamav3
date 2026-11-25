@@ -1,0 +1,24 @@
+sizeof MoEExl3Ref       64  expect  64
+offsetof trellis          0  expect   0
+offsetof suh              8  expect   8
+offsetof svh             16  expect  16
+offsetof mcg             24  expect  24
+offsetof mul1            32  expect  32
+offsetof in_features     40  expect  40
+offsetof out_features    44  expect  44
+offsetof k_width         48  expect  48
+offsetof has_mcg         52  expect  52
+layer_bytes            24576
+geom num_experts       128
+geom top_k             8
+geom hidden            2304
+geom inter             9216
+geom gate_cap          4.0
+geom up_cap            25.0
+geom block_m           16
+geom block_n           64
+geom block_k           32
+capacity entries 8     padded_rows 128    max_blocks 8    
+capacity entries 64    padded_rows 1024   max_blocks 64   
+capacity entries 512   padded_rows 2432   max_blocks 152  
+capacity entries 2048  padded_rows 3968   max_blocks 248  
