@@ -79,9 +79,13 @@ class Peak(torch.utils._python_dispatch.TorchDispatchMode):
     def __torch_dispatch__(self, func, types_, args=(), kwargs=None):
         out = func(*args, **(kwargs or {}))
         name = getattr(func, "_name", str(func))
+        # Dispatch reports overload-suffixed names (aten::slice.Tensor, aten::transpose.int), so match on
+        # the base op name -- otherwise views are counted as materialisations and both `largest` and the
+        # cumulative total inflate (observed: a hoisted transpose VIEW counted as 256 MiB "allocated").
+        base = str(name).split(".")[0]
         for t in self._tensors(out):
             nb = t.numel() * t.element_size()
-            if name in VIEW_OPS or (t.is_leaf is False and t._base is not None):
+            if base in VIEW_OPS or name in VIEW_OPS or (t.is_leaf is False and t._base is not None):
                 continue
             self.cum += nb
             if name in COPY_OPS and tuple(t.shape) in self.replica_shapes:

@@ -796,6 +796,10 @@ class InklingAttention(Module):
                 sc3 = torch.empty((kvh, grp * (qe - qs), S), dtype=torch.float32, device=q.device)
                 for c0 in range(0, S, k_chunk):
                     c1 = min(c0 + k_chunk, S)
+                    # Slice the hoisted (kvh,d,S) view, not k itself: slicing k before the transposes was
+                    # measured WORSE at decode (T=1, S=131,072: +0.79 GiB of per-block transpose and slice
+                    # traffic versus +0.29 GiB here), because each block then re-transposes and torch
+                    # materialises those intermediates. The peak cap is identical either way.
                     sc3[:, :, c0:c1] = torch.matmul(q4t, kxf[:, :, c0:c1].float())
                 sc = sc3.view(kvh, grp, qe - qs, S) * self.scaling
             else:
