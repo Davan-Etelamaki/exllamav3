@@ -272,7 +272,7 @@ class InklingConvs(Module):
         self.key_attn_conv = key_attn_conv
         self.key_mlp_conv = key_mlp_conv
 
-        self.w_k = self.w_v = self.w_attn = self.w_mlp = None
+        self.w_k = self.w_v = self.w_kv = self.w_attn = self.w_mlp = None
         self.k_static = self.v_static = None
         self.k_wproj = self.v_wproj = None
 
@@ -317,6 +317,9 @@ class InklingConvs(Module):
         else:
             self.w_k = self._load_depthwise(self.key_k_conv + ".weight", self.kv_dim)
             self.w_v = self._load_depthwise(self.key_v_conv + ".weight", self.kv_dim)
+            # Prebuild the fused K/V weight (rung 4): cat once at load so conv_kv costs no
+            # per-token concatenation. (2*kv, 1, K), matches conv_kv's groups = 2*kv.
+            self.w_kv = torch.cat([self.w_k, self.w_v], dim = 0).unsqueeze(1).contiguous()
         self.w_attn = self._load_depthwise(self.key_attn_conv + ".weight", self.hidden_size)
         self.w_mlp = self._load_depthwise(self.key_mlp_conv + ".weight", self.hidden_size)
         for rl in self.recurrent_layers:
@@ -324,7 +327,7 @@ class InklingConvs(Module):
 
     @override
     def unload(self):
-        self.w_k = self.w_v = self.w_attn = self.w_mlp = None
+        self.w_k = self.w_v = self.w_kv = self.w_attn = self.w_mlp = None
         self.k_static = self.v_static = self.k_wproj = self.v_wproj = None
         for rl in self.recurrent_layers:
             rl.free()
@@ -386,9 +389,58 @@ class InklingConvs(Module):
             y = F.conv1d(full, weight.unsqueeze(1), None, padding = kdim - 1, groups = chan)
             ys.append(y[:, :, kdim:kdim + seqlen])
 
-        out = torch.cat(ys, dim = 0).transpose(1, 2)                    # (B, T, C)
+        out = (ys[0] if len(ys) == 1 else torch.cat(ys, dim = 0)).transpose(1, 2)   # (B, T, C)
         out = (out + residual) / math.sqrt(kdim + 1)
         return out.to(input_dtype)
+
+    def conv_kv(self, k_lin: torch.Tensor, v_lin: torch.Tensor, params: dict):
+        """K and V depthwise convs in ONE conv1d launch (sm_89 rung 4: the K/V attention-prepare
+        kernels run as one launch). Depthwise conv mixes no channels, so concatenating K and V on
+        the channel axis and sharing the residual/scale is bit-identical to two separate conv()
+        calls. The fused weight is prebuilt in load(); the stored K/V conv-state buffers are read
+        in place (no full-width per-token copy), so the only added kernel per token is the single
+        activation cat the one conv1d needs, against dropping a whole second conv body."""
+        kdim = self.conv_kernel_size
+        input_dtype = k_lin.dtype
+        kv = k_lin.shape[-1]
+        x = torch.cat([k_lin, v_lin], dim = -1).float()                   # (B, T, 2*kv)
+        residual = x
+        bsz, seqlen, chan = x.shape
+        xt = x.transpose(1, 2)                                            # (B, 2*kv, T)
+
+        st, slots = self._state_slot(params)
+        if st is None:
+            state = torch.zeros((bsz, chan, kdim), dtype = torch.float, device = x.device)
+            slots_cpu = list(range(bsz))
+            save_history = False
+            bufs = None
+        else:
+            sk, sv = st.conv_states["k"], st.conv_states["v"]
+            slots_cpu = slots
+            save_history = params.get("recurrent_history", False)
+            bufs = ((sk, 0, kv), (sv, kv, chan))
+
+        ys = []
+        for i, slot in enumerate(slots_cpu):
+            if bufs is None:
+                lpad = state[slot, :, :kdim].unsqueeze(0)
+            else:
+                lpad = torch.cat([sk[slot, :, :kdim], sv[slot, :, :kdim]], dim = 0).unsqueeze(0)
+            full = torch.cat([lpad, xt[i].unsqueeze(0)], dim = -1)
+            if save_history:
+                for dst, s0, s1 in bufs:
+                    write_size = min(dst.shape[-1], full.shape[-1])
+                    dst[slot][:, -write_size:].copy_(full[0, s0:s1, -write_size:])
+            elif bufs is not None:
+                for dst, s0, s1 in bufs:
+                    dst[slot][:, :kdim].copy_(full[0, s0:s1, -kdim:])
+            y = F.conv1d(full, self.w_kv, None, padding = kdim - 1, groups = chan)
+            ys.append(y[:, :, kdim:kdim + seqlen])
+
+        out = (ys[0] if len(ys) == 1 else torch.cat(ys, dim = 0)).transpose(1, 2)   # (B, T, 2*kv)
+        out = (out + residual) / math.sqrt(kdim + 1)
+        out = out.to(input_dtype)
+        return out[..., :kv], out[..., kv:]
 
     def conv_dynamic(self, which: str, x: torch.Tensor, dyn_input: torch.Tensor, params: dict) -> torch.Tensor:
         """
@@ -625,8 +677,7 @@ class InklingAttention(Module):
         k_lin = self.wk.forward(h_k, params)
         v_lin = self.wv.forward(h_v, params)
         if self.sliding:
-            kc = self.convs.conv("k", k_lin, params)
-            vc = self.convs.conv("v", v_lin, params)
+            kc, vc = self.convs.conv_kv(k_lin, v_lin, params)
         else:
             kc = self.convs.conv_dynamic("k", k_lin, h_k, params)
             vc = self.convs.conv_dynamic("v", v_lin, h_v, params)
