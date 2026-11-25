@@ -21,7 +21,9 @@ from ...cache.recurrent import host_copy
 from ...model.config import Config
 from ...util.tensor import get_for_device, host_values, stage_host
 from ...constants import PAGE_SIZE
+from ...ext import exllamav3_ext as ext
 from .. import Module, Linear, RMSNorm
+from . import moe_coop_plan
 
 KEY_FLOW = "inkling_flow"
 
@@ -1085,6 +1087,9 @@ class InklingMoE(Module):
             self.experts_d.append(d)
             for lin in (g, u, d):
                 self.register_submodule(lin)
+        # Per-decode-batch fixed-address arenas for the exl3_moe_coop decode tier
+        # (moe_group/README.md); empty until the first eligible decode step.
+        self._coop_by_rows: dict = {}
 
     @override
     def optimizer_targets(self):
@@ -1100,6 +1105,7 @@ class InklingMoE(Module):
     @override
     def unload(self):
         self.router_w = self.router_bias = None
+        self._coop_by_rows = {}  # pointer tables pin device addresses; they die with the weights
         super().unload()
 
     @override
@@ -1109,6 +1115,87 @@ class InklingMoE(Module):
             if x is not None:
                 t[k] = x
         return t
+
+    def _coop_ptr_lists(self):
+        return {
+            tag + "_" + what: [getattr(m, what).data_ptr() for m in mods]
+            for tag, mods in (("g", self.experts_g), ("u", self.experts_u), ("d", self.experts_d))
+            for what in ("trellis", "suh", "svh")
+        }
+
+    def _coop_state(self, device, rows: int):
+        """Fixed-address arena for one decode batch size: nine int64 pointer tables (the
+        per-expert LinearEXL3 tensors are referenced BY POINTER at load — never a stacked
+        copy), the coop scratch and the fp32 output buffer. Built once per (batch-size,
+        load epoch); reloads invalidate it via unload()."""
+        desc = moe_coop_plan.classify_experts(zip(self.experts_g, self.experts_u, self.experts_d))
+        if desc is None:
+            return None
+        g0, d0 = self.experts_g[0], self.experts_d[0]
+        Hi, I = int(g0.in_features), int(g0.out_features)
+        Ho = int(d0.out_features)
+        h = self.hidden_size
+        if Hi % 128 or I % 128 or Ho % 128 or Ho < h or int(d0.in_features) != I:
+            return None
+        # (expert-bias homogeneity and bit/codebook uniformity are decided by
+        # moe_coop_plan.classify_experts above, where the CPU fence guards them)
+        ptr_lists = self._coop_ptr_lists()
+        tables = {k: torch.tensor(v, dtype = torch.int64, device = device) for k, v in ptr_lists.items()}
+        slots = rows * self.top_k
+        args = dict(
+            min_expert = -1, max_expert = -1, Hi = Hi,
+            g_bias = None, u_bias = None, d_bias = None,
+            Kg = desc["Kg"], Ku = desc["Ku"], Kd = desc["Kd"],
+            mcg = desc["mcg"], mul1 = desc["mul1"],
+            act = moe_coop_plan.MOE_COOP_ACT_SOFTCAP,
+            act_limit = self.gate_softcap, up_cap = self.up_softcap, gated = True,
+            sh_out = None, sh_gate_w = None,
+            had_g = torch.zeros((slots, Hi), dtype = torch.half, device = device),
+            had_u = torch.zeros((slots, Hi), dtype = torch.half, device = device),
+            gu_g = torch.zeros((slots, I), dtype = torch.half, device = device),
+            gu_u = torch.zeros((slots, I), dtype = torch.half, device = device),
+            act_out = torch.zeros((slots, I), dtype = torch.half, device = device),
+            d_out = torch.zeros((slots, Ho), dtype = torch.float, device = device),
+            ctr = torch.zeros(moe_coop_plan.ctr_len(slots, rows, I, Ho), dtype = torch.int, device = device),
+            out = torch.zeros((rows, h), dtype = torch.float, device = device),
+            **tables,
+        )
+        st = {"args": args, "ptr_lists": ptr_lists,
+              "fingerprint": tuple(p for k in sorted(ptr_lists) for p in ptr_lists[k])}
+        self._coop_by_rows[rows] = st
+        return st
+
+    def _coop_decode(self, flat, sel, w):
+        """Grouped decode through exl3_moe_coop: one launch pair for the whole MoE layer,
+        routing kept ON DEVICE (the host_values/stage_host roundtrip and the per-expert
+        python loop are skipped entirely). Returns None to keep the python dispatch —
+        prefill, unsupported pack geometry, expert weights that vanished or an extension
+        without the entry point. Decode-only contract: rows <= 32, slots <= 256
+        (exllamav3/exllamav3_ext/moe_group/README.md)."""
+        rows = flat.size(0)
+        if not moe_coop_plan.eligible(rows, self.top_k, flat.is_cuda,
+                                      flat.dtype == torch.half,
+                                      hasattr(ext, "exl3_moe_coop")):
+            return None
+        st = self._coop_by_rows.get(rows) or self._coop_state(flat.device, rows)
+        if st is None:
+            return None
+        args = st["args"]
+        cur_lists = self._coop_ptr_lists()
+        fingerprint = tuple(p for k in sorted(cur_lists) for p in cur_lists[k])
+        if fingerprint != st["fingerprint"]:
+            # Weights moved (offload/reload): refill the tables IN PLACE so the addresses
+            # a captured graph round baked in stay meaningful on replay (doorbell rule).
+            st["ptr_lists"] = cur_lists
+            for k, v in cur_lists.items():
+                args[k].copy_(torch.tensor(v, dtype = torch.int64, device = args["out"].device))
+            st["fingerprint"] = fingerprint
+        call = dict(args)
+        call["x"] = flat
+        call["sel"] = sel.reshape(rows, self.top_k)
+        call["rw"] = w.reshape(rows, self.top_k).half()
+        ext.exl3_moe_coop(*moe_coop_plan.build_call_args(call))
+        return args["out"]
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype = None) -> torch.Tensor:
@@ -1120,6 +1207,10 @@ class InklingMoE(Module):
         w = scores.gather(1, sel)
         w = w / (w.sum(dim = -1, keepdim = True) + 1e-20)
         w = w * self.route_scale
+
+        coop = self._coop_decode(flat, sel, w)
+        if coop is not None:
+            return coop.view(b, t, h)
 
         sel_flat = sel.reshape(-1)
         w_flat = w.reshape(-1)

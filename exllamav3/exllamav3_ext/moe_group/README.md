@@ -171,11 +171,25 @@ with `cuobjdump --dump-elf-symbols` and the expected kernel-entry names in the r
    decision + Verification record above). Python callers that want softcap must set
    `p.act = MOE_COOP_ACT_SOFTCAP`, `p.act_limit = 4.0`, `p.up_cap = 25.0` — done in TODO 2's
    wiring, where the values come from the served module, not literals.
-2. Python wiring for the coop drive: build the nine int64 pointer tables from `experts_g/u/d[e]`
-   LinearEXL3 tensors at load; scratch via `exl3_moe_coop_ctr_len` + this branch's capacity
-   formula; fixed-address `sel64/rw16` + x/out slots per capture round (doorbell rule); expose
-   `moe_coop_launch_with_device_routing` through `bindings.cpp`; retire
-   `host_values`/`stage_host` in `inkling2_loop.py:1131-1160` behind the fence-2 trace arm.
+2. Python wiring for the coop drive — **LANDED 2026-11-25**:
+   `exllamav3/modules/arch_specific/moe_coop_plan.py` (pure-python plan layer: constants,
+   `ctr_len` mirror, eligibility, positional `CALL_ARGS`) + `_coop_decode`/`_coop_state`
+   in `inkling2_loop.py` drive `ext.exl3_moe_coop` (already exposed, bindings.cpp:322 —
+   zero C++ changes). Nine int64 POINTER tables built from `experts_g/u/d[e]`
+   LinearEXL3 `.trellis/.suh/.svh` `data_ptr()` at first eligible decode step — the coop
+   `prepare` consumes tables directly (its `*_trellis` args ARE int64 tables,
+   `n_local = size(0)`), so no stacked copy ever exists. Fixed-address arena per
+   (decode-rows, load-epoch): `had_g/had_u/gu_g/gu_u/act_out/d_out/ctr/out`, cleared on
+   `unload()`; a weight-pointer fingerprint is re-checked per call and refilled IN PLACE
+   on drift so captured addresses stay meaningful (doorbell rule). Router stays torch
+   (byte-identical routing; `sel` is already int64, `rw = w.half()`). NUMERICS NOTE:
+   `rw` rides the coop boundary as HALF while the python path multiplied fp32 weights —
+   fence 3's greedy parity prices this honestly; `gu` scratch is half, which MATCHES the
+   served rounding (`expert.forward` returns half, `act` computed after `.float()`).
+   Legacy `host_values`/`stage_host` path RETAINED (prefill + ineligible shapes still
+   ride it); its retirement behind the fence-2 trace arm is a wheel-window decision.
+   Drift fence: `tests/cpu/moe_coop_plan_fence.py` re-parses the headers (constants,
+   37-parameter call order, ctr formula text) with a planted-rename control.
 3. Fallback comparator only (`moe_group_gemv.cu`): host grid sizing
    (`cudaOccupancyMaxActiveBlocksPerMultiprocessor`) and, if it is ever promoted to primary,
    the trellis stream substitution (replace the int4 placeholder unpack; fold x*suh pre-GU and
