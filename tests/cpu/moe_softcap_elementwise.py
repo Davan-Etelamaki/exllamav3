@@ -2,8 +2,10 @@
 """Elementwise fence: the merged coop SOFTCAP act branch == served inkling2_loop.py epilogue.
 
 TODO-1 gate from the Integration decision: MOE_COOP_ACT_SOFTCAP (cherry-picked as
-020ce47c from dsh-softcap aae2681f) must compute EXACTLY the served activation at
-inkling2_loop.py:1155-1158:
+020ce47c from dsh-softcap aae2681f) must compute EXACTLY the served epilogue in
+Inkling2LoopSparseMoeBlock.forward — gate tanh-cap line, sigmoid line, up tanh-cap line
+(numbers decay with edits: 1246-1248 at tip 355f7530; the SERVED_ANCHORS strings below
+are the authoritative binding — supervisor note 2026-11-25):
     act = tanh(g/cg)*cg * sigmoid(g) * (tanh(u/cu)*cu)
 
 The compared C++ expression is EXTRACTED from the tree (exll3_moe_coop_kernel.cuh's
@@ -17,8 +19,8 @@ import sys
 
 import torch
 
-GATE_CAP = 4.0        # served gate_softcap (inkling2_loop.py:1155)
-UP_CAP = 25.0         # served up softcap  (inkling2_loop.py:1156)
+GATE_CAP = 4.0        # served gate_softcap (anchor: "act = torch.tanh(g / self.gate_softcap)")
+UP_CAP = 25.0         # served up softcap  (anchor: "act = act * (torch.tanh(u / self.up_softcap)")
 SEED = 20261125
 N = 1 << 20
 ATOL = 1e-6           # fp32 reassociation only
@@ -74,8 +76,13 @@ def main():
     kernel_act = eval(py_expr, env)  # noqa: S307 - expression extracted above
     ref = served_act(g, u)
     ok = torch.allclose(kernel_act, ref, atol=ATOL, rtol=RTOL)
-    md = (kernel_act - ref).abs().max().item()
-    print(f"elementwise N={N}: max|delta| = {md:.3e} (bound atol {ATOL} / rtol {RTOL})")
+    diff = (kernel_act - ref).abs()
+    md = diff.max().item()
+    at_worst = int(diff.argmax())
+    eff = ATOL + RTOL * ref.abs().max().item()
+    print(f"elementwise N={N}: max|delta| = {md:.3e} at |ref| = {ref.abs().max().item():.3e}")
+    print(f"EFFECTIVE allclose bound at that magnitude: atol {ATOL} + rtol {RTOL} * |ref| = {eff:.3e}"
+          f" (max|delta| is {eff / md:.1f}x under)")
 
     # POSITIVE CONTROL: single-cap mistake (gate cap used for both caps) must breach.
     bad_env = dict(env)

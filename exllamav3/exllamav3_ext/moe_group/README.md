@@ -156,9 +156,14 @@ with `cuobjdump --dump-elf-symbols` and the expected kernel-entry names in the r
   `exl3_moe_coop_ns::exl3_moe_coop_a/b_kernel<…>` (the templates that embed `act_gate`'s
   softcap branch); `cuobjdump -sass` of one instantiation shows MUFU.TANH instructions —
   the softcap math is really emitted, not dead-stripped. Standalone coop-TU compiles must
-  pass torch's default extension flags `--expt-relaxed-constexpr --expt-extended-lambda`
-  (torch `cpp_extension.py` injects them; the repo's own `cuda_flags.cuda_cflags` does not) —
-  without them CUDA 13 rejects the plain-`constexpr` tile helpers.
+  pass `--expt-relaxed-constexpr` (from torch `cpp_extension.py` `COMMON_NVCC_FLAGS`,
+  line 388 of 2.14.1+cu130; the repo's own `cuda_flags.cuda_cflags` does not list it) —
+  without it CUDA 13 rejects the plain-`constexpr` tile helpers. `--expt-extended-lambda`
+  is NOT needed (recompiled the instantiation TU without it: exit 0 — it was my hand
+  addition). Wheel-EXACT scratch recipe verified: torch's four `-D__CUDA_NO_*HALF/BFLOAT*`
+  defines + `--expt-relaxed-constexpr` + repo `-O3 --use_fast_math` +
+  `-Xcudafe --diag_suppress=177/20012`, `-std=c++20 -arch=sm_89` → instantiation TU
+  exit 0; scratch and wheel flag sets agree.
 
 ## Deferred to dot26 / the owner's wheel window (laws 13/31/38)
 
