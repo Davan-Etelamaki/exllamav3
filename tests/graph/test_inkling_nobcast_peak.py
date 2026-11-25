@@ -106,7 +106,7 @@ def extract(path):
     for node in tree.body:
         if isinstance(node, ast.Assign):
             for tg in node.targets:
-                if isinstance(tg, ast.Name) and tg.id == "_ATTEND_TILE_BYTES":
+                if isinstance(tg, ast.Name) and tg.id in {"_ATTEND_TILE_BYTES", "_ATTEND_K_CHUNK_BYTES"}:
                     picked.append(ast.get_source_segment(text, node))
         if isinstance(node, ast.ClassDef):
             for sub in node.body:
@@ -114,7 +114,7 @@ def extract(path):
                     picked.append(ast.get_source_segment(text, sub))
     ns = {"torch": torch, "F": torch.nn.functional, "_os": os, "math": __import__("math")}
     exec(compile("\n\n".join(picked), path, "exec"), ns)   # noqa: S102 - project source
-    for need in ("_attend_one", "_attend_one_tile", "_ATTEND_TILE_BYTES"):
+    for need in ("_attend_one", "_attend_one_tile", "_ATTEND_TILE_BYTES", "_ATTEND_K_CHUNK_BYTES"):
         if need not in ns:
             raise RuntimeError(f"{path}: missing {need}")
     return ns
@@ -178,7 +178,12 @@ def main():
     args = ap.parse_args()
     ns = extract(args.source)
     budget = ns["_ATTEND_TILE_BYTES"]
-    print(f"[cfg] target={args.source} budget={budget/2**20:.0f}MiB threads={torch.get_num_threads()} "
+    mode = os.environ.get("INKLING_NOBCAST_TARGET", "source")
+    # INKLING_NOBCAST_TARGET=sabotage points the target leg at the broadcast formulation: the run MUST go
+    # RED (law 21 -- a fence is not trusted until it has been seen to fire).
+    target = incumbent_body if mode == "sabotage" else ns["_attend_one"]
+    print(f"[cfg] target={args.source} mode={mode} budget={budget/2**20:.0f}MiB kchunk="
+          f"{ns['_ATTEND_K_CHUNK_BYTES']/2**20:.0f}MiB threads={torch.get_num_threads()} "
           f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')!r} "
           f"-- regime: CPU, card untouched")
 
@@ -186,6 +191,8 @@ def main():
         "full": [(64, 262144), (2048, 17408), (1, 131072)],
         "decode": [(1, 1024), (1, 17408), (1, 65536), (1, 131072)],   # 44 of 48 layer-executions/token
         "prefill": [(64, 262144), (2048, 17408)],
+        "tiny": [(1, 1024), (1, 4096), (8, 1024)],   # seconds: for sabotage / positive-control drills
+        "chunk": [(8, 20480), (64, 32768), (1, 20480)],   # S > k_chunk: exercises the column-blocked path
     }[os.environ.get("INKLING_NOBCAST_SHAPES", "full")]
 
     ok = True
@@ -198,7 +205,7 @@ def main():
             t_inc = time.perf_counter() - t0
         with Peak(replicas) as p_tgt:
             t0 = time.perf_counter()
-            out_tgt = ns["_attend_one"](stub(ns), *inp)
+            out_tgt = target(stub(ns), *inp)
             t_tgt = time.perf_counter() - t0
 
         bit = bool(torch.equal(out_inc.view(torch.uint16), out_tgt.view(torch.uint16)))
@@ -225,12 +232,15 @@ def main():
                   f"(x{t_tgt / max(t_inc, 1e-9):.2f}, reported only)")
         else:
             within = p_tgt.largest <= budget
-            good = common and bit and within
+            shrunk = p_tgt.largest < p_inc.largest and p_tgt.cum < p_inc.cum
+            good = common and bit and within and shrunk
             print(f"[{'PASS' if good else 'FAIL'}] T={T} S={S}: replica copies inc={len(p_inc.replicas)} "
                   f"tgt={len(p_tgt.replicas)} (want 0) | largest {p_inc.largest/2**20:.1f}->"
-                  f"{p_tgt.largest/2**20:.1f} MiB (budget {budget/2**20:.0f}) | cumulative "
-                  f"{p_inc.cum/2**30:.2f}->{p_tgt.cum/2**30:.2f} GiB | bit={bit} codes_differing={n_diff} "
-                  f"maxabs={gap:.3e} | tile={tile_used} cpu_s {t_inc:.2f}->{t_tgt:.2f} "
+                  f"{p_tgt.largest/2**20:.1f} MiB (budget {budget/2**20:.0f}; must shrink and fit) | "
+                  f"cumulative {p_inc.cum/2**30:.2f}->{p_tgt.cum/2**30:.2f} GiB (must shrink) | "
+                  f"bit={bit} codes_differing={n_diff} "
+                  f"maxabs={gap:.3e} | tile={tile_used} k_chunk={max(EXTENT, ns['_ATTEND_K_CHUNK_BYTES'] // (KVH * D * 4))} "
+                  f"cpu_s {t_inc:.2f}->{t_tgt:.2f} "
                   f"(x{t_tgt / max(t_inc, 1e-9):.2f}, reported only)")
             print(f"          target-largest: {p_tgt.desc}")
             if p_tgt.replicas:
@@ -242,8 +252,9 @@ def main():
         del inp, out_inc, out_tgt, p_inc, p_tgt, ulp, hist
 
     # Latency fence is CPU-only here; the card figure is owed at the boot window (law 38).
-    print(f"\nFENCE {'PASS' if ok else 'RED'} (regime: CPU, threads=4; GPU latency NOT measured -- "
-          f"owed at the owner's restart)")
+    print(f"\nFENCE {'PASS' if ok else 'RED'} (mode={mode}, "
+          f"shapes={os.environ.get('INKLING_NOBCAST_SHAPES', 'full')}, "
+          f"regime: CPU, threads=4; GPU latency NOT measured -- owed at the owner's restart)")
     return 0 if ok else 1
 
 

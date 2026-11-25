@@ -31,6 +31,15 @@ KEY_FLOW = "inkling_flow"
 # neutral. Tunable per-instance via self.attend_tile_bytes.
 _ATTEND_TILE_BYTES = int(_os.environ.get("INKLING_ATTEND_TILE_BYTES", 512 * 1024 * 1024))
 
+# Byte cap for the fp32 K temporary inside the tile loop. Once the broadcast replicas are folded away
+# (§48), the largest single allocation on the long-S path is `kxf.float()`: kvh*d*S*4 = 4,096*S bytes,
+# which is 1.0 GiB at the served 262,144 -- still an OOM-sized slab on a card that runs with ~409 MiB
+# free at peak load. Splitting the scores matmul along the KEY axis caps it at this budget instead.
+# Splitting columns is exact: each score is dot(q_row, k_column) over d alone, so a column block
+# computes the same values in the same order as the full-width product (the fence proves bit-identity).
+# Floor at rel_extent so a chunk still covers one full relative window.
+_ATTEND_K_CHUNK_BYTES = int(_os.environ.get("INKLING_ATTEND_K_CHUNK_BYTES", 64 * 1024 * 1024))
+
 
 def _fresh_flow() -> dict:
     return {"bank": [], "pre_bank": None, "pre_hidden": None, "prev_bank": None, "prev_hidden": None}
@@ -747,7 +756,8 @@ class InklingAttention(Module):
         S = k.shape[0]
         grp = self.num_kv_groups
         kvh = self.num_kv_heads
-        kxf = k.transpose(0, 1).transpose(1, 2).float()                   # (kvh,d,S), NOT broadcast
+        kxf = k.transpose(0, 1).transpose(1, 2)                            # (kvh,d,S) fp16 view, no cast
+        k_chunk = max(self.rel_extent, _ATTEND_K_CHUNK_BYTES // (kvh * d * 4))
         vx = v.transpose(0, 1)                                            # (kvh,S,d), NOT expanded
         q4 = q.view(kvh, grp, T, d).float()                               # heads grouped by kv head
 
@@ -774,8 +784,25 @@ class InklingAttention(Module):
             # 262,144 -- above ~43k context that copy, not the bias, was the largest allocation,
             # and the byte-budget tile could not reach it. Each output element still contracts
             # over d alone, so the arithmetic is unchanged; the fence proves it.
-            sc = torch.matmul(q4[:, :, qs:qe].reshape(kvh, grp * (qe - qs), d), kxf) \
-                   .view(kvh, grp, qe - qs, S) * self.scaling        # (kvh,grp,tt,S)
+            q4t = q4[:, :, qs:qe].reshape(kvh, grp * (qe - qs), d)
+            # Chunk only where the fp32 K temporary is the bigger allocation. The cast costs kvh*d*4 =
+            # 4,096 bytes per key column; the scores tensor this tile produces anyway costs h*4 bytes per
+            # column. So when tile_rows >= 4096/(h*4) == 128/h (42.67 rows at h=24), the wide single
+            # matmul is strictly better -- chunking there would add a block-copy without lowering the peak
+            # (measured: cumulative 2.88 -> 2.95 GiB and x3.37 CPU at T=64, S=32,768, where tile=64).
+            # At the served shapes the rule selects chunks in both regimes that matter: decode (tile=1) and
+            # long-context prefill (tile=10 at S=262,144), because there the K cast dwarfs the tile's scores.
+            if S > k_chunk and kvh * d * 4 > h * 4 * (qe - qs):
+                sc3 = torch.empty((kvh, grp * (qe - qs), S), dtype=torch.float32, device=q.device)
+                for c0 in range(0, S, k_chunk):
+                    c1 = min(c0 + k_chunk, S)
+                    sc3[:, :, c0:c1] = torch.matmul(q4t, kxf[:, :, c0:c1].float())
+                sc = sc3.view(kvh, grp, qe - qs, S) * self.scaling
+            else:
+                # Column blocks are exact -- a score is dot(q_row, k_column) over d alone, so splitting the
+                # key axis computes the same values in the same order as one wide product (asserted, not
+                # assumed: bit=True at S=20,480 and S=32,768, both above k_chunk=16,384).
+                sc = torch.matmul(q4t, kxf.float()).view(kvh, grp, qe - qs, S) * self.scaling
             sc = sc + bias4
             sc = sc.masked_fill(~causal[None, None, :, :], float("-inf"))
             snk = sink[qs:qe].T.view(kvh, grp, qe - qs).float()           # (kvh,grp,tt)
