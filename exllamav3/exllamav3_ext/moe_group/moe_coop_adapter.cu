@@ -1,6 +1,6 @@
 // Device-routing adapter for the EXISTING exl3_moe_coop decode tier (decision 2026-11-25,
 // see README "Integration decision"). The served Inkling-2 MoE pays its per-layer D2H sync
-// (inkling2_loop.py:1134) only because the routing values must reach the python dispatch loop;
+// (served `sel_cpu = host_values(sel_flat, ...)` line) only because the routing values must reach the python dispatch loop;
 // exl3_moe_coop_launch already reads sel/rw as DEVICE arrays through per-expert pointer
 // tables, so the group tier itself does not need reinventing. This file adapts moe_route.cu's
 // output (int32 sel, float w) to the coop contract (int64 sel, half rw) at FIXED addresses —

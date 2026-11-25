@@ -11,7 +11,8 @@ serving card must stay untouched. So this test pins three things it CAN see from
 3. that the second cap is carried everywhere the enum is interpreted, so no path can apply
    the softcap with up_cap left at 0 (which would divide by zero).
 
-Reference for the model's own math: Inkling2LoopSparseMoeBlock, inkling2_loop.py:1148-1150.
+Reference for the model's own math: Inkling2LoopSparseMoeBlock forward()'s act triplet
+(anchor strings, not line numbers — they decay with edits).
 """
 
 from pathlib import Path

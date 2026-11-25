@@ -1,11 +1,11 @@
 // Phase-1 device routing: top-k on device + expert segmentation, replacing the per-MoE-layer
-// D2H sync and python sort of inkling2_loop.py:1134-1135. Zero host synchronization: the
+// D2H sync and python sort of the served `sel_cpu = host_values(sel_flat, ...)` line. Zero host synchronization: the
 // padded block count stays device-resident (MoERouting::num_blocks_out is read only by the
 // grouped kernels' grid-stride bound, never by the host — vLLM reads num_tokens_post_padded
 // on host only because it sizes its grid dynamically; a persistent grid does not need it).
 //
 // Numerics mirror the served router exactly (fence 1 pins it): w uses the UNBIASED sigmoid
-// score gathered at sel (inkling2_loop.py:1114), renormalized as w/(sum+1e-20)*route_scale.
+// score gathered at sel (served `w = scores.gather(1, sel)` line), renormalized as w/(sum+1e-20)*route_scale.
 #include "moe_sm89_common.cuh"
 
 #include <cfloat>

@@ -1,11 +1,11 @@
 // Phase-1 grouped expert tier for Inkling-2 decode: one persistent launch per leg, all expert
 // selection resolved ON DEVICE (moe_route.cu), weights reached through the load-time pointer
 // table (KiB-scale; the 128x3 independent per-expert-qgroup Linears of the served architecture,
-// inkling2_loop.py:1072-1088 — never a stacked copy, VRAM can't pay one).
+// inkling2_loop.py served __init__ — never a stacked copy, VRAM can't pay one).
 //
 // Leg GU (template GU=true):  gate+up for a 16-entry segment block share one A tile; fused
 // swiglu-softcap epilogue writes act_scratch in fp16 — bit-for-bit the same rounding point as
-// the served `act.to(torch.half)` before down_proj (inkling2_loop.py:1159).
+// the served `act.to(torch.half)` before down_proj (served epilogue's rounding line).
 // Leg D  (template GU=false): down_proj over act_scratch; epilogue multiplies each row by its
 // routing weight and atomically accumulates into the fp32 out (the served index_add_ becomes
 // atomicAdd — accumulation order intentionally free, fence 1 prices the reassociation).

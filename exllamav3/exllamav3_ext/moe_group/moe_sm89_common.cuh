@@ -10,7 +10,7 @@
 // instead of 24 python-dispatched groups + a per-layer D2H sync, not tensor-core utilisation.
 //
 // Containers: experts are 128x3 INDEPENDENT quantized Linears with per-expert qgroups
-// (exllamav3/modules/arch_specific/inkling2_loop.py:1072-1088). The tier therefore rides a
+// (inkling2_loop.py served __init__, per-expert Linear ctors). The tier therefore rides a
 // POINTER TABLE built at load (MoEPtrTable below, ~12 KiB), never a stacked weight copy —
 // NOT modules/block_sparse_mlp.py's stacked ExpertsCFG tensors (different architecture).
 #ifndef MOE_SM89_COMMON_CUH
@@ -26,7 +26,7 @@
 #define MOE_TOP_K         8
 #define MOE_HIDDEN        2304
 #define MOE_INTER         9216
-// Softcaps, verbatim semantics from the served epilogue (inkling2_loop.py:1155-1158).
+// Softcaps, verbatim semantics from the served act triplet (anchor: "act = torch.tanh(g / self.gate_softcap)").
 #define MOE_GATE_CAP      4.0f
 #define MOE_UP_CAP        25.0f
 
@@ -89,7 +89,7 @@ struct MoERouting {
     float        route_scale;
 
     // produced by moe_dev_topk: chosen ids [T, TOP_K] and renormalized weights
-    // w = scores.gather(sel) / (sum + 1e-20) * route_scale   (inkling2_loop.py:1114-1116)
+    // w = scores.gather(sel) / (sum + 1e-20) * route_scale   (served router gather/renorm/route_scale lines)
     int32_t* sel;
     float*   w;
 
@@ -156,7 +156,7 @@ __device__ __forceinline__ void moe_mma_16x8x16(float& d0, float& d1, float& d2,
 
 __device__ __forceinline__ float moe_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
-// Fused swiglu-softcap epilogue, mirroring inkling2_loop.py:1155-1158 elementwise:
+// Fused swiglu-softcap epilogue, mirroring the served act triplet elementwise:
 // act = (tanh(g/4)*4) * sigmoid(g) * (tanh(u/25)*25)
 __device__ __forceinline__ half moe_swiglu_softcap(float g, float u) {
     const float capped_g = tanhf(g / MOE_GATE_CAP) * MOE_GATE_CAP;

@@ -4,7 +4,9 @@ CPU numerical simulation for fence 1 of the sm89 MoE grouped-dispatch lane (dsh-
 Two implementations of the same MoE expert dispatch, compared on identical dequant operands:
 
 - reference_dispatch: the CURRENT python dispatch loop of Inkling2LoopSparseMoeBlock.forward,
-  moved verbatim (comments stripped) from exllamav3/modules/arch_specific/inkling2_loop.py:1109-1160
+  moved verbatim (comments stripped) from the dispatch block of
+  exllamav3/modules/arch_specific/inkling2_loop.py (anchor strings `sel_cpu =
+  host_values(...)` through `return out.view(b, t, h)`; bare line numbers decay)
   into this CPU simulation. host_values(...) becomes .tolist(); stage_host(...) becomes a plain CPU
   tensor; self.experts_{g,u,d}[e].forward(xs, params) becomes a Linear-equivalent matmul against a
   FakeExpert's stored dequant operands (gate/up round their output to half exactly as
@@ -31,7 +33,7 @@ import torch
 
 # Fake geometry: expert-count and top_k match the served model (dot26 config 2026-11-25);
 # hidden/intermediate are shrunk for CPU speed. Caps/route_scale mirror the in-file defaults
-# (gate cap 4, up cap 25, docstring at inkling2_loop.py:1041-1046).
+# (gate cap 4, up cap 25, stated in the Inkling2LoopSparseMoeBlock class docstring).
 NUM_EXPERTS = 128
 TOP_K = 8
 GATE_SOFTCAP = 4.0
@@ -41,8 +43,7 @@ ROUTE_SCALE = 1.0
 
 class FakeExpert:
     """One routed expert's three INDEPENDENT quantized Linear modules (per-expert qgroups),
-    stood in by their dequantized fp16 operand matrices. Storage layout matches the Linear ctors
-    at inkling2_loop.py:1072-1080: gate/up are (intermediate x hidden), down is (hidden x intermediate)."""
+    stood in by their dequantized fp16 operand matrices. Storage layout matches the served __init__ per-expert Linear ctors: gate/up are (intermediate x hidden), down is (hidden x intermediate)."""
 
     def __init__(self, w_g, w_u, w_d):
         self.w_g = w_g  # half (intermediate, hidden)
@@ -76,7 +77,7 @@ def act_epilogue(g, u):
 
 
 def route(hs, router_w, router_bias, top_k = TOP_K, route_scale = ROUTE_SCALE):
-    """Router, verbatim from inkling2_loop.py:1112-1116.
+    """Router, verbatim from the served forward() router lines (scores/topk/gather/renorm/route_scale).
 
     SPEC (supervisor charge C, 2026-11-25): where biased scores tie, the DEVICE rule is
     authoritative — lowest expert id wins (moe_route.cu's butterfly picks min index among
@@ -100,8 +101,9 @@ def route(hs, router_w, router_bias, top_k = TOP_K, route_scale = ROUTE_SCALE):
 
 
 def reference_dispatch(flat, sel_flat, w_flat, table):
-    """The current python dispatch loop, verbatim from inkling2_loop.py:1131-1160 modulo the
-    substitutions named in the module docstring. This IS the fence's reference implementation."""
+    """The current python dispatch loop, verbatim from the served forward() dispatch block
+    modulo the substitutions named in the module docstring. This IS the fence's reference
+    implementation."""
     top_k = TOP_K
     sel_cpu = sel_flat.tolist()                      # host_values(sel_flat, (...)).tolist()
     order = sorted(range(len(sel_cpu)), key = lambda i: sel_cpu[i])
