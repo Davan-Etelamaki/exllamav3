@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Charge A (supervisor, 2026-11-25): PRICE the rw float->half rounding at the coop boundary.
 
-Multiply sites:
+Multiply sites (supervisor charge A, 2026-11-25 — exact lines):
   served:  inkling2_loop.py:1160 — out.index_add_(..., y.float() * w_flat...) — fp32 weight
-  coop:    MoeCoopParams.rw is `const half*` (exl3_moe_coop.cuh); the kernel multiplies the
-           half weight against the fp32 partial inside fp32.
+  coop:    the half weight is cast back INSIDE the kernel at
+           exl3_moe_coop_kernel.cuh:220 (si.w = __half2float(p.rw[s]), slot load of the B
+           stage) and multiplied against the fp32 partial in the fp32 accumulate at
+           exl3_moe_coop_kernel.cuh:990-993 (o{i} += sj.w * v{i}). This fence's shape —
+           float(carrier(w)) * fp32 partial, fp32 sum — matches that site exactly.
 
 Method: identical seeded renormalised weights (served router lines) and identical per-slot
 outputs; the ONLY difference is the weight precision. Triangle inequality gives the exact
