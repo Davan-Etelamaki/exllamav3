@@ -1853,7 +1853,10 @@ class DiskPageCache:
             conn.close()
 
 
-    _REPORTED = ("page_writes", "page_write_bytes", "state_writes", "page_reads", "page_read_bytes", "state_reads")
+    _REPORTED = ("page_writes", "page_write_bytes", "state_writes", "page_reads", "page_read_bytes", "state_reads",
+                 # Without these, a tier that throws work away is indistinguishable from one that never had it:
+                 # the save/restore halves only show what landed, never what was dropped before it could.
+                 "states_pruned", "state_candidates_dropped", "skipped_low_space", "skipped_budget", "write_errors")
 
     def _note_activity(self):
         """Writer thread. Start an activity summary, or write the current one if it is 10 seconds old"""
@@ -1882,6 +1885,10 @@ class DiskPageCache:
         if d["page_reads"] or d["state_reads"]:
             parts.append(f"restored {d['page_reads']} pages ({d['page_reads'] * PAGE_SIZE} tokens) and "
                          f"{d['state_reads']} checkpoints")
+        discarded = [(k, d[k]) for k in ("states_pruned", "state_candidates_dropped", "skipped_low_space",
+                                         "skipped_budget", "write_errors") if d[k]]
+        if discarded:
+            parts.append("discarded: " + ", ".join(f"{k} {v}" for k, v in discarded))
         if not parts:
             return
         logger.info(
