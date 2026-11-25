@@ -40,8 +40,8 @@ decode tier phase 1 needs, in service for stacked-expert architectures:
 
 Primary path therefore: `moe_route.cu` (device top-k/renorm, this branch) ->
 `moe_coop_adapter.cu` (int32 sel -> int64, float w -> half at fixed addresses; compile-verified
-on dot26 2026-11-25, `nvcc -arch=compute_89 -std=c++20 -c` exit 0 with the venv's torch
-includes; positive control: the same command at -std=c++17 was RED with 100 header errors) ->
+symbol-attributed in the Verification record below: `nvcc -arch=sm_89 -std=c++20 -c` exit 0,
+entry `moe_route_to_coop_kernel`) ->
 `exl3_moe_coop_launch`. The hand-written `moe_group_gemv.cu` (int4 placeholder stream) is
 DEMOTED to the fallback/measurement comparator for fence 3; it must not serve a real pack.
 
@@ -81,13 +81,44 @@ shape + reassociation on identical dequant operands and carries the pointer-tabl
 control. Fence 2 (trace: zero host syncs per MoE layer, RED-arm on the pre-change code) and
 fence 3 (dot26 bench-lane decode delta + greedy parity, owner window) attach at integration.
 
+## Verification record (corrected 2026-11-25 after a supervisor attribution refutation)
+
+The first "compile-verified" claim (milestone-1 report, commit `56428c48` message) rested on
+EXIT codes plus `cuobjdump --list-elf` in `~/kernel-scratch/dsh-moe/` and did NOT dump symbols:
+the objects there turned out to be FOREIGN (`finalize`, `gemm1_segmented`, `gemm2_segmented`,
+`moe_sort_launch`, `moe_gemv_test_probe`), i.e. someone else's draft under the same filenames
+in the shared scratch dir. Claim withdrawn for that evidence class — an unnamed-symbol cubin
+proves nothing about attribution (law 7b: a fence that cannot tell whose code it ran is no fence).
+
+Corrected fresh builds, sources extracted with `git show <sha>:<path>` (md5 recorded), one
+directory PER COMMIT, symbol dump as part of the check:
+
+- `56428c48` -> `~/kernel-scratch/dsh-moe-56428c48/` (md5 da87dbad… gemv, 7c575d9c… route,
+  71c221a7… common):
+  `nvcc -arch=sm_89 -c moe_route.cu -o moe_route.o` exit 0 → cubin `moe_route.1.sm_89.cubin`,
+  entries `_Z25moe_build_segments_kernel10MoERouting`, `_Z19moe_dev_topk_kernel10MoERouting`;
+  `nvcc -arch=sm_89 -c moe_group_gemv.cu -o moe_group_gemv.o` exit 0 → `moe_group_gemv.1.sm_89.cubin`,
+  entries `_Z21moe_group_gemv_kernelILb0EEv…`, `_Z21moe_group_gemv_kernelILb1EEv…`. Exact
+  kernel roster of the committed sources — attribution holds for `56428c48`.
+- `a387ec5b` -> `~/kernel-scratch/dsh-moe-a387ec5b/` (adapter + headers + vendored
+  `exl3_moe_coop.cuh` from the commit):
+  `nvcc -arch=sm_89 -std=c++20 -c moe_group/moe_coop_adapter.cu -o moe_coop_adapter.o
+  -I<torch inc> -I<torch api inc>` exit 0 → `moe_coop_adapter.1.sm_89.cubin`, entry
+  `_Z24moe_route_to_coop_kernelPKiPKfPlP6__halfi`.
+- The earlier ABI-probe execution (pure host) and both CPU fences were regenerated from
+  working-tree files in the same turn as their GREEN outputs and are unaffected.
+
+Protocol going forward: scratch paths are named `<branch>-<sha12>`; every compile-verify ends
+with `cuobjdump --dump-elf-symbols` and the expected kernel-entry names in the report.
+
 ## Deferred to dot26 / the owner's wheel window (laws 13/31/38)
 
-- Compile verification runs as a compiler invocation only, in `~/kernel-scratch/` on dot26
-  (RTX 4090, sm_89) — a `.cu` → `.o` compile does not touch the serving GPU context and is
-  not a wheel build; no build happens in the exllamav3 tree on dot26 and its engine is never
-  restarted by this lane. Repro:
-  `nvcc -arch=compute_89 -c moe_route.cu -o /dev/null && nvcc -arch=compute_89 -c moe_group_gemv.cu -o /dev/null`
+- Compile verification runs as a compiler invocation only, in a per-commit `~/kernel-scratch/
+  <branch>-<sha12>/` dir on dot26 (RTX 4090, sm_89) — a `.cu` → `.o` compile does not touch the
+  serving GPU context and is not a wheel build; no build happens in the exllamav3 tree on dot26
+  and its engine is never restarted by this lane. Repro (with the attribution step):
+  `nvcc -arch=sm_89 -c moe_route.cu -o moe_route.o && nvcc -arch=sm_89 -c moe_group_gemv.cu -o moe_group_gemv.o && cuobjdump --dump-elf-symbols moe_route.o moe_group_gemv.o` — the symbol
+  entries MUST name the committed kernels; see Verification record above.
 - Runtime behaviour (fence 2 GPU arm, fence 3) waits for the owner's wheel window; no
   `setup.py build_ext` on the workstation (law 31 — build slot is after wheel-1/wheel-2).
 
