@@ -128,13 +128,24 @@ def _deployed_has_fix():
 
 
 def load_installed():
+    """Where the engine loads inkling2 from, and whether the fix is there.
+
+    Presence is decided by importlib.util.find_spec alone -- the resolution path proves the
+    wheel is the load source (on dot26 MainPID find_spec resolves to site-packages). An
+    import EXCEPTION is a DISTINCT, differently-worded condition: under CUDA_VISIBLE_DEVICES=""
+    importing the package raises a CUDA-init error, which must never be reported as `absent`.
+    """
+    spec = importlib.util.find_spec(PKG)
+    if spec is None or not spec.origin:
+        return f"ABSENT :: {PKG} not found by find_spec on this interpreter"
+    path = spec.origin
     _seed_cpu_stubs()
     try:
         import exllamav3.modules.arch_specific.inkling2_loop as m
-        has = hasattr(m, "compute_log_tau")
-        return f"present, compute_log_tau present={has}"
+        return f"PRESENT at {path} :: compute_log_tau present={hasattr(m, 'compute_log_tau')}"
     except Exception as exc:  # noqa: BLE001
-        return f"absent ({type(exc).__name__})"
+        return (f"PRESENT at {path} :: not imported HERE ({type(exc).__name__}: "
+                f"{str(exc)[:60]}) -- import masked, NOT absent")
 
 
 # ---- the measured python sliver: shared-tau log_scale --------------------------------------
@@ -224,11 +235,11 @@ def main():
           f"=> {per_token_drop} aten/token (python sliver; the mat-vec itself is build)")
 
     print(f"[info   ] target module: worktree source {ARCH_REL}")
-    # "absent" here means this CPU fence masks the compiled extension, so the installed
-    # package cannot import. It does NOT mean the engine uses the checkout: the running
-    # engine maps the wheel's .so (verified 2026-11-25 via /proc/<pid>/maps, 5 mappings).
-    print(f"[deploy ] installed wheel {PKG}: {load_installed()}  "
-          f"(absent = extension masked in this fence, not evidence of the load path)")
+    # Presence = find_spec (proves the wheel is the load path). The running engine maps the
+    # wheel's .so (dot26 MainPID /proc/<pid>/maps, 5 mappings, cwd is the checkout but the
+    # resolved module is site-packages), NOT the live checkout. A masked import (CUDA-init under
+    # CUDA_VISIBLE_DEVICES="") is worded 'not imported HERE', never 'absent'.
+    print(f"[deploy ] {load_installed()}")
 
     print(f"\nFENCE {'PASS' if ok else 'RED'}")
     return 0 if ok else 1
