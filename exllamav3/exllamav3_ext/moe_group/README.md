@@ -55,9 +55,11 @@ today's python path (it was exactly this silent-SiLU bug class that aae2681f fix
 ## Shape (updated after reading exl3.py 2026-11-25)
 
 - `moe_sm89_common.cuh` — served geometry (128 experts, top_k 8, hidden 2304, inter 9216,
-  gate cap 4 / up cap 25), the load-time `MoEPtrTable` (~12 KiB of pointers per layer — a
-  pointer table, never a stacked weight copy: VRAM can't pay ~16 GB of dequantized duplicates),
-  the fixed-address `MoERouting` exchange, and the sm_89 primitives (cp.async, ldmatrix,
+  gate cap 4 / up cap 25), the load-time `MoEPtrTable` (exactly 9,216 B per layer — pinned by
+  `MOE_PTR_TABLE_EXPECT_SIZEOF` static_assert and probe; supervisor correction 2026-11-25:
+  an earlier `down[MOE_INTER]` slip meant 228 KiB and is fixed to `down[MOE_NUM_EXPERTS]`),
+  the fixed-address `MoERouting` exchange, the DECODE-ONLY cap (`MOE_MAX_DECODE_TOKENS 32`,
+  see contract below), and the sm_89 primitives (cp.async, ldmatrix,
   mma.sync m16n8k16 — no wgmma/TMA, those are sm_90+).
 - `moe_route.cu` — device top-k (one warp/token, sigmoid scores + additive bias, renorm
   `w/(sum+1e-20)*route_scale` exactly as :1114-1116) and the vLLM-shaped segment build
@@ -80,6 +82,25 @@ Fence 1 (this branch, `tests/cpu/test_moe_grouped_dispatch.py`) already prices t
 shape + reassociation on identical dequant operands and carries the pointer-table positive
 control. Fence 2 (trace: zero host syncs per MoE layer, RED-arm on the pre-change code) and
 fence 3 (dot26 bench-lane decode delta + greedy parity, owner window) attach at integration.
+
+## Decode-only contract and arena sizing (supervisor order 2026-11-25)
+
+This tier serves DECODE ONLY: `bsz <= MOE_MAX_DECODE_TOKENS = 32` entries <= 256 = the coop
+tier's `MAX_SLOTS`. `act_scratch` is `[bsz*TOP_K, MOE_INTER]` fp16 — 144 KiB at bsz 1, 4.6 MiB
+at the cap — and prefill (which would ask gigabytes) is REFUSED by the host gate in
+`moe_coop_adapter.cu` (`return -1`, python keeps the fused/mgemm path), never silently
+allocated.
+
+Worst-case segment capacity (named rule, header `moe_exl3_table.cuh`):
+`max_padded_rows(entries) = entries + 15 * min(entries, 128)` — each of at most
+`min(entries, 128)` non-empty experts wastes at most `BLOCK_M-1 = 15` padding rows;
+`max_blocks = ceil(max_padded_rows/16)`. At the cap: 256 entries -> 2176 rows -> 136 blocks.
+Compiled and python values are pinned equal by the ABI crosscheck at {8, 64, 512, 2048}.
+
+Allocation owner: the PYTHON WIRING allocates one fixed-address arena per graph-capture set
+(per device, per layer: sel/w/sorted_token_ids/expert_for_block/counters + act_scratch) at
+capture-set creation, sized by the formulas above; kernels never allocate mid-forward and the
+address set is stable across replays (Strata in-place-recall lesson, campaign §210).
 
 ## Verification record (corrected 2026-11-25 after a supervisor attribution refutation)
 

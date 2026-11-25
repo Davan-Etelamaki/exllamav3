@@ -48,7 +48,12 @@ extern "C" int moe_coop_launch_with_device_routing
     }
     p->sel = sel64_scratch;
     p->rw = rw16_scratch;
-    if (p->bsz <= 0 || p->bsz * p->topk > p->slots_max) {
+    if (p->bsz <= 0 || p->bsz > MOE_MAX_DECODE_TOKENS) {
+        return -1;                // DECODE-ONLY contract (moe_sm89_common.cuh): a prefill batch
+                                  // is refused here and keeps the legacy/fused path, never a
+                                  // silent gigabyte act_scratch request
+    }
+    if (p->bsz * p->topk > p->slots_max) {
         return -1;                // batch beyond the coop scratch: python keeps the legacy path
     }
     exl3_moe_coop_launch(*p, K_gu, K_d, cb, device, stream);

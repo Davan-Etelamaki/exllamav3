@@ -18,6 +18,9 @@ geom up_cap            25.0
 geom block_m           16
 geom block_n           64
 geom block_k           32
+geom max_decode_tokens 32
+geom max_decode_entries 256
+sizeof MoEPtrTable     9216  expect 9216
 capacity entries 8     padded_rows 128    max_blocks 8    
 capacity entries 64    padded_rows 1024   max_blocks 64   
 capacity entries 512   padded_rows 2432   max_blocks 152  

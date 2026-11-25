@@ -188,10 +188,14 @@ moe_group_gemv_kernel(const MoERouting r, const MoEPtrTable* table, const half* 
     }
 }
 
-// Launches both legs. Preconditions (checked by the python wiring at integration): routing buffers
-// sized to max_blocks capacity; act_scratch [num_entries, MOE_INTER] fp16; out [T, MOE_HIDDEN]
-// fp32 PRE-ZEROED (the served out = torch.zeros carries over); every table ref group_size
-// divisible by MOE_BLOCK_K; grid <= device SM count for the persistent regime (draft fixed value).
+// Launches both legs. Preconditions (checked by the python wiring at integration): DECODE-ONLY
+// batch (bsz <= MOE_MAX_DECODE_TOKENS, moe_sm89_common.cuh — act_scratch is [bsz*TOP_K, MOE_INTER]
+// fp16, 144 KiB at bsz 1, 4.6 MiB at the cap, absurd for prefill which keeps the fused path);
+// routing arena at FIXED addresses sized by moe_max_padded_rows/moe_max_blocks (allocated once per
+// graph-capture set by python, never mid-forward); act_scratch [num_entries, MOE_INTER] fp16;
+// out [T, MOE_HIDDEN] fp32 PRE-ZEROED (the served out = torch.zeros carries over); every table
+// ref group_size divisible by MOE_BLOCK_K; grid <= device SM count for the persistent regime
+// (draft fixed value).
 extern "C" void moe_launch_group_gemv(const MoERouting* routing, const MoEPtrTable* table,
                                       const half* x, int grid, cudaStream_t stream) {
     moe_group_gemv_kernel<true ><<<grid, MOE_THREADS, 0, stream>>>(*routing, table, x);

@@ -69,6 +69,12 @@ static_assert(offsetof(MoEExl3Ref, has_mcg)      == MOE_REF_EXPECT_OFF_HAS_MCG, 
 // compiled value for the diff. Padding every non-empty expert slice up to BLOCK_M=16 wastes at
 // most 15 rows per touched expert:
 //     max_padded_rows(entries) = entries + 15 * min(entries, 128)
+// Worst case at the decode cap (entries = MOE_MAX_DECODE_ENTRIES = 256): 256 + 15*128 = 2176
+// rows, 136 blocks. ALLOCATION OWNER: the python wiring allocates ONE fixed-address arena per
+// graph-capture set (per device per layer region: sel/w/sorted_token_ids/expert_for_block/
+// counters + act_scratch) at capture-set creation, sized by these formulas; the kernels and
+// this lane never allocate mid-forward — Strata's recall lesson: the captured address set
+// must be stable across replays (campaign §210 doorbell law).
 inline int32_t moe_max_padded_rows(int32_t entries) {
     const int32_t touched = entries < 128 ? entries : 128;
     return entries + 15 * touched;

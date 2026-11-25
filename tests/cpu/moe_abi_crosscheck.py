@@ -210,6 +210,31 @@ def run_checks():
             f"({max_padded_rows(entries)}, {max_blocks(entries)}) vs compiled ({rows_p}, {blocks_p})")
     lines.append("arena capacity formula matches compiled values at entries {8,64,512,2048}")
 
+    # decode-only contract: header caps == probe echo; entries-at-cap within the formula; and the
+    # cap must equal the coop tier's MAX_SLOTS (single decode regime across both paths)
+    cap_t = geom_defs["MOE_MAX_DECODE_TOKENS"]
+    cap_e = cap_t * TOP_K                     # derived (the define is a C expression, not parsed)
+    assert fixture["geom max_decode_tokens"] == float(cap_t)
+    assert fixture["geom max_decode_entries"] == float(cap_e) == cap_t * TOP_K
+    coop_kernel = os.path.join(REPO, "exllamav3", "exllamav3_ext", "quant", "exl3_moe_coop_kernel.cuh")
+    with open(coop_kernel, "r", encoding = "utf-8") as f:
+        m = re.search(r"constexpr int MAX_SLOTS\s*=\s*(\d+);", f.read())
+    assert m and int(m.group(1)) == cap_e, (
+        f"decode cap {cap_e} entries != coop MAX_SLOTS {m.group(1) if m else 'MISSING'} — "
+        f"the two grouped paths must refuse the same regime")
+    assert max_padded_rows(cap_e) == 2176 and max_blocks(cap_e) == 136, (
+        f"worst-case arena at the cap changed: ({max_padded_rows(cap_e)}, {max_blocks(cap_e)}) "
+        f"!= documented (2176, 136)")
+    lines.append(f"decode-only contract: {cap_t} tokens / {cap_e} entries == coop MAX_SLOTS; "
+                 f"arena at cap = 2176 rows / 136 blocks")
+
+    # pointer-table size: compiled == literal (supervisor's down[MOE_INTER] defect guard)
+    got, expect = fixture["sizeof MoEPtrTable"]
+    assert got == expect == geom_defs["MOE_PTR_TABLE_EXPECT_SIZEOF"] == 3 * NUM_EXPERTS * 24, (
+        f"MoEPtrTable sizeof: compiled {got}, literal {expect}, python-derived "
+        f"{3 * NUM_EXPERTS * 24} — a per-EXPERT array slipping back to per-INTER looks like this")
+    lines.append(f"MoEPtrTable size {got} B == literal == python-derived (3x{NUM_EXPERTS}x24)")
+
     # builder + positive control
     gen = torch.Generator().manual_seed(20261125)
     experts = [MockExpert(gen, e, with_mul1 = True) for e in range(NUM_EXPERTS)]

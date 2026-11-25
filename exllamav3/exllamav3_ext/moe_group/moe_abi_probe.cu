@@ -36,6 +36,9 @@ int main() {
     printf("geom block_m           %d\n", MOE_BLOCK_M);
     printf("geom block_n           %d\n", MOE_BLOCK_N);
     printf("geom block_k           %d\n", MOE_BLOCK_K);
+    printf("geom max_decode_tokens %d\n", MOE_MAX_DECODE_TOKENS);
+    printf("geom max_decode_entries %d\n", MOE_MAX_DECODE_ENTRIES);
+    printf("sizeof MoEPtrTable     %3zu  expect %3d\n", sizeof(MoEPtrTable), MOE_PTR_TABLE_EXPECT_SIZEOF);
 
     const int32_t samples[] = {8, 64, 512, 2048};
     for (unsigned i = 0; i < sizeof(samples) / sizeof(samples[0]); ++i) {

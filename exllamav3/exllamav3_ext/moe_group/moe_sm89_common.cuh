@@ -57,8 +57,22 @@ struct MoEWeightRef {
 struct MoEPtrTable {
     MoEWeightRef gate[MOE_NUM_EXPERTS];   // [INTER, HIDDEN]
     MoEWeightRef up  [MOE_NUM_EXPERTS];   // [INTER, HIDDEN]
-    MoEWeightRef down[MOE_INTER];         // [HIDDEN, INTER]
+    MoEWeightRef down[MOE_NUM_EXPERTS];   // [HIDDEN, INTER] — per EXPERT, not per intermediate
 };
+
+// Table size is exact and pinned (supervisor correction 2026-11-25: an earlier draft declared
+// down[MOE_INTER], a 228 KiB slip contradicting the pointer-table claim):
+// 3 * 128 * sizeof(MoEWeightRef) = 3*128*24 = 9216 B per layer.
+#define MOE_PTR_TABLE_EXPECT_SIZEOF 9216
+static_assert(sizeof(MoEPtrTable) == MOE_PTR_TABLE_EXPECT_SIZEOF, "MoEPtrTable size drifted");
+
+// DECODE-ONLY CONTRACT (supervisor order 2026-11-25): this tier serves bsz <= MOE_MAX_DECODE_TOKENS
+// (chosen to match the coop tier's MAX_SLOTS = 256 entries at top_k 8 -> 32 tokens). act_scratch is
+// [bsz*TOP_K, MOE_INTER] fp16: 144 KiB at bsz 1, 4.6 MiB at the cap; a prefill batch would ask for
+// gigabytes and MUST be refused by the host gate (moe_coop_adapter.cu) and by the python wiring,
+// never silently allocated. Prefill stays on the existing fused/mgemm path.
+#define MOE_MAX_DECODE_TOKENS 32
+#define MOE_MAX_DECODE_ENTRIES (MOE_MAX_DECODE_TOKENS * MOE_TOP_K)   // == coop MAX_SLOTS
 
 // ---------------------------------------------------------------------------
 // Device-local routing exchange. Everything below lives at FIXED ADDRESSES allocated once per
