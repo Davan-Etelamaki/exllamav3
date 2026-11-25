@@ -224,8 +224,11 @@ def main():
           f"=> {per_token_drop} aten/token (python sliver; the mat-vec itself is build)")
 
     print(f"[info   ] target module: worktree source {ARCH_REL}")
+    # "absent" here means this CPU fence masks the compiled extension, so the installed
+    # package cannot import. It does NOT mean the engine uses the checkout: the running
+    # engine maps the wheel's .so (verified 2026-11-25 via /proc/<pid>/maps, 5 mappings).
     print(f"[deploy ] installed wheel {PKG}: {load_installed()}  "
-          f"(deployed engine reads inkling2 from the live checkout, not the wheel)")
+          f"(absent = extension masked in this fence, not evidence of the load path)")
 
     print(f"\nFENCE {'PASS' if ok else 'RED'}")
     return 0 if ok else 1

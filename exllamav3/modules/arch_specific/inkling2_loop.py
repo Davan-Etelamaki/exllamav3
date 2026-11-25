@@ -717,6 +717,15 @@ class InklingAttention(Module):
         extra query tile and stays launch-neutral; only multi-row passes (T above the byte
         budget) tile down, which is where the (h, T, S) bias was the largest allocation."""
         budget = getattr(self, "attend_tile_bytes", _ATTEND_TILE_BYTES)
+        if torch.cuda.is_available():
+            # Headroom, not the ceiling, decides: the served card runs with 0.4-2.8 GiB
+            # free depending on fleet load, so a constant budget OOMs exactly when the
+            # engine is busiest. Half of what the device reports stays for the rest of
+            # the forward; the 8 MiB floor keeps the tile count bounded when free is tiny.
+            # Row grouping never changes a row's softmax set, so any value here is
+            # bit-identical -- this dial cannot move the output.
+            free = int(torch.cuda.mem_get_info()[0])
+            budget = min(budget, max(8 * 1024 * 1024, free // 2))
         h = self.num_kv_heads * self.num_kv_groups       # combined q-head count (24)
         denom = h * S * itemsize * 2                     # bias + companion logits, fp32
         cap = max(1, int(budget // denom)) if denom else T
