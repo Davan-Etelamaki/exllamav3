@@ -31,7 +31,7 @@ class StubPagetable:
 
 
 class StubSequence:
-    pass
+    sequence_ids = [0] * 8  # token spine, read by the VRAM admission gate
 
 
 class StubJob:
@@ -79,6 +79,10 @@ def make_generator(pending, active = (), max_batch_size = 16):
     generator._gov_size = 2048
     generator._gov_target_ms = 0
     generator._gov_stats = False
+    # VRAM admission gate attrs set by Generator.__init__ upstream; the stubbed free figure
+    # is generous, so this suite stays on the batch/page admission path it tests.
+    generator.admission_margin_granules = 8
+    generator._admission_free_bytes = lambda: 8 * 1024**3
     # No disk tier: iterate() consults it after the job stages
     generator.disk_page_cache = None
     generator.disk_cache_write_interval = 0

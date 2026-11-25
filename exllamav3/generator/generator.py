@@ -39,6 +39,7 @@ from ..util import cuda_sync_active
 
 logger = logging.getLogger(__name__)
 from ..util.memory import malloc_trim
+from .admission import admits, prompt_cost_granules, GRANULE_BYTES, DEFAULT_ADMISSION_MARGIN_GRANULES
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .disk_cache import DiskPageCache
@@ -65,6 +66,7 @@ class Generator:
         max_chunk_size: int = 2048,
         shared_chunk_size: int | None = None,
         prefill_cooldown: int = 4,
+        admission_margin_granules: int = DEFAULT_ADMISSION_MARGIN_GRANULES,
         max_q_size: int = 8,
         draft_model: Model | None = None,
         draft_cache: Cache | None = None,
@@ -128,6 +130,14 @@ class Generator:
             pace while prompt ingestion takes one chunk every prefill_cooldown + 1 calls. With several prompts
             waiting, they take turns, one chunk per pass. Default is 4. Set to 0 for a prefill pass on every
             iteration, as when no job is generating
+
+        :param admission_margin_granules:
+            Headroom in VRAM granules (20 MiB each) demanded on top of a job's prompt-tier
+            cost before iterate_start_jobs() admits it (see generator/admission.py for the
+            tiers and their calibration). A job that cannot be admitted stays queued, like
+            one that is short of cache pages, and starts when memory frees; a job with
+            nothing left to ingest never waits. Default 8 (=160 MiB); 0 admits whenever the
+            tier cost alone fits. Ignored on a device whose free memory cannot be read.
 
         :param max_q_size:
             Maximum number of tokens to evaluate per sequence during generation. Leave this at the default
@@ -370,6 +380,12 @@ class Generator:
         self.prefill_cooldown = prefill_cooldown
         self.prefill_cooldown_left = 0
         self.prefill_rotation = 0
+
+        # VRAM admission gate (see generator/admission.py): headroom over the measured
+        # prompt-tier peak, in 20 MiB granules, demanded before a job may start ingesting
+        # a prompt. Warn once if the device will not report free memory, then gate open.
+        self.admission_margin_granules = max(0, int(admission_margin_granules))
+        self._admission_warned = False
 
         # Job queues
         self.job_serial = 0
@@ -2956,15 +2972,49 @@ class Generator:
         })
 
 
+    def _admission_free_bytes(self) -> int:
+        """
+        Bytes the device reports free, for the VRAM admission gate, or -1 when it cannot be
+        measured (no CUDA context, driver not answering). Unreadable means the gate is open:
+        refusing every prefill because a query failed would stall the queue outright.
+        """
+        try:
+            return int(torch.cuda.mem_get_info()[0])
+        except Exception:
+            if not self._admission_warned:
+                self._admission_warned = True
+                logger.warning(
+                    "VRAM admission gate disabled: torch.cuda.mem_get_info() did not answer, "
+                    "so jobs start without a free-memory check"
+                )
+            return -1
+
+
+    def _admission_prompt_tokens(self, job) -> int:
+        """
+        Tokens a pending job still has to ingest before it can decode, the figure the
+        admission gate prices its prompt tier on.
+
+        0 - which the gate treats as a decode-only admission and never blocks - covers a
+        resumed job whose prompt is already in the cache, and a sequence that reports no
+        token spine at all.
+        """
+        if job.is_prefill_done():
+            return 0
+        return max((len(seq.sequence_ids) for seq in job.sequences), default = 0)
+
+
     def iterate_start_jobs(self, results: list):
         """
-        Move pending jobs into the active set when batch and cache capacity allow.
+        Move pending jobs into the active set when batch, cache and VRAM capacity allow.
 
-        Jobs are considered in queue order, but a job can be skipped temporarily if it would exceed max_batch_size
-        or needs more fresh pages than are currently unreferenced. Later jobs may start if they fit, which improves
-        utilization, but each skipped job accumulates a skip count; once any skipped job reaches max_skips, startup
-        stops for this iteration to preserve approximate queue fairness. Started jobs allocate their cache pages
-        immediately and emit a "started" event.
+        Jobs are considered in queue order, but a job can be skipped temporarily if it would exceed max_batch_size,
+        needs more fresh pages than are currently unreferenced, or - if it still has a prompt to ingest - cannot be
+        priced inside the device's free memory plus admission_margin_granules. A refused job stays queued exactly as
+        a page-short one does and starts on a later pass when memory frees; nothing raises. Later jobs may start if
+        they fit, which improves utilization, but each skipped job accumulates a skip count; once any skipped job
+        reaches max_skips, startup stops for this iteration to preserve approximate queue fairness. Started jobs
+        allocate their cache pages immediately and emit a "started" event.
         """
 
         # Get current max batch
@@ -2977,11 +3027,24 @@ class Generator:
             len(self.pending_jobs) and
             current_max_batch < self.max_batch_size):
 
+            # VRAM admission budget for this pass, spent as jobs start. Reading free memory
+            # once and testing every candidate against it is not enough: two large prefills
+            # admitted in the same pass both see the same free figure, then both pay their
+            # peak, which is the cliff this gate closes (dot26 2026-11-24: n concurrent large
+            # prefills peak at 21.63 + n * 1.55 GiB and bust 23.59 GiB usable at n >= 2).
+            free_bytes = self._admission_free_bytes()
+
             skipped_jobs = []
             for job in self.pending_jobs.copy():
 
                 if (len(job.sequences) + current_max_batch > self.max_batch_size or
                         job.current_new_pages_required() > self.pagetable.num_unreferenced_pages()):
+                    skipped_jobs.append(job)
+                    continue
+
+                # Price this job's prompt tier against what is left of the budget
+                gate_tokens = self._admission_prompt_tokens(job)
+                if free_bytes >= 0 and not admits(free_bytes, gate_tokens, self.admission_margin_granules):
                     skipped_jobs.append(job)
                     continue
 
@@ -3004,6 +3067,10 @@ class Generator:
                     self.reap_failed_job(job, e, results)
                     continue
                 current_max_batch += len(job.sequences)
+                if free_bytes >= 0:
+                    # Spend this job's tier from the pass budget, so the next candidate is
+                    # priced against the peak this one is about to reach
+                    free_bytes -= prompt_cost_granules(gate_tokens) * GRANULE_BYTES
 
                 r = {
                     "job": job,
