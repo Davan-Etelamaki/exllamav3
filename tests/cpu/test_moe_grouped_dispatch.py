@@ -12,6 +12,12 @@ Runnable two ways:
 - pytest (dot26 CI): plain test_* functions, marker nogpu.
 - bare python on the workstation (no pytest installed there): python3 tests/cpu/test_moe_grouped_dispatch.py
   — this module never imports exllamav3 (importing it initializes CUDA; the workstation GPU serves prod).
+
+TIE-BREAK SPEC (supervisor charge C, 2026-11-25): where biased router scores tie, the DEVICE
+rule is authoritative — LOWEST EXPERT ID WINS (moe_route.cu's butterfly reduces ties to the
+minimum index). torch.topk's tie order is unspecified, so route() ASSERTS each seeded case is
+tie-free: membership is then deterministic and a parity failure can never be an unspecified
+torch tie posing as one.
 """
 
 import os

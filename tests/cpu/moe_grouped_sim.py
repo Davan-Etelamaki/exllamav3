@@ -74,9 +74,23 @@ def act_epilogue(g, u):
 
 
 def route(hs, router_w, router_bias, top_k = TOP_K, route_scale = ROUTE_SCALE):
-    """Router, verbatim from inkling2_loop.py:1112-1116."""
+    """Router, verbatim from inkling2_loop.py:1112-1116.
+
+    SPEC (supervisor charge C, 2026-11-25): where biased scores tie, the DEVICE rule is
+    authoritative — lowest expert id wins (moe_route.cu's butterfly picks min index among
+    equal maxima). torch.topk's tie order is unspecified, so this fence asserts the case
+    is TIE-FREE: selection membership is then deterministic and a parity failure can
+    never be an unspecified torch tie posing as one.
+    """
     scores = torch.sigmoid(torch.matmul(hs, router_w.T))
-    sel = torch.topk(scores + router_bias, top_k, dim = -1, sorted = False).indices
+    biased = scores + router_bias
+    srt = biased.sort(dim = -1).values
+    tied = (srt[:, 1:] == srt[:, :-1]).any(dim = -1)
+    if bool(tied.any()):
+        rows = tied.nonzero().flatten().tolist()[:8]
+        raise AssertionError(f"malformed fence case: tied biased scores at token rows {rows}; "
+                             "device tie-break (lowest expert id) is the spec")
+    sel = torch.topk(biased, top_k, dim = -1, sorted = False).indices
     w = scores.gather(1, sel)
     w = w / (w.sum(dim = -1, keepdim = True) + 1e-20)
     w = w * route_scale
