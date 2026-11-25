@@ -66,7 +66,9 @@ def down_forward(expert, act_half):
 
 
 def act_epilogue(g, u):
-    """Fused swiglu-softcap epilogue, verbatim from inkling2_loop.py:1155-1158."""
+    """Fused swiglu-softcap epilogue, verbatim from Inkling2LoopSparseMoeBlock.forward
+    (bound by the SERVED_ANCHORS strings in test_moe_grouped_dispatch; bare line numbers
+    decay with edits)."""
     act = torch.tanh(g / GATE_SOFTCAP) * GATE_SOFTCAP
     act = act * torch.sigmoid(g)
     act = act * (torch.tanh(u / UP_SOFTCAP) * UP_SOFTCAP)

@@ -52,7 +52,7 @@ def extract_kernel_expr(path):
 
 
 def served_act(g, u):
-    """Verbatim inkling2_loop.py:1155-1158 with the Inkling caps."""
+    """Verbatim the served epilogue triplet (SERVED_ANCHORS below) with the Inkling caps."""
     act = torch.tanh(g / GATE_CAP) * GATE_CAP
     act = act * torch.sigmoid(g)
     act = act * (torch.tanh(u / UP_CAP) * UP_CAP)

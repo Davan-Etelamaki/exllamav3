@@ -52,8 +52,9 @@ now cherry-picked here as `020ce47c` (clean merge of all seven source files; the
 file `tests/kernels/moe/test_softcap_swiglu_lane.py` never existed in this lineage — branch
 divergence, not a deletion — and was adopted whole with its fence suite). Elementwise fence
 `tests/cpu/moe_softcap_elementwise.py` extracts the `MOE_COOP_ACT_SOFTCAP` return expression
-FROM THE TREE and compares it against the served epilogue (`inkling2_loop.py:1155-1158`,
-anchors asserted) at N=2^20 fp32: GREEN, max|delta| 7.6e-06; positive control (the classic
+FROM THE TREE and compares it against the served epilogue (the `inkling2_loop.py` act
+triplet, bound by `SERVED_ANCHORS` strings — bare line numbers decay with edits) at
+N=2^20 fp32: GREEN, max|delta| 7.6e-06 against an effective bound 9.1e-04; positive control (the classic
 single-cap mistake, `up_cap := gate cap`) breaches at 7.5e+01. No wheel-batch dependency on
 `dsh-softcap` remains for the act selector.
 
@@ -87,6 +88,11 @@ minimum index). `torch.topk`'s tie order is UNSPECIFIED and is never a parity re
 fence 1 asserts its seeded cases tie-free (`moe_grouped_sim.route()` sorted-neighbor
 scan), so a torch-specific tie can never be read as a grouped-vs-served parity failure,
 and at runtime the device selection — not any host-side topk — defines membership.
+PARITY SURFACE (supervisor §Q): ranking uses score+bias but the EMITTED weights gather the
+UNBIASED scores renormalised (`moe_route.cu` broadcasts the unbiased score; served lines
+do the same via `scores.gather`), so the fence-3 greedy arm SHALL assert on the emitted
+weights per token, not only on the selected ids — the biased-rank/unbiased-emit asymmetry
+is where a routing bug can hide behind equal id sets.
 
 Expert-order changes reorder the atomic accumulates, so a non-byte greedy result after
 integration is honest-to-FAIL and gets adjudicated (campaign card row 5), never waived.
@@ -179,7 +185,7 @@ with `cuobjdump --dump-elf-symbols` and the expected kernel-entry names in the r
 ## Integration TODOs (next commits on this branch, before any wheel ride)
 
 1. **Act-selector alignment — LANDED** (`aae2681f` cherry-picked as `020ce47c`; elementwise
-   fence vs `inkling2_loop.py:1155-1158` GREEN with single-cap control RED; see Integration
+   fence vs the served act triplet (anchor-bound; line numbers decay) GREEN with single-cap control RED; see Integration
    decision + Verification record above). Python callers that want softcap must set
    `p.act = MOE_COOP_ACT_SOFTCAP`, `p.act_limit = 4.0`, `p.up_cap = 25.0` — done in TODO 2's
    wiring, where the values come from the served module, not literals.
