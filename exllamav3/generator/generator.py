@@ -66,7 +66,7 @@ class Generator:
         max_chunk_size: int = 2048,
         shared_chunk_size: int | None = None,
         prefill_cooldown: int = 4,
-        admission_margin_granules: int = DEFAULT_ADMISSION_MARGIN_GRANULES,
+        admission_margin_granules: int | None = DEFAULT_ADMISSION_MARGIN_GRANULES,
         max_q_size: int = 8,
         draft_model: Model | None = None,
         draft_cache: Cache | None = None,
@@ -138,6 +138,8 @@ class Generator:
             one that is short of cache pages, and starts when memory frees; a job with
             nothing left to ingest never waits. Default 8 (=160 MiB); 0 admits whenever the
             tier cost alone fits. Ignored on a device whose free memory cannot be read.
+            An upper config layer may pass None (an explicit null in its own config file):
+            that is treated exactly as the default, never as an error.
 
         :param max_q_size:
             Maximum number of tokens to evaluate per sequence during generation. Leave this at the default
@@ -384,7 +386,9 @@ class Generator:
         # VRAM admission gate (see generator/admission.py): headroom over the measured
         # prompt-tier peak, in 20 MiB granules, demanded before a job may start ingesting
         # a prompt. Warn once if the device will not report free memory, then gate open.
-        self.admission_margin_granules = max(0, int(admission_margin_granules))
+        self.admission_margin_granules = max(0, int(DEFAULT_ADMISSION_MARGIN_GRANULES
+                                                   if admission_margin_granules is None
+                                                   else admission_margin_granules))
         self._admission_warned = False
 
         # Job queues

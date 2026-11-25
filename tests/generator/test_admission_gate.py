@@ -185,6 +185,20 @@ def test_wiring_budget_spent_per_started_job():
     assert spent, f"{GENERATOR_PATH.name}: the pass budget is never spent, so concurrent prefills double-admit"
 
 
+def test_wiring_none_margin_takes_the_default():
+    """tabbyAPI forwards an Optional[int]: an explicit null must reach the engine default,
+    not int(None). Asserted on the source: __init__ coerces None before max()/int()."""
+    src = GENERATOR_PATH.read_text()
+    assert "if admission_margin_granules is None" in src, \
+        "Generator.__init__ does not None-guard admission_margin_granules"
+    sig = next(n for n in ast.walk(ast.parse(src))
+               if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+               and "admission_margin_granules" in [a.arg for a in n.args.args])
+    arg = next(a for a in sig.args.args if a.arg == "admission_margin_granules")
+    assert arg.annotation is not None and "None" in ast.unparse(arg.annotation), \
+        "signature does not admit None"
+
+
 def test_wiring_margin_is_a_config_value_with_engine_default_8():
     """Generator takes admission_margin_granules and defaults it to the engine default"""
     classes = [n for n in ast.walk(GENERATOR_TREE)
