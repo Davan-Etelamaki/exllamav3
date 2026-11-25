@@ -219,7 +219,9 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     c10::optional<at::Tensor> _up_bias_ptrs,
     c10::optional<at::Tensor> _down_bias_ptrs,
     bool _act_relu2,
-    bool _sh_coop
+    bool _sh_coop,
+    bool _act_softcap,
+    float _up_cap
 ) :
         yh2                 (std::move(_yh2)),
         yh                  (std::move(_yh)),
@@ -259,9 +261,11 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         act_gelu            (_act_gelu),
         act_silu_oai        (_act_silu_oai),
         act_relu2           (_act_relu2),
+        act_softcap         (_act_softcap),
         shared_experts      (_shared_experts),
         shared_gate         (_shared_gate),
         act_limit           (_act_limit),
+        up_cap              (_up_cap),
         gates               (_gates),
         ups                 (_ups),
         downs               (_downs),
@@ -303,6 +307,7 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         int act = act_silu_oai ? MOE_COOP_ACT_SILU_OAI :
                   act_gelu ? MOE_COOP_ACT_GELU :
                   act_relu2 ? MOE_COOP_ACT_RELU2 :
+                  act_softcap ? MOE_COOP_ACT_SOFTCAP :
                   MOE_COOP_ACT_SILU;
         c10::optional<at::Tensor> sh_w;
         if (shared_gate) sh_w = shared_gate->weight;
@@ -315,7 +320,7 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
             gate_bias_ptrs, up_bias_ptrs, down_bias_ptrs,
             gate_K, up_K, down_K,
             up_mcg, up_mul1,
-            act, act_limit, gated,
+            act, act_limit, up_cap, gated,
             yh, had_u, interm_g, interm_u, interm_a, out_d, coop_ctr, out_bszn,
             sh_w, coop_K_gu, coop_K_d, coop_cb
         );
@@ -406,7 +411,7 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
             sh_coop_p = exl3_moe_coop_prepare
             (
                 Hi_sh, gt, gs, gv, ut, us, uv, dt, ds, dv, gb, ub, db,
-                Kgu, Kgu, d->K, mcg_gu, mul1_gu, act_sh, se->act_limit, true,
+                Kgu, Kgu, d->K, mcg_gu, mul1_gu, act_sh, se->act_limit, 0.0f, true,
                 had_g_sh, had_u_sh, gu_g_sh, gu_u_sh, act_out_sh, d_out_sh, ctr_sh, out_d_sh.value(),
                 c10::nullopt, sh_K_gu, sh_K_d, sh_cb
             );

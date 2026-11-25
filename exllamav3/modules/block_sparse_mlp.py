@@ -634,7 +634,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return all(has) or not any(has)
         self.support_bc_bszn = (
             self.is_quantized and
-            (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
+            (self.activation_fn in ("silu", "gelu", "swiglu_oai", "softcap_swiglu") if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
             not self.config.infer_params.no_reconstruct
         )
@@ -843,6 +843,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 down_bias_ptrs,
                 act_relu2 = self.activation_fn == "relu2",
                 sh_coop = self.shared_coop_ok(),
+                act_softcap = self.activation_fn == "softcap_swiglu",
+                up_cap = self.up_cap,
             )
 
             # Larger buffers for fused path, if supported. Wide row tiles (32 / 64 rows, separate

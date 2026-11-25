@@ -102,7 +102,7 @@ def run_case(device, seed, Kg, Ku, Kd, cb, act = "silu", gated = True, bias = Fa
             *gtabs, *up.tabs, *down.tabs,
             gbias, up.bias_tab, down.bias_tab,
             gK, up.K, down.K, cb == 1, cb == 2,
-            ACTS[act], limit, gated,
+            ACTS[act], limit, 0.0, gated,
             had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out[:bsz],
             sh_out, sh_w,
         )
@@ -231,7 +231,7 @@ def _empty_case(device, bsz, topk, shared = None, Hi = 256, H = 256):
             ref += sh_out
     ext.exl3_moe_coop(
         x, sel, rw, -1, -1, Hi, *gate.tabs, *up.tabs, *down.tabs, None, None, None, K, K, K, False, True,
-        0, 0.0, True, had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out[:bsz], sh_out, sh_w,
+        0, 0.0, 0.0, True, had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out[:bsz], sh_out, sh_w,
     )
     torch.cuda.synchronize()
     return out, ref

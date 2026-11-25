@@ -13,6 +13,7 @@
 #define MOE_COOP_ACT_GELU 1
 #define MOE_COOP_ACT_RELU2 2
 #define MOE_COOP_ACT_SILU_OAI 3
+#define MOE_COOP_ACT_SOFTCAP 4   // Inkling: cg*tanh(g/cg)*sigmoid(g) * cu*tanh(u/cu); cg = act_limit, cu = up_cap
 
 #define MOE_COOP_THREADS 512
 #define MOE_COOP_WNT 2                  // adjacent 16-column tiles per warp (32-column groups per block)
@@ -44,6 +45,7 @@ struct MoeCoopParams
     const int64_t* d_bias;
     int act;                    // MOE_COOP_ACT_*
     float act_limit;
+    float up_cap;               // Inkling softcap's second cap (cu); gateless/other acts ignore it
     bool gated;                 // false: no gate projection, activation is relu(u) * u
 
     // Scratch (leading dim >= bsz * topk)
@@ -98,6 +100,7 @@ MoeCoopParams exl3_moe_coop_prepare
     bool mcg, bool mul1,
     int act,
     float act_limit,
+    float up_cap,
     bool gated,
     at::Tensor& had_g,
     at::Tensor& had_u,
@@ -138,6 +141,7 @@ void exl3_moe_coop
     bool mcg, bool mul1,
     int act,
     float act_limit,
+    float up_cap,
     bool gated,
     at::Tensor& had_g,
     at::Tensor& had_u,

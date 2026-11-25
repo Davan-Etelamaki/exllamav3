@@ -189,6 +189,7 @@ MoeCoopParams exl3_moe_coop_prepare
     bool mcg, bool mul1,
     int act,
     float act_limit,
+    float up_cap,
     bool gated,
     at::Tensor& had_g,
     at::Tensor& had_u,
@@ -209,7 +210,7 @@ MoeCoopParams exl3_moe_coop_prepare
     TORCH_CHECK(!(mcg && mul1), "exl3_moe_coop: specified both mcg and mul1");
     TORCH_CHECK(Kg >= 1 && Kg <= 8 && Ku >= 1 && Ku <= 8 && Kd >= 1 && Kd <= 8, "exl3_moe_coop: K out of range");
     TORCH_CHECK(!gated || Kg == Ku, "exl3_moe_coop: gate and up must share a bit width");
-    TORCH_CHECK(act >= 0 && act <= 3, "exl3_moe_coop: unknown activation");
+    TORCH_CHECK(act >= 0 && act <= MOE_COOP_ACT_SOFTCAP, "exl3_moe_coop: unknown activation");
 
     MoeCoopParams p = {};
     p.Hi = Hi;
@@ -270,6 +271,7 @@ MoeCoopParams exl3_moe_coop_prepare
     p.n_local = (int) u_trellis.size(0);
     p.act = act;
     p.act_limit = act_limit;
+    p.up_cap = up_cap;
     p.gated = gated;
 
     p.had_g = (half*) had_g.data_ptr();
@@ -348,6 +350,7 @@ void exl3_moe_coop
     bool mcg, bool mul1,
     int act,
     float act_limit,
+    float up_cap,
     bool gated,
     at::Tensor& had_g,
     at::Tensor& had_u,
@@ -374,7 +377,7 @@ void exl3_moe_coop
     }
     float K_gu, K_d; int cb;
     MoeCoopParams p = exl3_moe_coop_prepare(Hi, g_trellis, g_suh, g_svh, u_trellis, u_suh, u_svh, d_trellis, d_suh, d_svh,
-                                            g_bias, u_bias, d_bias, Kg, Ku, Kd, mcg, mul1, act, act_limit, gated,
+                                            g_bias, u_bias, d_bias, Kg, Ku, Kd, mcg, mul1, act, act_limit, up_cap, gated,
                                             had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out, sh_gate_w, K_gu, K_d, cb);
     p.min_expert = min_expert;
     p.max_expert = max_expert;
