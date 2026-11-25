@@ -113,8 +113,14 @@ _TOUCH_INTERVAL = 60
 
 # Bump when a change to the code alters the bytes of a page image or a checkpoint (a kernel or module computing
 # K/V differently, a new checkpoint layout). Part of the fingerprint, so existing caches are left alone until
-# then; the version string and the model/cache identity cover the rest
-DISK_CACHE_FORMAT_VERSION = 3
+# then; the version string and the model/cache identity cover the rest.
+# Held at 2 deliberately. The tuple-layer-key fix does NOT change page or checkpoint bytes: rung-4's fused K/V
+# conv prepare and the per-tile attention reordering are both proven bit-identical, and a pre-encoding state
+# blob is detected at read by _is_legacy_layer_key and dropped as a clean miss. A bump here rotates the store
+# directory identity, which was the whole cost of the build-tag incident, so it would strand the live tier
+# (measured on dot26: segments 2.4 GB still valid) and re-write about the same again, against the drive-wear
+# limit. Invalidating a key shape at the reader keeps those pages warm.
+DISK_CACHE_FORMAT_VERSION = 2
 
 
 def _encode_layer_key(key):
@@ -2575,10 +2581,13 @@ class DiskPageCache:
                         d["tp_handle"] = handle
                     else:
                         keymap = self._side_keymap(side)
-                        if keymap is None and any(_is_legacy_layer_key(key) for key in info["layers"]):
+                        if any(_is_legacy_layer_key(key) for key in info["layers"]):
                             # Written by the pre-encoding tier (format 2): bare-side layer keys were
                             # stringified, so they cannot be mapped back onto the live layers. Dropping
-                            # it lets the GC reclaim the blob instead of failing every restore.
+                            # it lets the GC reclaim the blob instead of failing every restore. Checked
+                            # on both sides: on the TP side a stringified key simply misses `inverse`,
+                            # lands in the state dict as a string and re-plants the KeyError that
+                            # _encode_layer_key exists to prevent.
                             self.metrics["legacy_states_skipped"] += 1
                             raise ValueError("state written by the pre-encoding tier (stringified layer keys)")
                         inverse = {_encode_layer_key(v): k for k, v in keymap.items()} if keymap else {}

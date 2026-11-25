@@ -162,23 +162,39 @@ else:
     fired_cond = eval(detect_seg, dict(globals(), keymap=None, any=any,
                                        info={"layers": {"(6, 0)": {}}},
                                        _is_legacy_layer_key=helpers["_is_legacy_layer_key"]))
+    # both sides: on the TP side keymap is not None, and a stringified key there silently misses
+    # `inverse` and re-plants the KeyError this fix exists to remove. If the guard ever regresses to
+    # `keymap is None and ...`, this second eval is the arm that catches it -- positive control, not
+    # decoration: same condition, opposite keymap, same expected firing.
+    fired_tp = eval(detect_seg, dict(globals(), keymap={"(6, 0)": (6, 0)}, any=any,
+                                     info={"layers": {"(6, 0)": {}}},
+                                     _is_legacy_layer_key=helpers["_is_legacy_layer_key"]))
+    fresh_cond = eval(detect_seg, dict(globals(), keymap={(6, 0): (6, 0)}, any=any,
+                                       info={"layers": {helpers["_encode_layer_key"]((6, 0)): {}}},
+                                       _is_legacy_layer_key=helpers["_is_legacy_layer_key"]))
     if fired_cond:
         try:
             exec(detect_body, {"self": self_obj, "ValueError": ValueError})
         except ValueError:
             pass  # the body's raise is the hand-off to the existing drop path
-    ok_gate = (metrics["legacy_states_skipped"] == 1 and "raise ValueError" in detect_body)
-    print(f"[patched] legacy-shape arm counts and raises: {ok_gate}")
+    ok_gate = (metrics["legacy_states_skipped"] == 1 and "raise ValueError" in detect_body
+               and fired_cond and fired_tp and not fresh_cond)
+    print(f"[patched] legacy-shape arm counts and raises: {ok_gate} "
+          f"(bare={fired_cond} tp={fired_tp} fresh_not_fired={not fresh_cond})")
     # precision: the detector recognises stringified tuples, nothing else
     ok_prec = (helpers["_is_legacy_layer_key"]("(6, 0)") is True
                and helpers["_is_legacy_layer_key"](helpers["_encode_layer_key"]((6, 0))) is False
                and helpers["_is_legacy_layer_key"]("model.layers.3.conv") is False)
     print(f"[patched] detector precision ('(6, 0)' yes; encoded/dotted no): {ok_prec}")
-    # invalidation rides the fingerprint, not a new field
-    ok_fmt = ("DISK_CACHE_FORMAT_VERSION = 3" in dc_src
+    # invalidation rides the reader, not a new field, and the store identity does NOT rotate:
+    # a bump strands the live tier (segments measured 2.4 GB still valid on dot26) and re-writes
+    # about the same, which is the drive-wear limit -- so the version stays 2 and the legacy key
+    # shape is recognised at read.
+    ok_fmt = ("DISK_CACHE_FORMAT_VERSION = 2" in dc_src
               and "STATE_FORMAT_VERSION" not in dc_src
-              and 'manifest["state_format"]' not in dc_src)
-    print(f"[patched] format 2->3 fingerprint bump, no invented per-file stamp: {ok_fmt}")
+              and 'manifest["state_format"]' not in dc_src
+              and "keymap is None and any(_is_legacy_layer_key" not in dc_src)
+    print(f"[patched] format held at 2, legacy shape caught at read on both sides: {ok_fmt}")
     ok_counters = (dc_src.count('"legacy_states_skipped"') >= 4
                    and '"skipped_budget", "write_errors",\n                                         "legacy_states_skipped") if d[k]]' in dc_src)
     print(f"[patched] counter reaches the [CACHE] line and the discarded: segment: {ok_counters}")
