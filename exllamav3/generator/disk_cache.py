@@ -114,7 +114,32 @@ _TOUCH_INTERVAL = 60
 # Bump when a change to the code alters the bytes of a page image or a checkpoint (a kernel or module computing
 # K/V differently, a new checkpoint layout). Part of the fingerprint, so existing caches are left alone until
 # then; the version string and the model/cache identity cover the rest
-DISK_CACHE_FORMAT_VERSION = 2
+DISK_CACHE_FORMAT_VERSION = 3
+
+
+def _encode_layer_key(key):
+    """JSON-safe key: tuple layer keys become tagged lists so they survive json.dumps and come back as data."""
+    if isinstance(key, str):
+        return key
+    if isinstance(key, tuple):
+        return json.dumps(["tuple", list(key)])
+    return json.dumps(["scalar", key])
+
+
+def _decode_layer_key(key):
+    """Inverse of _encode_layer_key; anything it did not write is returned unchanged."""
+    if not isinstance(key, str) or not key.startswith("["):
+        return key
+    try:
+        tag, val = json.loads(key)
+    except Exception:
+        return key
+    return tuple(val) if tag == "tuple" else val
+
+
+def _is_legacy_layer_key(key):
+    """True for a stringified tuple layer key written by the pre-encoding state tier, e.g. '(6, 0)'."""
+    return isinstance(key, str) and key.startswith("(") and key.endswith(")") and ", " in key
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -480,6 +505,7 @@ class DiskPageCache:
             "write_errors": 0, "states_pruned": 0, "state_candidates_dropped": 0, "skipped_low_space": 0,
             "pages_adopted": 0, "states_adopted": 0, "skipped_budget": 0, "state_rewrites_suppressed": 0,
             "seg_rotations": 0, "seg_unlinked": 0, "skipped_no_segment": 0,
+            "legacy_states_skipped": 0,
         }
         # Read-only connection of the main thread for adopt(), opened on first use
         self._query_conn = None
@@ -1368,7 +1394,7 @@ class DiskPageCache:
                         continue
                     tensors = []
                     struct = pack_stash(v, tensors)
-                    key = keymap.get(k, k if isinstance(k, str) else str(k))
+                    key = _encode_layer_key(keymap.get(k, k))
                     layers[key] = {
                         "struct": struct,
                         "tensors": [{"shape": list(t.shape), "dtype": str(t.dtype).removeprefix("torch.")} for t in tensors],
@@ -1856,7 +1882,8 @@ class DiskPageCache:
     _REPORTED = ("page_writes", "page_write_bytes", "state_writes", "page_reads", "page_read_bytes", "state_reads",
                  # Without these, a tier that throws work away is indistinguishable from one that never had it:
                  # the save/restore halves only show what landed, never what was dropped before it could.
-                 "states_pruned", "state_candidates_dropped", "skipped_low_space", "skipped_budget", "write_errors")
+                 "states_pruned", "state_candidates_dropped", "skipped_low_space", "skipped_budget", "write_errors",
+                 "legacy_states_skipped")
 
     def _note_activity(self):
         """Writer thread. Start an activity summary, or write the current one if it is 10 seconds old"""
@@ -1886,7 +1913,8 @@ class DiskPageCache:
             parts.append(f"restored {d['page_reads']} pages ({d['page_reads'] * PAGE_SIZE} tokens) and "
                          f"{d['state_reads']} checkpoints")
         discarded = [(k, d[k]) for k in ("states_pruned", "state_candidates_dropped", "skipped_low_space",
-                                         "skipped_budget", "write_errors") if d[k]]
+                                         "skipped_budget", "write_errors",
+                                         "legacy_states_skipped") if d[k]]
         if discarded:
             parts.append("discarded: " + ", ".join(f"{k} {v}" for k, v in discarded))
         if not parts:
@@ -2547,7 +2575,13 @@ class DiskPageCache:
                         d["tp_handle"] = handle
                     else:
                         keymap = self._side_keymap(side)
-                        inverse = {v: k for k, v in keymap.items()} if keymap else {}
+                        if keymap is None and any(_is_legacy_layer_key(key) for key in info["layers"]):
+                            # Written by the pre-encoding tier (format 2): bare-side layer keys were
+                            # stringified, so they cannot be mapped back onto the live layers. Dropping
+                            # it lets the GC reclaim the blob instead of failing every restore.
+                            self.metrics["legacy_states_skipped"] += 1
+                            raise ValueError("state written by the pre-encoding tier (stringified layer keys)")
+                        inverse = {_encode_layer_key(v): k for k, v in keymap.items()} if keymap else {}
                         for key, entry in info["layers"].items():
                             tensors = []
                             for t in entry["tensors"]:
@@ -2556,7 +2590,7 @@ class DiskPageCache:
                                 if f.readinto(_raw(tensor)) != t["nbytes"]:
                                     raise ValueError("short read")
                                 tensors.append(tensor)
-                            d[inverse.get(key, key)] = unpack_stash(entry["struct"], tensors)
+                            d[inverse.get(key, _decode_layer_key(key))] = unpack_stash(entry["struct"], tensors)
                     sides_out[side] = d
             if markers:
                 deadline = time.time() + 120
