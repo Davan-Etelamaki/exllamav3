@@ -25,6 +25,12 @@ from .. import Module, Linear, RMSNorm
 
 KEY_FLOW = "inkling_flow"
 
+# Per-call byte budget for the _attend_one relative-position temporaries. Derives the query
+# tile so the largest single allocation on the long-S path stays bounded; only multi-row
+# passes tile down, so single-token decode (T == 1) and short-context passes stay launch-
+# neutral. Tunable per-instance via self.attend_tile_bytes.
+_ATTEND_TILE_BYTES = int(_os.environ.get("INKLING_ATTEND_TILE_BYTES", 512 * 1024 * 1024))
+
 
 def _fresh_flow() -> dict:
     return {"bank": [], "pre_bank": None, "pre_hidden": None, "prev_bank": None, "prev_hidden": None}
@@ -80,9 +86,17 @@ def scaled_l2_clip(x: torch.Tensor, scale: torch.Tensor, threshold: float) -> to
     return (x * (threshold / (norm + 1e-6)).clamp(max = 1.0)).to(input_dtype)
 
 
-def log_scale(x: torch.Tensor, pos: torch.Tensor, alpha: float, floor: int) -> torch.Tensor:
+def compute_log_tau(pos: torch.Tensor, alpha: float, floor: int) -> torch.Tensor:
+    """The position term shared by every log_scale consumer in a forward. Hoisted so global
+    layers compute it once, not once per q/rel projection."""
+    return 1.0 + alpha * torch.log(((pos + 1).float() / floor).clamp(min = 1.0))
+
+
+def log_scale(x: torch.Tensor, pos: torch.Tensor, alpha: float, floor: int,
+              tau: torch.Tensor | None = None) -> torch.Tensor:
     input_dtype = x.dtype
-    tau = 1.0 + alpha * torch.log(((pos + 1).float() / floor).clamp(min = 1.0))
+    if tau is None:
+        tau = compute_log_tau(pos, alpha, floor)
     return (x.float() * tau[..., None, None]).to(input_dtype)
 
 
@@ -665,13 +679,13 @@ class InklingAttention(Module):
     def forward(self, x, params, out_dtype = None):
         raise RuntimeError("InklingAttention is driven by InklingLayer")
 
-    def project_qkv(self, h_q, h_k, h_v, pos_row, params):
+    def project_qkv(self, h_q, h_k, h_v, pos_row, params, tau=None):
         q_lin = self.wq.forward(h_q, params)
         b, t, _ = q_lin.shape
         q = q_lin.view(b, t, self.num_q_heads, self.head_dim).float()
         q = scaled_l2_clip(q, self.q_scale, self.qk_threshold)
         if not self.sliding:
-            q = log_scale(q, pos_row, self.log_alpha, self.log_floor)
+            q = log_scale(q, pos_row, self.log_alpha, self.log_floor, tau)
         q = q.to(torch.half).transpose(1, 2).contiguous()                # (B,h,T,d)
 
         k_lin = self.wk.forward(h_k, params)
@@ -687,14 +701,26 @@ class InklingAttention(Module):
         vh = rmsnorm_f(vh, self.rms_norm_eps).to(vh.dtype)               # unweighted V norm
         return q, kh, vh                                                  # (B,h,T,d) / (B,T,kvh,d)
 
-    def rel_logits(self, h_q, pos_row, params):
+    def rel_logits(self, h_q, pos_row, params, tau=None):
         rs = self.wr.forward(h_q, params)                                 # (B,T,h*d_rel)
         b, t, _ = rs.shape
         rs = rs.view(b, t, self.num_q_heads, self.d_rel).float()
         rs = scaled_l2_clip(rs, self.rel_scale, self.rel_threshold)
         if not self.sliding:
-            rs = log_scale(rs, pos_row, self.log_alpha, self.log_floor)
+            rs = log_scale(rs, pos_row, self.log_alpha, self.log_floor, tau)
         return torch.matmul(rs.transpose(1, 2), self.rel_proj)            # (B,h,T,extent)
+
+    def _attend_one_tile(self, S, T, itemsize):
+        """Largest query-tile whose dominant fp32 temporaries -- the (h, tile, S) relative
+        bias and the (kvh, grp, tile, S+1) softmax logits -- stay under the per-call byte
+        budget. Kept >= T for the usual single-tile decode (T == 1), so the hoist adds no
+        extra query tile and stays launch-neutral; only multi-row passes (T above the byte
+        budget) tile down, which is where the (h, T, S) bias was the largest allocation."""
+        budget = getattr(self, "attend_tile_bytes", _ATTEND_TILE_BYTES)
+        h = self.num_kv_heads * self.num_kv_groups       # combined q-head count (24)
+        denom = h * S * itemsize * 2                     # bias + companion logits, fp32
+        cap = max(1, int(budget // denom)) if denom else T
+        return min(T, max(cap, 32))                      # 32 floor mirrors the old S>16384 path
 
     def _attend_one(self, q, k, v, rel_small, sink, q_pos, kv_pos):
         # single sequence: q (h,T,d) half; k/v (S_,kvh,d) half; rel_small (h,T,extent) fp32;
@@ -706,19 +732,27 @@ class InklingAttention(Module):
         kxf = k.transpose(0, 1).transpose(1, 2).unsqueeze(1).float()      # (kvh,1,d,S)
         vx = v.transpose(0, 1).unsqueeze(1).expand(kvh, grp, S, d)        # (kvh,grp,S,d)
         q4 = q.view(kvh, grp, T, d).float()                               # heads grouped by kv head
-        dist = q_pos[:, None] - kv_pos[None, :]                           # (T,S)
-        causal = dist >= 0
-        bias = rel_small.gather(-1, dist.clamp(0, self.rel_extent - 1).expand(h, T, S))
-        bias = torch.where((causal & (dist < self.rel_extent)).unsqueeze(0), bias, torch.zeros_like(bias))
-        bias4 = bias.view(kvh, grp, T, S)
 
-        tile = 32 if S > 16384 else T
+        # dist/causal/bias are built per query tile, not once for the whole (h, T, S): the
+        # fp32 (h, T, S) bias gather was the largest single allocation on the long-S path,
+        # and it sat OUTSIDE the tile loop so shrinking the tile never touched it. Tiling the
+        # relative-position math keeps its peak at O(tile * S) and is bit-identical -- every
+        # value is a pure function of (q_pos[row], kv_pos), so each tile's rows are bit-equal
+        # to the old full-matrix rows.
+        tile = self._attend_one_tile(S, T, 4)
         outs = []
         for qs in range(0, T, tile):
             qe = min(qs + tile, T)
+            dist = q_pos[qs:qe, None] - kv_pos[None, :]                   # (tt, S)
+            causal = dist >= 0
+            bias = rel_small[:, qs:qe, :].gather(                         # (h, tt, S)
+                -1, dist.clamp(0, self.rel_extent - 1).unsqueeze(0).expand(h, qe - qs, S))
+            bias = torch.where((causal & (dist < self.rel_extent)).unsqueeze(0),
+                               bias, torch.zeros_like(bias))
+            bias4 = bias.view(kvh, grp, qe - qs, S)
             sc = torch.matmul(q4[:, :, qs:qe], kxf) * self.scaling        # (kvh,grp,tt,S)
-            sc = sc + bias4[:, :, qs:qe]
-            sc = sc.masked_fill(~causal[None, None, qs:qe], float("-inf"))
+            sc = sc + bias4
+            sc = sc.masked_fill(~causal[None, None, :, :], float("-inf"))
             snk = sink[qs:qe].T.view(kvh, grp, qe - qs).float()           # (kvh,grp,tt)
             comb = torch.cat([sc, snk.unsqueeze(-1)], dim = -1)
             w = F.softmax(comb, dim = -1)[..., :S].to(v.dtype)
@@ -729,8 +763,11 @@ class InklingAttention(Module):
     def forward_attn(self, h_q, h_k, h_v, params):
         b, t, _ = h_q.shape
         pos_row = self._pos_row(params, b, t)
-        q, kh, vh = self.project_qkv(h_q, h_k, h_v, pos_row, params)
-        rel_small = self.rel_logits(h_q, pos_row, params)                 # (B,h,T,ext)
+        # Global layers apply log_scale on both the q path and the rel path over the SAME
+        # pos_row; compute the shared position term once instead of inside each projection.
+        tau = None if self.sliding else compute_log_tau(pos_row, self.log_alpha, self.log_floor)
+        q, kh, vh = self.project_qkv(h_q, h_k, h_v, pos_row, params, tau)
+        rel_small = self.rel_logits(h_q, pos_row, params, tau)            # (B,h,T,ext)
         sink = torch.matmul(h_q.float(), self.sink_w.T)                   # (B,T,heads)
 
         if self.sliding:
