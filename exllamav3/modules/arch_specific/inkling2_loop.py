@@ -728,8 +728,17 @@ class InklingAttention(Module):
             budget = min(budget, max(8 * 1024 * 1024, free // 2))
         h = self.num_kv_heads * self.num_kv_groups       # combined q-head count (24)
         denom = h * S * itemsize * 2                     # bias + companion logits, fp32
-        cap = max(1, int(budget // denom)) if denom else T
-        return min(T, max(cap, 32))                      # 32 floor mirrors the old S>16384 path
+        if not denom:
+            return int(T)
+        cap = max(1, int(budget // denom))               # rows that actually fit the budget
+        # 32 rows is a preference (it mirrors the old S>16384 path and bounds the loop count),
+        # never a licence to overrun the budget. Applied unconditionally it was the latter: at
+        # S=262,144 one row costs ~50 MiB, so a 512 MiB budget allows 10 rows and the floor
+        # bought 32 -- a ~1.6 GiB allocation under a 512 MiB ceiling, three times over, exactly
+        # where the served window lives. Take the floor only while it still fits.
+        if 32 * denom <= budget:
+            cap = max(cap, 32)
+        return min(int(T), cap)
 
     def _attend_one(self, q, k, v, rel_small, sink, q_pos, kv_pos):
         # single sequence: q (h,T,d) half; k/v (S_,kvh,d) half; rel_small (h,T,extent) fp32;
