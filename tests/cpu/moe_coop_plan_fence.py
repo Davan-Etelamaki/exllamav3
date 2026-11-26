@@ -214,6 +214,25 @@ def main():
     check("_coop_ptr_lists unwraps before data_ptr",
           "moe_coop_plan.unwrap_linear(m)" in ast.unparse(methods["_coop_ptr_lists"]))
 
+    print("[9] type fidelity: the wrapper fixture must match the REAL served Linear")
+    try:  # the boot crash came from the served class, not from a lookalike fixture
+        from exllamav3.modules.linear import Linear as RealLinear
+        lin_src = pathlib.Path(sys.modules[RealLinear.__module__].__file__).read_text()
+    except Exception as e:
+        check("real served Linear importable CPU-only", False, f"{type(e).__name__}: {e}")
+        RealLinear, lin_src = None, ""
+    if RealLinear is not None:
+        check("real Linear exposes no .bias at class level (the boot crash shape)",
+              not hasattr(RealLinear, "bias"))
+        check("wrapper fixture mirrors the real class on the .bias axis",
+              hasattr(tri[0], "bias") == hasattr(RealLinear, "bias"),
+              f"fixture_bias={hasattr(tri[0], 'bias')} real_bias={hasattr(RealLinear, 'bias')}")
+        check("real Linear assigns self.inner in source (unwrap target exists)",
+              "self.inner" in lin_src)
+        grown = LinWrap(FakeLin(3)); grown.bias = None
+        check("POSITIVE CONTROL: a fixture that grows .bias is caught",
+              hasattr(grown, "bias") != hasattr(RealLinear, "bias"))
+
     if fails:
         print("MOE COOP PLAN FENCE RED:", ", ".join(fails))
         return 1
