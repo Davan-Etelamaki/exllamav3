@@ -2,7 +2,8 @@
 
 The served inkling-2-mini path must be declared graph-unsafe: on 2026-11-24 17:38:59 the runner
 warmed up and tried to capture it anyway and the boot lost the round at
-inkling2_loop.py:756 ("expanded size of the tensor (10880) must match the existing size (256)").
+the _gather_global zero-fill (`kk = torch.zeros((b, maxlen) + …)` in inkling2_loop.py, symbol-bound
+because its line number decays) — "expanded size of the tensor (10880) must match the existing size (256)".
 A clean boot-time degrade is the acceptance behaviour; a silent capture attempt is the defect.
 """
 

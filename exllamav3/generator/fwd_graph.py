@@ -48,10 +48,11 @@ def unsafe_types():
     - GatedDeltaNet: histpool launches its own captured graphs and alternates slots on host-side
       logic (gated_delta_net.h:196,202) that capture would freeze.
     - InklingAttention: _gather_global sizes the gathered K/V from HOST-side sequence extents
-      (inkling2_loop.py:735-756: _host_lens -> lens -> maxlen -> torch.zeros shapes) while the NVFP4
+      (_gather_global -> _host_lens -> lens -> maxlen -> kk = torch.zeros((b, maxlen) + …);
+      symbol-bound on purpose — inkling2_loop.py line numbers decay with every edit) while the NVFP4
       staging pool counts pages from the DEVICE cache_seqlens. The two length sources disagree once a
       round's visible extent exceeds the staged pool: dot26 2026-11-24 17:38:59 failed at
-      inkling2_loop.py:756 with "The expanded size of the tensor (10880) must match the existing
+      that zero-fill with "The expanded size of the tensor (10880) must match the existing
       size (256) at non-singleton dimension 0. Target sizes: [10880, 8, 128]. Tensor sizes:
       [256, 8, 128]". Even where a round fits, maxlen moves with context, so every decode step is a
       new capture: whole-forward replay cannot pay for this path until the gather is padded to a

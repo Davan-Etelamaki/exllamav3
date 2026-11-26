@@ -8,14 +8,16 @@ BUILD-BOUND (NOT shippable as a python edit):
   * The "one mat-vec per token" headline. exl3 stores each projection as its own packed Linear:
     Linear.forward delegates wholly to self.inner.forward -- a single ext GEMV over that one
     packed tensor -- exllamav3/modules/linear.py:813/843. wq/wo/gate/wr are separate Linear
-    objects (inkling2_loop.py:599,605,607,609). There is no plain .weight to torch.cat in python:
+    objects (the self.wq/self.wo/self.gate/self.wr Linear ctors in InklingAttention.__init__;
+    symbol-bound — inkling2_loop.py line numbers decay with every edit). No plain .weight exists
+    to torch.cat in python:
     a stacked mat-vec needs a concatenated exl3/fp16 pack (pack change) or a new grouped-GEMV
     ext entry (ext change). Either way it rides the build, like rungs 1-3, and it is NOT
     bit-identical (concat re-lays quant blocks). Reported, not shipped.
 
 PYTHON-FEASIBLE + BITWISE, MEASURED HERE (the rung-5 python sliver):
-  * log_scale computes the position term `tau` from pos_row; on GLOBAL layers project_qkv(:668)
-    and rel_logits(:690) each recompute the SAME tau over the SAME pos_row. Compute tau once and
+  * log_scale computes the position term `tau` from pos_row; on GLOBAL layers project_qkv
+    and rel_logits each recompute the SAME tau over the SAME pos_row. Compute tau once and
     pass it into both -> removes one duplicated tau chain per global layer, bit-identical.
 
 RUNG-5 LATENCY HALF (kept, not a kernel-count win; boot-gated):
