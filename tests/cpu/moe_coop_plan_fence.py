@@ -249,8 +249,9 @@ def main():
     check("bucket creation seeds the fingerprint from a FRESH read, not from the cache",
           "ptr_lists = self._coop_ptr_lists()" in state
           and "'fingerprint': tuple((p for k in names for p in ptr_lists[k]))" in state)
-    check("served path rebuilds only on a cold cache or a moved fingerprint",
-          "if self._coop_ptrs_cache is None:" in decode and "fingerprint != st[" in decode)
+    check("served path rebuilds only on a cold cache or a moved identity",
+          "self._coop_ptrs_cache is None" in decode
+          and ("fingerprint != st[" in decode and "_coop_ptrs_probe() != st" in decode))
     check("refill recomputes fresh, then advances cache and fingerprint together",
           "st['ptr_lists'] = cur_lists = self._coop_ptr_lists()" in decode
           and "self._coop_ptrs_cache = cur_lists" in decode
@@ -261,6 +262,60 @@ def main():
     cache_seed = state.replace("for p in ptr_lists[k]))", "for p in self._coop_ptrs_cache[k]))")
     check("POSITIVE CONTROL: seeding the fingerprint from the cache is caught",
           cache_seed != state and "for p in self._coop_ptrs_cache[k])" in cache_seed)
+
+    print("[11] epoch arm: a moved tensor without unload() must not serve cached pointers")
+    import numpy as _np
+    fn2 = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_coop_decode")
+    keep = lambda n: ("_coop_ptrs_cache" in ast.unparse(n) or "cur_lists = " in ast.unparse(n)
+                      or ast.unparse(n).startswith("fingerprint = ") or "_coop_ptrs_probe" in ast.unparse(n))
+    stmts = [n for n in fn2.body if keep(n)]
+
+    class _Live:
+        def __init__(s, v): s.v = v
+        def data_ptr(s): return s.v
+
+    class _Buf:
+        def __init__(s): s.src = None
+        def copy_(s, src, non_blocking=False): s.src = src
+
+    class _Shim:
+        def __init__(s):
+            s._coop_ptrs_cache = None
+            s.live = {"g": _Live(1000), "u": _Live(2000), "d": _Live(3000)}
+        def _coop_ptr_lists(s):
+            return {k: [m.data_ptr()] for k, m in (("g", s.live["g"]), ("u", s.live["u"]), ("d", s.live["d"]))}
+        def _coop_ptrs_probe(s):
+            l = s._coop_ptr_lists()
+            return None if not l else tuple(l[k][0] for k in ("g", "u", "d"))
+
+    def _run(body):
+        code = compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])), "<arm>", "exec")
+        sh = _Shim(); lists = sh._coop_ptr_lists(); names = sorted(lists)
+        stage = _np.array([v for k in names for v in lists[k]], dtype=_np.int64)
+        offs, pos = {}, 0
+        for k in names:
+            offs[k] = (pos, pos + len(lists[k])); pos = offs[k][1]
+        st = {"names": names, "offsets": offs, "stage": stage, "stage_np": stage,
+              "ptr_lists": lists, "fingerprint": tuple(v for k in names for v in lists[k]),
+              "probe": sh._coop_ptrs_probe(), "args": {k: _Buf() for k in names}}
+        sh._coop_ptrs_cache = lists
+        for k in sh.live: sh.live[k].v += 8000  # weights move; unload() never fires
+        ex = {"self": sh, "st": st, "args": st["args"]}
+        exec(code, ex)
+        return st["ptr_lists"]["g"][0], sh._coop_ptr_lists()["g"][0]
+
+    served, live = _run(stmts)
+    check("a moved tensor is caught: the coop step serves the LIVE pointers",
+          served == live, f"served_g={served} live_g={live}")
+    _dq, _sq = chr(34), chr(39)
+    _frag_dq = ' or self._coop_ptrs_probe() != st.get(' + _dq + 'probe' + _dq + ')'
+    _frag_sq = ' or self._coop_ptrs_probe() != st.get(' + _sq + 'probe' + _sq + ')'
+    planted = [ast.parse(ast.unparse(n).replace(_frag_dq, '').replace(_frag_sq, '')).body[0] for n in stmts]
+    check("planted edit actually removed the live-probe test",
+          all("_coop_ptrs_probe" not in ast.unparse(n) for n in planted if "self._coop_ptrs_cache is None" in ast.unparse(n)))
+    served_p, live_p = _run(planted)
+    check("POSITIVE CONTROL: dropping the live probe reintroduces the stale serve",
+          served_p != live_p, f"served={served_p} live={live_p}")
 
     if fails:
         print("MOE COOP PLAN FENCE RED:", ", ".join(fails))

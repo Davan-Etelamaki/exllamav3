@@ -1132,6 +1132,18 @@ class InklingMoE(Module):
             for what in ("trellis", "suh", "svh")
         }
 
+    def _coop_ptrs_probe(self):
+        """Cheapest LIVE identity signal for the pointer tables: the first expert's three
+        projections. An offload/promote/reload re-allocates the layer's expert tensors, so
+        these device addresses move with them. Needed because a memoised table is its own
+        evidence: reading the fingerprint from the cache can never notice that the weights
+        moved without unload (arm proven 2026-11-26: served 1000 while live was 9000)."""
+        if not self.experts_g:
+            return None
+        un = moe_coop_plan.unwrap_linear
+        return (un(self.experts_g[0]).data_ptr(), un(self.experts_u[0]).data_ptr(),
+                un(self.experts_d[0]).data_ptr())
+
     def _coop_state(self, device, bucket: int):
         """Fixed-address arena for one decode BUCKET: nine int64 pointer tables (the
         per-expert LinearEXL3 tensors are referenced BY POINTER at load — never a stacked
@@ -1187,7 +1199,8 @@ class InklingMoE(Module):
         )
         st = {"args": args, "ptr_lists": ptr_lists, "stage": stage, "stage_np": stage_np,
               "offsets": offsets, "names": names,
-              "fingerprint": tuple(p for k in names for p in ptr_lists[k])}
+              "fingerprint": tuple(p for k in names for p in ptr_lists[k]),
+              "probe": self._coop_ptrs_probe()}
         self._coop_by_bucket[bucket] = st
         return st
 
@@ -1223,7 +1236,7 @@ class InklingMoE(Module):
         # layer lifecycle says they moved (unload/load), never per decode step. Before this
         # cache, _coop_ptr_lists + unwrap_linear burned ~36% of decode samples (dot26 census
         # 2026-11-26 17:2x: 100+30 of ~360).
-        if self._coop_ptrs_cache is None:
+        if self._coop_ptrs_cache is None or self._coop_ptrs_probe() != st.get("probe"):
             self._coop_ptrs_cache = self._coop_ptr_lists()
         cur_lists = self._coop_ptrs_cache
         fingerprint = tuple(p for k in st["names"] for p in cur_lists[k])
@@ -1241,6 +1254,7 @@ class InklingMoE(Module):
                 stage_np[lo:hi] = cur_lists[k]
                 args[k].copy_(st["stage"][lo:hi], non_blocking = True)
             st["fingerprint"] = fingerprint
+            st["probe"] = self._coop_ptrs_probe()
         call = dict(args)
         call["x"] = flat
         call["sel"] = sel.reshape(rows, self.top_k)
