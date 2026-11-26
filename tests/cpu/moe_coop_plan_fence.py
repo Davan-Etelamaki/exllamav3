@@ -185,6 +185,11 @@ def main():
           "stage_np[lo:hi] = cur_lists[k]" in decode and "copy_(st[" in decode)
     check("declared switch gates the tier",
           "self.config.infer_params.moe_coop_decode" in decode)
+    check("pointer tables cached, not rebuilt per decode step (census 2026-11-26)",
+          "self._coop_ptrs_cache is None" in decode)
+    planted = decode.replace("self._coop_ptrs_cache is None", "True")
+    check("POSITIVE CONTROL: planted per-step rebuild caught",
+          planted != decode and "self._coop_ptrs_cache is None" not in planted)
     check("output sliced to the live rows", "out[:rows]" in decode)
     whole = MODULE.read_text()
     check("live-rows dict retired tree-wide", "_coop_by_rows" not in whole)

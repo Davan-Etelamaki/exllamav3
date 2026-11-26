@@ -1092,6 +1092,7 @@ class InklingMoE(Module):
         # moe_coop_plan.padded_bucket_rows, never by live rows: one captured graph replays
         # for every live count at or below its bucket (graph lane §U).
         self._coop_by_bucket: dict = {}
+        self._coop_ptrs_cache: dict | None = None
         self._coop_refuse_reason = None
 
     @override
@@ -1109,6 +1110,7 @@ class InklingMoE(Module):
     def unload(self):
         self.router_w = self.router_bias = None
         self._coop_by_bucket = {}  # pointer tables pin device addresses; they die with the weights
+        self._coop_ptrs_cache = None
         self._coop_refuse_reason = None
         super().unload()
 
@@ -1216,7 +1218,13 @@ class InklingMoE(Module):
         if st is None:
             return None
         args = st["args"]
-        cur_lists = self._coop_ptr_lists()
+        # Pointer tables are pure functions of the LOADED weights: rebuilt only when the
+        # layer lifecycle says they moved (unload/load), never per decode step. Before this
+        # cache, _coop_ptr_lists + unwrap_linear burned ~36% of decode samples (dot26 census
+        # 2026-11-26 17:2x: 100+30 of ~360).
+        if self._coop_ptrs_cache is None:
+            self._coop_ptrs_cache = self._coop_ptr_lists()
+        cur_lists = self._coop_ptrs_cache
         fingerprint = tuple(p for k in st["names"] for p in cur_lists[k])
         if fingerprint != st["fingerprint"]:
             # Weights moved (offload/reload): refill the tables IN PLACE so the addresses
@@ -1224,7 +1232,8 @@ class InklingMoE(Module):
             # The refill reads from the pinned staging buffer: no allocation and no
             # pageable H2D inside a capture step (torch refuses the latter; it is how
             # every capture of this model died, dot26 journal 2026-11-24 03:34:47).
-            st["ptr_lists"] = cur_lists
+            st["ptr_lists"] = cur_lists = self._coop_ptr_lists()  # cache was stale: weights moved
+            self._coop_ptrs_cache = cur_lists
             stage_np = st["stage_np"]
             for k in st["names"]:
                 lo, hi = st["offsets"][k]
