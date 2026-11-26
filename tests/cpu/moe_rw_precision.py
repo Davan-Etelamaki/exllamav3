@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Charge A (supervisor, 2026-11-25): PRICE the rw float->half rounding at the coop boundary.
 
-Multiply sites (supervisor charge A, 2026-11-25 — exact lines):
-  served:  Inkling2LoopSparseMoeBlock.forward — out.index_add_(..., y.float() * w_flat...)
-           fp32 weight (string anchor; at tip fc4a5451 this line is :1250 and w_flat is
-           built at :1216; it was :1115 BEFORE the coop wiring commit — the earlier
-           :1160 cite came from the design brief and matched neither tree, supervisor
-           §R caught it)
+Multiply sites (supervisor charge A, 2026-11-25 — anchored, not line-numbered):
+  served:  InklingMoE.forward legacy dispatch — the line multiplying the fp32 routing
+           weight into the expert output before accumulation, located by the string
+           'out.index_add_(0, tokens, y.float() *' with w_flat = w.reshape(-1) above it
+           (line numbers decay across wiring commits and are deliberately not restamped;
+           the :1160 cite inherited from the design brief matched neither tree, §R)
   coop:    the half weight is cast back INSIDE the kernel at
            exl3_moe_coop_kernel.cuh:220 (si.w = __half2float(p.rw[s]), slot load of the B
            stage) and multiplied against the fp32 partial in the fp32 accumulate at

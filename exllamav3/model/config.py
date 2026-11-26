@@ -28,6 +28,14 @@ class InferParams:
     # Width threshold for enabling MGEMM regardless of bitrate
     mgemm_n_threshold: int = 0
 
+    # Routed-decode tier for block-sparse MoE (Inkling2Loop): a decode-shaped batch goes
+    # through the fused exl3_moe_coop launches (device routing, zero host syncs) instead of
+    # the per-expert python dispatch. True is the served default; False is the control arm
+    # of the fence-3 A/B — one build, both arms, this field the only difference
+    # (exllamav3/exllamav3_ext/moe_group/README.md). Checked per forward call, so both arms
+    # run in one process without a reload
+    moe_coop_decode: bool = True
+
     def __init__(self):
         # With the int8 GEMV mode (on by default), separate int8 GEMV calls beat the fused MGEMM
         # only when a single matrix is wide enough to fill the GPU on its own (and K is within the

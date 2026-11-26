@@ -119,10 +119,48 @@ Worst-case segment capacity (named rule, header `moe_exl3_table.cuh`):
 `max_blocks = ceil(max_padded_rows/16)`. At the cap: 256 entries -> 2176 rows -> 136 blocks.
 Compiled and python values are pinned equal by the ABI crosscheck at {8, 64, 512, 2048}.
 
-Allocation owner: the PYTHON WIRING allocates one fixed-address arena per graph-capture set
-(per device, per layer: sel/w/sorted_token_ids/expert_for_block/counters + act_scratch) at
-capture-set creation, sized by the formulas above; kernels never allocate mid-forward and the
-address set is stable across replays (Strata in-place-recall lesson, campaign §210).
+Allocation owner: the PYTHON WIRING allocates one fixed-address arena per decode BUCKET
+(per device, per layer: nine int64 pointer tables + coop scratch
+`had_g/had_u/gu_g/gu_u/act_out/d_out/ctr/out`) at the first step that needs that bucket,
+sized by the formulas above with `entries = bucket * top_k`; kernels never allocate
+mid-forward and the address set is stable across replays (Strata in-place-recall lesson,
+campaign §210).
+
+## Capture contract — arena key = padded bucket (graph lane §U, 2026-11-25)
+
+Piecewise capture pads a decode batch to a bucket, so ONE captured graph replays for every
+live count at or below it. Keying the arena by LIVE rows therefore breaks capture: the
+capture step bakes `arena(live_rows)`, and a replay at another live count takes a dict miss,
+a fresh allocation and different addresses than the graph baked — a silent replay against
+the wrong buffer, not a clean error. The shared rule BOTH lanes call is
+`moe_coop_plan.padded_bucket_rows(rows) -> arena_key`, over the decode ladder
+`DECODE_BUCKETS = (1, 2, 4, 8, 16, 32)`; counts above the ladder do not take the coop tier
+(`refusal()` names why; `classify_experts` returns its reason string — the fence-3 validity
+gate: a zero A/B delta must be explainable from a recorded refusal, never inferred).
+
+Division of obligations:
+
+- This lane: arena keyed and sized by the bucket. `bsz` for the coop call comes from
+  `x.size(0)` (`exl3_moe_coop_run`), so eager steps run live-row shapes against the
+  oversized arena — every scratch index is a superset — and the fp32 output is sliced
+  `out[:rows]` (a view; no allocation).
+- Capture lane: at a bucket, the captured inputs `flat/sel/w` are PADDED FIXED-ADDRESS
+  buffers handed into the module (the baked `bsz` equals the bucket); rows above the live
+  count are garbage-but-finite and masked downstream. Arena stability is necessary, not
+  sufficient — per-step activation addresses must not be baked.
+- Both: the fingerprint refill reads a PINNED int64 staging buffer (one `copy_` per table),
+  never `torch.tensor(..., device=...)` — no allocation and no pageable H2D inside a
+  capture step (torch refuses the latter; it is how every capture of this model died,
+  dot26 journal 2026-11-24 03:34:47).
+- The fence-3 A/B seam is the declared field `config.infer_params.moe_coop_decode` (on by
+  default), checked per forward call: one build, both arms, the switch the only readable
+  difference; no env-var procedure (laws 10/16).
+
+Verification at this change: python-only — zero compiled files touched, so no nvcc ritual;
+`tests/cpu/moe_coop_plan_fence.py` extended with the bucket-rule arms, refusal-reason arms
+and an AST check that the SERVED module carries the shared rule (parsed, never imported —
+workstation import law); both planted controls RED as required; the three numeric fences
+re-ran GREEN in the same turn as this commit.
 
 ## Verification record (corrected 2026-11-25 after a supervisor attribution refutation)
 
@@ -201,9 +239,12 @@ with `cuobjdump --dump-elf-symbols` and the expected kernel-entry names in the r
    LinearEXL3 `.trellis/.suh/.svh` `data_ptr()` at first eligible decode step — the coop
    `prepare` consumes tables directly (its `*_trellis` args ARE int64 tables,
    `n_local = size(0)`), so no stacked copy ever exists. Fixed-address arena per
-   (decode-rows, load-epoch): `had_g/had_u/gu_g/gu_u/act_out/d_out/ctr/out`, cleared on
-   `unload()`; a weight-pointer fingerprint is re-checked per call and refilled IN PLACE
-   on drift so captured addresses stay meaningful (doorbell rule). Router stays torch
+   (decode-BUCKET, load-epoch) — §U: `had_g/had_u/gu_g/gu_u/act_out/d_out/ctr/out`,
+   cleared on `unload()`; a weight-pointer fingerprint is re-checked per call and refilled
+   IN PLACE from a pinned int64 staging buffer on drift, so captured addresses stay
+   meaningful (doorbell rule) and no capture step allocates. The tier is gated by the
+   declared `config.infer_params.moe_coop_decode` (on by default; off is the fence-3
+   control arm) and every refusal records its reason on the module. Router stays torch
    (byte-identical routing; `sel` is already int64, `rw = w.half()`). NUMERICS NOTE:
    `rw` rides the coop boundary as HALF while the python path multiplied fp32 weights —
    fence 3's greedy parity prices this honestly; `gu` scratch is half, which MATCHES the
@@ -211,7 +252,9 @@ with `cuobjdump --dump-elf-symbols` and the expected kernel-entry names in the r
    Legacy `host_values`/`stage_host` path RETAINED (prefill + ineligible shapes still
    ride it); its retirement behind the fence-2 trace arm is a wheel-window decision.
    Drift fence: `tests/cpu/moe_coop_plan_fence.py` re-parses the headers (constants,
-   37-parameter call order, ctr formula text) with a planted-rename control.
+   37-parameter call order, ctr formula text) with a planted-rename control, pins the
+   bucket rule and the refusal reasons, and AST-checks the served module for the shared
+   rule (planted live-row-key control).
 3. Fallback comparator only (`moe_group_gemv.cu`): host grid sizing
    (`cudaOccupancyMaxActiveBlocksPerMultiprocessor`) and, if it is ever promoted to primary,
    the trellis stream substitution (replace the int4 placeholder unpack; fold x*suh pre-GU and

@@ -1087,9 +1087,12 @@ class InklingMoE(Module):
             self.experts_d.append(d)
             for lin in (g, u, d):
                 self.register_submodule(lin)
-        # Per-decode-batch fixed-address arenas for the exl3_moe_coop decode tier
-        # (moe_group/README.md); empty until the first eligible decode step.
-        self._coop_by_rows: dict = {}
+        # Per-decode-BUCKET fixed-address arenas for the exl3_moe_coop decode tier
+        # (moe_group/README.md); empty until the first eligible decode step. Keyed by
+        # moe_coop_plan.padded_bucket_rows, never by live rows: one captured graph replays
+        # for every live count at or below its bucket (graph lane §U).
+        self._coop_by_bucket: dict = {}
+        self._coop_refuse_reason = None
 
     @override
     def optimizer_targets(self):
@@ -1105,7 +1108,8 @@ class InklingMoE(Module):
     @override
     def unload(self):
         self.router_w = self.router_bias = None
-        self._coop_by_rows = {}  # pointer tables pin device addresses; they die with the weights
+        self._coop_by_bucket = {}  # pointer tables pin device addresses; they die with the weights
+        self._coop_refuse_reason = None
         super().unload()
 
     @override
@@ -1123,25 +1127,41 @@ class InklingMoE(Module):
             for what in ("trellis", "suh", "svh")
         }
 
-    def _coop_state(self, device, rows: int):
-        """Fixed-address arena for one decode batch size: nine int64 pointer tables (the
+    def _coop_state(self, device, bucket: int):
+        """Fixed-address arena for one decode BUCKET: nine int64 pointer tables (the
         per-expert LinearEXL3 tensors are referenced BY POINTER at load — never a stacked
-        copy), the coop scratch and the fp32 output buffer. Built once per (batch-size,
-        load epoch); reloads invalidate it via unload()."""
-        desc = moe_coop_plan.classify_experts(zip(self.experts_g, self.experts_u, self.experts_d))
+        copy), a pinned int64 staging buffer for fingerprint refills, the coop scratch and
+        the fp32 output buffer, all sized by the bucket. Built once per (bucket, load
+        epoch); reloads invalidate it via unload(). Returns None and records the reason
+        when the pack itself refuses (homogeneity legs live in moe_coop_plan)."""
+        desc, reason = moe_coop_plan.classify_experts(
+            zip(self.experts_g, self.experts_u, self.experts_d))
         if desc is None:
+            self._coop_refuse_reason = reason
             return None
         g0, d0 = self.experts_g[0], self.experts_d[0]
         Hi, I = int(g0.in_features), int(g0.out_features)
         Ho = int(d0.out_features)
         h = self.hidden_size
         if Hi % 128 or I % 128 or Ho % 128 or Ho < h or int(d0.in_features) != I:
+            self._coop_refuse_reason = \
+                f"geometry not a multiple of 128 (Hi {Hi}, I {I}, Ho {Ho}, h {h})"
             return None
         # (expert-bias homogeneity and bit/codebook uniformity are decided by
         # moe_coop_plan.classify_experts above, where the CPU fence guards them)
         ptr_lists = self._coop_ptr_lists()
-        tables = {k: torch.tensor(v, dtype = torch.int64, device = device) for k, v in ptr_lists.items()}
-        slots = rows * self.top_k
+        names = sorted(ptr_lists)
+        stage = torch.empty(sum(len(ptr_lists[k]) for k in names),
+                            dtype = torch.int64, pin_memory = True)
+        stage_np = stage.numpy()
+        offsets = {}
+        pos = 0
+        for k in names:
+            stage_np[pos:pos + len(ptr_lists[k])] = ptr_lists[k]
+            offsets[k] = (pos, pos + len(ptr_lists[k]))
+            pos += len(ptr_lists[k])
+        tables = {k: stage[offsets[k][0]:offsets[k][1]].to(device).contiguous() for k in names}
+        slots = bucket * self.top_k
         args = dict(
             min_expert = -1, max_expert = -1, Hi = Hi,
             g_bias = None, u_bias = None, d_bias = None,
@@ -1156,46 +1176,66 @@ class InklingMoE(Module):
             gu_u = torch.zeros((slots, I), dtype = torch.half, device = device),
             act_out = torch.zeros((slots, I), dtype = torch.half, device = device),
             d_out = torch.zeros((slots, Ho), dtype = torch.float, device = device),
-            ctr = torch.zeros(moe_coop_plan.ctr_len(slots, rows, I, Ho), dtype = torch.int, device = device),
-            out = torch.zeros((rows, h), dtype = torch.float, device = device),
+            ctr = torch.zeros(moe_coop_plan.ctr_len(slots, bucket, I, Ho), dtype = torch.int, device = device),
+            out = torch.zeros((bucket, h), dtype = torch.float, device = device),
             **tables,
         )
-        st = {"args": args, "ptr_lists": ptr_lists,
-              "fingerprint": tuple(p for k in sorted(ptr_lists) for p in ptr_lists[k])}
-        self._coop_by_rows[rows] = st
+        st = {"args": args, "ptr_lists": ptr_lists, "stage": stage, "stage_np": stage_np,
+              "offsets": offsets, "names": names,
+              "fingerprint": tuple(p for k in names for p in ptr_lists[k])}
+        self._coop_by_bucket[bucket] = st
         return st
 
     def _coop_decode(self, flat, sel, w):
         """Grouped decode through exl3_moe_coop: one launch pair for the whole MoE layer,
         routing kept ON DEVICE (the host_values/stage_host roundtrip and the per-expert
         python loop are skipped entirely). Returns None to keep the python dispatch —
-        prefill, unsupported pack geometry, expert weights that vanished or an extension
-        without the entry point. Decode-only contract: rows <= 32, slots <= 256
-        (exllamav3/exllamav3_ext/moe_group/README.md)."""
-        rows = flat.size(0)
-        if not moe_coop_plan.eligible(rows, self.top_k, flat.is_cuda,
-                                      flat.dtype == torch.half,
-                                      hasattr(ext, "exl3_moe_coop")):
+        the declared switch off (config.infer_params.moe_coop_decode, the fence-3 A/B
+        seam), prefill, unsupported pack geometry, expert weights that vanished or an
+        extension without the entry point; a pack-level refusal records its reason in
+        self._coop_refuse_reason. Decode-only contract: rows <= 32, slots <= 256
+        (exllamav3/exllamav3_ext/moe_group/README.md).
+
+        ARENA RULE (§U): the arena is keyed by padded_bucket_rows, never by live rows.
+        At a bucket the capture layer hands padded FIXED-ADDRESS input buffers, so the
+        baked bsz equals the bucket and rows above the live count are masked downstream;
+        below it (eager) the live-row shapes run against the oversized arena — bsz comes
+        from x.size(0) in exl3_moe_coop_run and every scratch index is a superset."""
+        if not self.config.infer_params.moe_coop_decode:
             return None
-        st = self._coop_by_rows.get(rows) or self._coop_state(flat.device, rows)
+        rows = flat.size(0)
+        reason = moe_coop_plan.refusal(rows, self.top_k, flat.is_cuda,
+                                       flat.dtype == torch.half,
+                                       hasattr(ext, "exl3_moe_coop"))
+        if reason is not None:
+            return None
+        bucket = moe_coop_plan.padded_bucket_rows(rows)
+        st = self._coop_by_bucket.get(bucket) or self._coop_state(flat.device, bucket)
         if st is None:
             return None
         args = st["args"]
         cur_lists = self._coop_ptr_lists()
-        fingerprint = tuple(p for k in sorted(cur_lists) for p in cur_lists[k])
+        fingerprint = tuple(p for k in st["names"] for p in cur_lists[k])
         if fingerprint != st["fingerprint"]:
             # Weights moved (offload/reload): refill the tables IN PLACE so the addresses
             # a captured graph round baked in stay meaningful on replay (doorbell rule).
+            # The refill reads from the pinned staging buffer: no allocation and no
+            # pageable H2D inside a capture step (torch refuses the latter; it is how
+            # every capture of this model died, dot26 journal 2026-11-24 03:34:47).
             st["ptr_lists"] = cur_lists
-            for k, v in cur_lists.items():
-                args[k].copy_(torch.tensor(v, dtype = torch.int64, device = args["out"].device))
+            stage_np = st["stage_np"]
+            for k in st["names"]:
+                lo, hi = st["offsets"][k]
+                stage_np[lo:hi] = cur_lists[k]
+                args[k].copy_(st["stage"][lo:hi], non_blocking = True)
             st["fingerprint"] = fingerprint
         call = dict(args)
         call["x"] = flat
         call["sel"] = sel.reshape(rows, self.top_k)
         call["rw"] = w.reshape(rows, self.top_k).half()
         ext.exl3_moe_coop(*moe_coop_plan.build_call_args(call))
-        return args["out"]
+        out = args["out"]
+        return out[:rows]
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype = None) -> torch.Tensor:

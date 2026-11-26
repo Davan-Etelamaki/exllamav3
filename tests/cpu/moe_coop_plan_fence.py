@@ -7,10 +7,19 @@ PATH — it is pure python with no package deps. Checks:
   2. CALL_ARGS (positional order for pybind) == the exl3_moe_coop parameter names,
      IN ORDER, parsed from exl3_moe_coop.cuh — arity and order, not just count.
   3. ctr_len mirrors the C++ inline body verbatim (whitespace-normalised) + samples.
-  4. classify_experts/eligible semantics on fake module-likes.
-POSITIVE CONTROL: a planted rename in the parsed signature must trip check 2.
+  4. classify_experts semantics + REFUSED LEGS NAMING THEIR REASON on fake module-likes
+     (the reason is the fence-3 validity gate: a zero A/B delta must be explainable).
+  5. Bucket rule (§U): DECODE_BUCKETS == the shared ladder, arena key = padded bucket,
+     never live rows; refusal reasons for every ineligible leg.
+  6. build_call_args order + loud missing-key failure.
+  7. The SERVED module (parsed by AST, never imported) implements the shared rule: bucket
+     keying, pinned-staging refill, the declared InferParams switch — and the retired
+     live-rows / torch.tensor-refill constructs are gone from the tree.
+POSITIVE CONTROLS: a planted rename in the parsed signature trips 2; a planted bucket-key
+rename in the AST body trips 7.
 """
 
+import ast
 import importlib.util
 import pathlib
 import re
@@ -18,6 +27,8 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 PLAN = ROOT / "exllamav3/modules/arch_specific/moe_coop_plan.py"
+MODULE = ROOT / "exllamav3/modules/arch_specific/inkling2_loop.py"
+PARAMS = ROOT / "exllamav3/model/config.py"
 COOP_CUH = ROOT / "exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh"
 KERNEL_CUH = ROOT / "exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh"
 COMMON_CUH = ROOT / "exllamav3/exllamav3_ext/moe_group/moe_sm89_common.cuh"
@@ -59,6 +70,15 @@ class FakeLin:
         self.K, self.mcg, self.mul1, self.bias = K, mcg, mul1, bias
 
 
+def assert_refusal(name, groups, needle):
+    desc, reason = plan.classify_experts(groups)
+    ok = desc is None and needle in reason
+    detail = f" (reason: {reason})" if ok else f" (got desc={desc} reason={reason!r})"
+    print(f"  {'ok  ' if ok else 'FAIL'} {name}{detail}")
+    if not ok:
+        fails.append(name)
+
+
 def main():
     coop = COOP_CUH.read_text()
     kern = KERNEL_CUH.read_text()
@@ -92,25 +112,56 @@ def main():
     check("sample rows=1", plan.ctr_len(8, 1, 9216, 2304) == 8 * 72 + 18 + 2 + 9 + 8)
     check("sample cap", plan.ctr_len(256, 32, 9216, 2304) == 256 * 72 + 32 * 18 + 2 + 257 + 256)
 
-    print("[4] eligibility semantics on fake modules")
+    print("[4] classify_experts admits the homogeneous pack and names every refused leg")
     uni = [(FakeLin(3), FakeLin(3), FakeLin(3))] * 128
-    desc = plan.classify_experts(uni)
-    check("uniform pack classifies", desc == {"Kg": 3, "Ku": 3, "Kd": 3, "mcg": False, "mul1": False})
-    check("fractional bitrate", plan.classify_experts([(FakeLin(3.05, mul1=True), FakeLin(3.05, mul1=True), FakeLin(3.05, mul1=True))]) is not None)
-    check("gate/up bit split refused", plan.classify_experts([(FakeLin(3), FakeLin(4), FakeLin(3))]) is None)
-    mixed = [(FakeLin(3), FakeLin(3), FakeLin(3))] * 4 + [(FakeLin(3), FakeLin(3), FakeLin(4))]
-    check("per-expert bitrate drift refused", plan.classify_experts(mixed) is None)
-    cb_mix = [(FakeLin(3), FakeLin(3), FakeLin(3, mcg=True))]
-    check("mixed codebooks refused", plan.classify_experts(cb_mix) is None)
-    biased = [(FakeLin(3, bias=object()), FakeLin(3), FakeLin(3))]
-    check("biased pack refused", plan.classify_experts(biased) is None)
-    check("prefill refused by cap", not plan.eligible(plan.MOE_MAX_DECODE_TOKENS + 1, 8, True, True, True))
-    check("slot cap enforced", not plan.eligible(32, 9, True, True, True))
-    check("fp32 input refused", not plan.eligible(1, 8, True, False, True))
-    check("no ext entry refused", not plan.eligible(1, 8, True, True, False))
-    check("decode bs=1 admitted", plan.eligible(1, 8, True, True, True))
+    desc, reason = plan.classify_experts(uni)
+    check("uniform pack classifies",
+          desc == {"Kg": 3, "Ku": 3, "Kd": 3, "mcg": False, "mul1": False} and reason == "")
+    frac, reason = plan.classify_experts([(FakeLin(3.05, mul1 = True),) * 3])
+    check("fractional bitrate admitted", frac is not None and reason == "")
+    assert_refusal("gate/up bit split refused", [(FakeLin(3), FakeLin(4), FakeLin(3))], "gate K")
+    assert_refusal("per-expert bitrate drift refused",
+                   [(FakeLin(3), FakeLin(3), FakeLin(3))] * 4 + [(FakeLin(3), FakeLin(3), FakeLin(4))],
+                   "baseline")
+    assert_refusal("mixed codebooks refused", [(FakeLin(3), FakeLin(3), FakeLin(3, mcg = True))],
+                   "codebook families")
+    assert_refusal("biased pack refused", [(FakeLin(3, bias = object()), FakeLin(3), FakeLin(3))], "bias")
+    assert_refusal("bitrate outside [1,8] refused", [(FakeLin(0), FakeLin(0), FakeLin(0))], "outside")
 
-    print("[5] build_call_args pins order and fails loudly on a missing key")
+    print("[5] bucket rule (graph lane §U): arena key = padded bucket, never live rows")
+    check("ladder == the shared decode universe", plan.DECODE_BUCKETS == (1, 2, 4, 8, 16, 32),
+          str(plan.DECODE_BUCKETS))
+    check("ladder cap == MOE_MAX_DECODE_TOKENS",
+          max(plan.DECODE_BUCKETS) == plan.MOE_MAX_DECODE_TOKENS)
+    check("ladder slots cap == MOE_COOP_MAX_SLOTS at top_k 8",
+          max(plan.DECODE_BUCKETS) * 8 == plan.MOE_COOP_MAX_SLOTS)
+    for rows, want in [(1, 1), (2, 2), (3, 4), (5, 8), (9, 16), (17, 32), (32, 32),
+                       (33, None), (4096, None)]:
+        got = plan.padded_bucket_rows(rows)
+        check(f"padded_bucket_rows({rows}) -> {want}", got == want, str(got))
+    check("POSITIVE CONTROL: live-row keying retired (3 -> 4, not 3)",
+          plan.padded_bucket_rows(3) != 3)
+    check("refusal: a below-bucket live count is admitted",
+          plan.refusal(3, 8, True, True, True) is None and plan.eligible(3, 8, True, True, True))
+    for name, leg, needle in [
+        ("cpu x", (3, 8, False, True, True), "not a CUDA tensor"),
+        ("fp32 x", (3, 8, True, False, True), "not fp16"),
+        ("no ext entry", (3, 8, True, True, False), "exl3_moe_coop"),
+        ("above the ladder", (33, 8, True, True, True), "above the decode ladder"),
+        ("slots beyond cap", (32, 9, True, True, True), "exceeds MOE_COOP_MAX_SLOTS"),
+    ]:
+        r = plan.refusal(*leg)
+        ok = r is not None and needle in r and not plan.eligible(*leg)
+        print(f"  {'ok  ' if ok else 'FAIL'} refusal names {name}"
+              + (f" (reason: {r})" if ok else f" (got {r!r})"))
+        if not ok:
+            fails.append("refusal " + name)
+    check("eligible == (refusal is None) over a rows x top_k sweep",
+          all(plan.eligible(r, k, True, True, True)
+              == (plan.refusal(r, k, True, True, True) is None)
+              for r in range(0, 40) for k in (1, 8, 9)))
+
+    print("[6] build_call_args pins order and fails loudly on a missing key")
     vals = {n: n for n in plan.CALL_ARGS}
     check("round-trip order", plan.build_call_args(vals) == tuple(plan.CALL_ARGS))
     vals.pop("mcg")
@@ -119,6 +170,30 @@ def main():
         check("missing key raises", False)
     except KeyError:
         check("missing key raises", True)
+
+    print("[7] the served module implements the shared rule (AST parse, never imported)")
+    tree = ast.parse(MODULE.read_text())
+    methods = {n.name: n for cls in tree.body if isinstance(cls, ast.ClassDef)
+               for n in cls.body if isinstance(n, ast.FunctionDef)}
+    decode = ast.unparse(methods["_coop_decode"])
+    state = ast.unparse(methods["_coop_state"])
+    check("_coop_decode keys by padded_bucket_rows",
+          "padded_bucket_rows(rows)" in decode and "_coop_by_bucket.get(bucket)" in decode)
+    check("_coop_state sizes from the bucket",
+          "bucket * self.top_k" in state and "ctr_len(slots, bucket, I, Ho)" in state)
+    check("refill reads the pinned staging buffer",
+          "stage_np[lo:hi] = cur_lists[k]" in decode and "copy_(st[" in decode)
+    check("declared switch gates the tier",
+          "self.config.infer_params.moe_coop_decode" in decode)
+    check("output sliced to the live rows", "out[:rows]" in decode)
+    whole = MODULE.read_text()
+    check("live-rows dict retired tree-wide", "_coop_by_rows" not in whole)
+    check("per-call torch.tensor refill retired tree-wide", "copy_(torch.tensor(" not in whole)
+    check("InferParams declares the switch, coop on by default",
+          re.search(r"moe_coop_decode:\s*bool\s*=\s*True", PARAMS.read_text()) is not None)
+    planted = decode.replace("_coop_by_bucket.get(bucket)", "_coop_by_bucket.get(rows)")
+    check("POSITIVE CONTROL: planted live-row key caught",
+          planted != decode and "_coop_by_bucket.get(bucket)" not in planted)
 
     if fails:
         print("MOE COOP PLAN FENCE RED:", ", ".join(fails))
