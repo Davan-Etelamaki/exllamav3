@@ -341,6 +341,14 @@ def main():
     check("POSITIVE CONTROL: a tile fn without the early return fails the rule",
           planted.find("if T <= 1:") == -1 < planted.find("mem_get_info"))
 
+    print("[12] probe reads TENSORS: LinearEXL3 holds trellis/suh/svh but is not a tensor")
+    psrc = ast.unparse(methods["_coop_ptrs_probe"])
+    check("probe dereferences .trellis before data_ptr (AttributeError fix 2026-11-26)",
+          all(f"experts_{t}[0]).trellis.data_ptr()" in psrc for t in "gud"))
+    planted = psrc.replace(".trellis.data_ptr()", ".data_ptr()")
+    check("POSITIVE CONTROL: probe treating the mixin as a tensor fails",
+          planted != psrc and ".trellis.data_ptr()" not in planted)
+
     if fails:
         print("MOE COOP PLAN FENCE RED:", ", ".join(fails))
         return 1

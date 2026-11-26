@@ -1149,8 +1149,12 @@ class InklingMoE(Module):
         if not self.experts_g:
             return None
         un = moe_coop_plan.unwrap_linear
-        return (un(self.experts_g[0]).data_ptr(), un(self.experts_u[0]).data_ptr(),
-                un(self.experts_d[0]).data_ptr())
+        # .trellis hop: unwrap lands on the LinearEXL3 MIXIN, which holds tensors but is
+        # not one — calling .data_ptr() on it raised AttributeError inside every coop-armed
+        # request on the 98cf64d4 wheel (repro RED 2026-11-26). trellis is reallocated on
+        # any promote/offload/reload, so it moves exactly when the tables must.
+        return (un(self.experts_g[0]).trellis.data_ptr(), un(self.experts_u[0]).trellis.data_ptr(),
+                un(self.experts_d[0]).trellis.data_ptr())
 
     def _coop_state(self, device, bucket: int):
         """Fixed-address arena for one decode BUCKET: nine int64 pointer tables (the
