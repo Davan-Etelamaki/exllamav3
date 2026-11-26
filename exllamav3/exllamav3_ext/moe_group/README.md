@@ -159,8 +159,10 @@ Division of obligations:
 Verification at this change: python-only — zero compiled files touched, so no nvcc ritual;
 `tests/cpu/moe_coop_plan_fence.py` extended with the bucket-rule arms, refusal-reason arms
 and an AST check that the SERVED module carries the shared rule (parsed, never imported —
-workstation import law); both planted controls RED as required; the three numeric fences
-re-ran GREEN in the same turn as this commit.
+workstation import law); both planted controls RED as required. FULL FOUR-FENCE GREEN SET
+(plan / rw price / elementwise / dispatch-1, `CUDA_VISIBLE_DEVICES=''`) measured at tip
+`4ce17f72` — the first §U run measured the identical tree content a commit earlier
+(the §U commit itself); every number appears in the two commit messages.
 
 ## Verification record (corrected 2026-11-25 after a supervisor attribution refutation)
 
