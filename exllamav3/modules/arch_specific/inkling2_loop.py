@@ -1121,8 +1121,10 @@ class InklingMoE(Module):
         return t
 
     def _coop_ptr_lists(self):
+        # pointer tables reference the INNER quant tensors (Linear wrappers expose no
+        # .trellis/.suh/.svh); see moe_coop_plan.unwrap_linear for why
         return {
-            tag + "_" + what: [getattr(m, what).data_ptr() for m in mods]
+            tag + "_" + what: [getattr(moe_coop_plan.unwrap_linear(m), what).data_ptr() for m in mods]
             for tag, mods in (("g", self.experts_g), ("u", self.experts_u), ("d", self.experts_d))
             for what in ("trellis", "suh", "svh")
         }

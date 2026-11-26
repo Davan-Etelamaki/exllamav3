@@ -51,6 +51,15 @@ def padded_bucket_rows(rows: int) -> int | None:
     return None
 
 
+def unwrap_linear(m):
+    """Quant tensors of a Linear WRAPPER (modules/linear.py) live on .inner once loaded; the
+    coop plan and pointer tables must see the inner QuantLinear*, never the wrapper (whose
+    attribute set lacks .bias/.K/.trellis outright). Modules already exposing the quant attrs
+    pass through unchanged."""
+    inner = getattr(m, "inner", None)
+    return inner if inner is not None else m
+
+
 def classify_experts(groups) -> tuple[dict | None, str]:
     """Collapse 3*num_experts LinearEXL3 modules to one (K, cb) description.
 
@@ -62,6 +71,10 @@ def classify_experts(groups) -> tuple[dict | None, str]:
     """
     desc = None
     for e, (g, u, d) in enumerate(groups):
+        # InklingMoE passes Linear WRAPPERS whose quant tensors (bias/K/mcg/mul1) live on
+        # .inner after load; a bare wrapper has no .bias attribute at all and used to raise
+        # AttributeError here, which aborted every request on the first coop eligibility check
+        g, u, d = (unwrap_linear(m) for m in (g, u, d))
         if g.bias is not None or u.bias is not None or d.bias is not None:
             return None, f"expert {e} carries a bias (bias tables are not wired)"
         if getattr(g, "K", None) != getattr(u, "K", None):

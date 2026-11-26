@@ -195,6 +195,25 @@ def main():
     check("POSITIVE CONTROL: planted live-row key caught",
           planted != decode and "_coop_by_bucket.get(bucket)" not in planted)
 
+    print("[8] boot-shape regression: Linear WRAPPERS (no .bias attr) classify, not raise")
+    class LinWrap:  # mirrors modules/linear.py Linear: exposes inner, NOT bias/K/trellis
+        def __init__(self, inner):
+            self.inner = inner
+    tri = [LinWrap(FakeLin(3)) for _ in range(3)]
+    try:
+        desc, reason = plan.classify_experts([tuple(tri)])
+        check("wrapper trio classifies to a desc", desc is not None and desc["Kg"] == 3,
+              f"desc={desc} reason={reason!r}")
+    except AttributeError as e:  # pre-patch boot failure: 'Linear' has no attribute 'bias'
+        check("wrapper trio classifies to a desc", False, f"AttributeError: {e}")
+    biased = LinWrap(FakeLin(3, bias="b"))
+    desc, reason = plan.classify_experts([(biased, tri[1], tri[2])])
+    check("inner bias still refused", desc is None and "bias" in reason, f"reason={reason!r}")
+    check("bare inner trio unchanged (fence's own fixtures)",
+          plan.classify_experts([(FakeLin(3), FakeLin(3), FakeLin(3))])[0]["Ku"] == 3)
+    check("_coop_ptr_lists unwraps before data_ptr",
+          "moe_coop_plan.unwrap_linear(m)" in ast.unparse(methods["_coop_ptr_lists"]))
+
     if fails:
         print("MOE COOP PLAN FENCE RED:", ", ".join(fails))
         return 1
