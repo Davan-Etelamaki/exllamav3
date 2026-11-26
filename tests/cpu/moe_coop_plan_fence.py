@@ -238,6 +238,30 @@ def main():
         check("POSITIVE CONTROL: a fixture that grows .bias is caught",
               hasattr(grown, "bias") != hasattr(RealLinear, "bias"))
 
+    print("[10] pointer-table epoch: a cached table must die with the weights it pins (law 33)")
+    cls = next(c for c in tree.body if isinstance(c, ast.ClassDef)
+               and any(isinstance(n, ast.FunctionDef) and n.name == "_coop_decode" for n in c.body))
+    own = {n.name: ast.unparse(n) for n in cls.body if isinstance(n, ast.FunctionDef)}
+    unloaded = own.get("unload", "")
+    check("unload clears the pointer-table cache",
+          "self._coop_ptrs_cache = None" in unloaded, f"class={cls.name} unloaded_len={len(unloaded)}")
+    check("unload drops the arenas that pin device addresses", "_coop_by_bucket = {}" in unloaded)
+    check("bucket creation seeds the fingerprint from a FRESH read, not from the cache",
+          "ptr_lists = self._coop_ptr_lists()" in state
+          and "'fingerprint': tuple((p for k in names for p in ptr_lists[k]))" in state)
+    check("served path rebuilds only on a cold cache or a moved fingerprint",
+          "if self._coop_ptrs_cache is None:" in decode and "fingerprint != st[" in decode)
+    check("refill recomputes fresh, then advances cache and fingerprint together",
+          "st['ptr_lists'] = cur_lists = self._coop_ptr_lists()" in decode
+          and "self._coop_ptrs_cache = cur_lists" in decode
+          and "st['fingerprint'] = fingerprint" in decode)
+    forgotten = unloaded.replace("self._coop_ptrs_cache = None", "pass")
+    check("POSITIVE CONTROL: an unload that keeps the cache is caught",
+          forgotten != unloaded and "self._coop_ptrs_cache = None" not in forgotten)
+    cache_seed = state.replace("for p in ptr_lists[k]))", "for p in self._coop_ptrs_cache[k]))")
+    check("POSITIVE CONTROL: seeding the fingerprint from the cache is caught",
+          cache_seed != state and "for p in self._coop_ptrs_cache[k])" in cache_seed)
+
     if fails:
         print("MOE COOP PLAN FENCE RED:", ", ".join(fails))
         return 1
