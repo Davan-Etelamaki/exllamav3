@@ -328,7 +328,7 @@ def main():
     check("POSITIVE CONTROL: dropping the live probe reintroduces the stale serve",
           served_p != live_p, f"served={served_p} live={live_p}")
 
-    print("[11] single-row decode skips the VRAM read: tile(T=1) is budget-invariant")
+    print("[12] single-row decode skips the VRAM read: tile(T=1) is budget-invariant")
     tile_fn = methods["_attend_one_tile"]
     tsrc = ast.unparse(tile_fn)
     early, driver = tsrc.find("if T <= 1:"), tsrc.find("mem_get_info")
@@ -341,13 +341,89 @@ def main():
     check("POSITIVE CONTROL: a tile fn without the early return fails the rule",
           planted.find("if T <= 1:") == -1 < planted.find("mem_get_info"))
 
-    print("[12] probe reads TENSORS: LinearEXL3 holds trellis/suh/svh but is not a tensor")
+    print("[13] probe reads TENSORS: LinearEXL3 holds trellis/suh/svh but is not a tensor")
     psrc = ast.unparse(methods["_coop_ptrs_probe"])
     check("probe dereferences .trellis before data_ptr (AttributeError fix 2026-11-26)",
           all(f"experts_{t}[0]).trellis.data_ptr()" in psrc for t in "gud"))
     planted = psrc.replace(".trellis.data_ptr()", ".data_ptr()")
     check("POSITIVE CONTROL: probe treating the mixin as a tensor fails",
           planted != psrc and ".trellis.data_ptr()" not in planted)
+
+    print("[14] EXECUTED probe on the attribute surface read FROM SERVED SOURCE")
+    # Sections [11]/[13] pass on source shapes; the 98cf64d4 wheel was GREEN on both and died
+    # in serving with 'LinearEXL3' object has no attribute 'data_ptr', because every fixture in
+    # this file happened to expose a data_ptr the served mixin does not have. STANDING RULE:
+    # a probe/mechanism arm must execute the REAL served function against an attribute surface
+    # DERIVED FROM THE SERVED SOURCE, never a lookalike that carries the missing method.
+    QUANT = ROOT / "exllamav3/modules/quant/exl3.py"
+    qcls = next(n for n in ast.parse(QUANT.read_text()).body
+                if isinstance(n, ast.ClassDef) and n.name == "LinearEXL3")
+    ctor = next(n for n in qcls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    served_attrs = sorted({t.attr for n in ast.walk(ctor) if isinstance(n, ast.Assign)
+                           for t in n.targets if isinstance(t, ast.Attribute)
+                           and isinstance(t.value, ast.Name) and t.value.id == "self"})
+    check("exl3.py assigns the tensor attrs the pointer tables read",
+          {"trellis", "suh", "svh"} <= set(served_attrs), f"n={len(served_attrs)}")
+    check("the served mixin defines no data_ptr of its own (the crash class)",
+          not any(isinstance(n, ast.FunctionDef) and n.name == "data_ptr" for n in ast.walk(qcls)))
+
+    class _TensorRef:
+        def __init__(s, v): s.v = v
+        def data_ptr(s): return s.v
+
+    class _ServedMixinLike:
+        def __init__(s, base):
+            for a in served_attrs:
+                setattr(s, a, _TensorRef(base))
+
+    class _WrapperLike:
+        def __init__(s, inner): s.inner = inner
+
+    shim = type("Shim", (), {})()
+    shim.experts_g = [_WrapperLike(_ServedMixinLike(1000))]
+    shim.experts_u = [_WrapperLike(_ServedMixinLike(2000))]
+    shim.experts_d = [_WrapperLike(_ServedMixinLike(3000))]
+
+    def _exec_probe(src):
+        tree = ast.parse(src)
+        ns = {"moe_coop_plan": plan}
+        exec(compile(ast.fix_missing_locations(tree), "<probe>", "exec"), ns)
+        return ns[next(n.name for n in tree.body if isinstance(n, ast.FunctionDef))](shim)
+
+    psrc14 = ast.unparse(methods["_coop_ptrs_probe"])
+    try:
+        got = _exec_probe(psrc14)
+        ok14, why14 = got == (1000, 2000, 3000), f"got={got}"
+    except AttributeError as e:
+        ok14, why14 = False, f"AttributeError: {e}"
+    check("the REAL probe body runs on the served surface and returns live addresses", ok14, why14)
+    bad14 = psrc14.replace(".trellis.data_ptr()", ".data_ptr()")
+    check("planted 98cf64d4 form differs from the shipped probe", bad14 != psrc14)
+    try:
+        val14, err14 = _exec_probe(bad14), None
+    except AttributeError as e:
+        val14, err14 = None, str(e)
+    check("POSITIVE CONTROL: the 98cf64d4 probe form raises on the served surface",
+          err14 is not None and "data_ptr" in err14, f"raised={err14!r} returned={val14!r}")
+    drifted = [a for a in served_attrs if a != "trellis"]
+
+    class _DriftedMixin:
+        def __init__(s, base):
+            for a in drifted:
+                setattr(s, a, _TensorRef(base))
+
+    drift = type("Shim", (), {})()
+    for tag, base in (("g", 1000), ("u", 2000), ("d", 3000)):
+        setattr(drift, "experts_" + tag, [_WrapperLike(_DriftedMixin(base))])
+    try:
+        _t = ast.parse(psrc14); _ns = {"moe_coop_plan": plan}
+        exec(compile(ast.fix_missing_locations(_t), "<drift>", "exec"), _ns)
+        dval = _ns[next(n.name for n in _t.body if isinstance(n, ast.FunctionDef))](drift)
+        derr = None
+    except AttributeError as e:
+        dval, derr = None, str(e)
+    check("POSITIVE CONTROL: served source that stops assigning trellis breaks the arm loudly",
+          derr is not None and "trellis" in derr, f"raised={derr!r} returned={dval!r}")
 
     if fails:
         print("MOE COOP PLAN FENCE RED:", ", ".join(fails))
