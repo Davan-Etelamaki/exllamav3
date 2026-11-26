@@ -6,7 +6,11 @@ Multiply sites (supervisor charge A, 2026-11-25 — anchored, not line-numbered)
            weight into the expert output before accumulation, located by the string
            'out.index_add_(0, tokens, y.float() *' with w_flat = w.reshape(-1) above it
            (line numbers decay across wiring commits and are deliberately not restamped;
-           the :1160 cite inherited from the design brief matched neither tree, §R)
+           the :1160 cite inherited from the design brief NEVER pointed at the
+           served line: at 57c2a847 that number is the coop arena's own
+           out = torch.zeros((rows, h), ...) inside _coop_state — the brief's
+           stale digits landed on this lane's new code (§R named it; supervisor
+           precision pass 2026-11-25: "matched some era" is not a verification))
   coop:    the half weight is cast back INSIDE the kernel at
            exl3_moe_coop_kernel.cuh:220 (si.w = __half2float(p.rw[s]), slot load of the B
            stage) and multiplied against the fp32 partial in the fp32 accumulate at
