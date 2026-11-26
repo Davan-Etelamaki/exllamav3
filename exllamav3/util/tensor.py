@@ -132,6 +132,8 @@ class SeqTensor:
 
 no_default = object()
 
+_CUDA_AVAILABLE: bool | None = None
+
 def _capturing() -> bool:
     """True while the current stream is capturing a CUDA graph.
 
@@ -140,8 +142,16 @@ def _capturing() -> bool:
     an illegal device write at a fixed address (Xid 31 FAULT_PDE ACCESS_TYPE_VIRT_WRITE), the
     sticky error surfacing later on the next tensor destruction. Every cache below therefore
     refuses to store a capture-time tensor.
+
+    The availability bit is memoised: torch re-queries NVML on some paths (_nvml_based_avail,
+    py-spy 2026-11-26 saw it in 1/8 prefill samples via this function, which MoE dispatch calls
+    once per expert group), and availability cannot change mid-process — a device disappearing
+    after CUDA init faults the context, it does not flip this bit back to False.
     """
-    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    global _CUDA_AVAILABLE
+    if _CUDA_AVAILABLE is None:
+        _CUDA_AVAILABLE = torch.cuda.is_available()
+    return _CUDA_AVAILABLE and torch.cuda.is_current_stream_capturing()
 
 
 def get_for_device(
