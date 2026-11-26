@@ -3008,6 +3008,8 @@ class Generator:
         return max((len(seq.sequence_ids) for seq in job.sequences), default = 0)
 
 
+    _fairness_holds: int = 0  # consecutive passes held for an aged elder; bounded, see the clause below
+
     def iterate_start_jobs(self, results: list):
         """
         Move pending jobs into the active set when batch, cache and VRAM capacity allow.
@@ -3044,20 +3046,36 @@ class Generator:
                 if (len(job.sequences) + current_max_batch > self.max_batch_size or
                         job.current_new_pages_required() > self.pagetable.num_unreferenced_pages()):
                     skipped_jobs.append(job)
+                    job.skips += 1  # honest aging: every refusal counts, not only one a later start caused
                     continue
 
                 # Price this job's prompt tier against what is left of the budget
                 gate_tokens = self._admission_prompt_tokens(job)
                 if free_bytes >= 0 and not admits(free_bytes, gate_tokens, self.admission_margin_granules):
                     skipped_jobs.append(job)
+                    job.skips += 1  # honest aging
                     continue
 
-                # Make sure the job we're about to add doesn't skip a job that's been skipped too many times
-                for j in skipped_jobs:
-                    if j.skips >= j.max_skips:
-                        return
-                for j in skipped_jobs:
-                    j.skips += 1
+                # Fairness with a BOUNDED hold. An elder that has aged out keeps its place, so this
+                # pass stops for it (break, not return: the caller's pass bookkeeping stays reachable).
+                # The old clause returned from the pass on every candidate while skips was never
+                # reset, so one permanently unfittable elder denied service to every later job for
+                # its whole wait (dot26 2026-11-26: 22-token requests paid 102.5-489.0 s of `queued`
+                # for 0.07 s of compute). After max_skips holds the queue flows again and the aged
+                # counters restart, so fairness and utilization alternate instead of the queue
+                # freezing behind one job.
+
+                aged = [j for j in skipped_jobs if j.max_skips is not None and j.skips >= j.max_skips]
+                if aged:
+                    if self._fairness_holds < max(j.max_skips for j in aged):
+                        self._fairness_holds += 1
+                        break
+                    for j in aged:
+                        j.skips = 0
+
+                # Starting a job ends this pass's hold and clears its own waiting record
+                self._fairness_holds = 0
+                job.skips = 0
 
                 # Add job to active list
                 self.pending_jobs.remove(job)
