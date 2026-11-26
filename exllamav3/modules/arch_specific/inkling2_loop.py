@@ -728,6 +728,14 @@ class InklingAttention(Module):
         budget. Kept >= T for the usual single-tile decode (T == 1), so the hoist adds no
         extra query tile and stays launch-neutral; only multi-row passes (T above the byte
         budget) tile down, which is where the (h, T, S) bias was the largest allocation."""
+        T = int(T)
+        if T <= 1:
+            # Single-row decode tiles at 1 whatever the budget says: cap is floored at 1
+            # and the return is min(T, cap) == T, so the mem_get_info driver round-trip
+            # plus budget maths were pure overhead on every attention layer of every
+            # decode step (35/360 py-spy samples 2026-11-26). Tile-invariant by proof:
+            # same tile, same allocation, same bits. Multi-row passes keep the live read.
+            return T
         budget = getattr(self, "attend_tile_bytes", _ATTEND_TILE_BYTES)
         if torch.cuda.is_available():
             # Headroom, not the ceiling, decides: the served card runs with 0.4-2.8 GiB

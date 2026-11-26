@@ -46,6 +46,17 @@ def check(name, ok, detail=""):
         fails.append(name)
 
 
+def _excise_guard(fn):
+    """Copy of fn with the `if T <= 1: return T` guard spliced out (section [11]'s arm)."""
+    import copy
+    node = copy.deepcopy(fn)
+    for i, stmt in enumerate(node.body):
+        if isinstance(stmt, ast.If) and "T <= 1" in ast.unparse(stmt.test):
+            node.body[i] = ast.Pass()
+            break
+    return node
+
+
 def parse_define(text, name):
     m = re.search(r"#define\s+" + name + r"\s+(\S+)", text)
     return m.group(1) if m else None
@@ -316,6 +327,19 @@ def main():
     served_p, live_p = _run(planted)
     check("POSITIVE CONTROL: dropping the live probe reintroduces the stale serve",
           served_p != live_p, f"served={served_p} live={live_p}")
+
+    print("[11] single-row decode skips the VRAM read: tile(T=1) is budget-invariant")
+    tile_fn = methods["_attend_one_tile"]
+    tsrc = ast.unparse(tile_fn)
+    early, driver = tsrc.find("if T <= 1:"), tsrc.find("mem_get_info")
+    check("T<=1 early-return precedes any mem_get_info call (census 2026-11-26)",
+          -1 < early < driver and "return T" in tsrc[early:early + 600],
+          f"early={early} driver={driver}")
+    planted = ast.unparse(_excise_guard(tile_fn))  # AST surgery: a string replace missed
+    check("POSITIVE CONTROL: excising the early return changes the source",   # unparse's
+          planted != tsrc, "excision landed")                                 # indentation
+    check("POSITIVE CONTROL: a tile fn without the early return fails the rule",
+          planted.find("if T <= 1:") == -1 < planted.find("mem_get_info"))
 
     if fails:
         print("MOE COOP PLAN FENCE RED:", ", ".join(fails))
