@@ -79,8 +79,9 @@ def _host_lens(params: dict, seqlens) -> torch.Tensor:
 
 
 def rmsnorm_f(x: torch.Tensor, eps: float) -> torch.Tensor:
-    x = x.float()
-    return x * torch.rsqrt(x.square().mean(-1, keepdim = True) + eps)
+    # Fused single-kernel form of x.float()*rsqrt(mean(x.float()²)+eps) (was 3 eager kernels,
+    # top decode hotspot at 138/360 census samples 2026-11-26); fp32 promotion preserved.
+    return torch.nn.functional.rms_norm(x.float(), (x.shape[-1],), eps = eps)
 
 
 def l2_clip(x: torch.Tensor, threshold: float) -> torch.Tensor:
