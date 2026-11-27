@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from ..model import Model, Config
     from ..modules import Attention
 import weakref
+from .recurrent import mp_cache_recurrent_clear
 
 class CacheLayer(ABC):
     """
@@ -372,6 +373,21 @@ class Cache:
             raise
 
 
+    def clear_slot(self, slot: int):
+        """
+        Zero the recurrent state of every layer of this cache at `slot`. Used to quarantine a
+        slot whose state construction failed halfway: a freed slot must never re-enter the
+        free_list carrying half-restored tensors, or its next occupant reads state that is not
+        its own (dot26 boot 3918593 left the half-restored slot in the pool on the
+        KeyError(6,0) path before the completeness gate landed).
+        """
+        if not self.model.loaded_tp:
+            for l in self.get_all_recurrent_layers().values():
+                l.clear(slot)
+        else:
+            self.model.tp_dispatch_all(mp_cache_recurrent_clear, (id(self), slot))
+
+
     def new_from_stashed(self, stashed_state, position):
         """
         Allocate a new state from a stashed state
@@ -387,6 +403,9 @@ class Cache:
                 stashed = stashed_state
             )
         except BaseException:
+            # Quarantine before recycle: the failed constructor may have written the slot
+            # halfway; an uncleared slot re-entering free_list carries foreign state.
+            self.clear_slot(handle)
             self.free_list.appendleft(handle)
             raise
 

@@ -136,9 +136,11 @@ class ShortConvState:
         if not self.cache.model.loaded_tp:
             registry = self.cache.get_all_recurrent_layers()
             if not checkpoint_is_compatible(stashed, registry):
+                missing = sorted(k for k in registry if k not in stashed)
                 raise CheckpointStale(
                     f"recurrent checkpoint at position {stashed['position']} written by registry "
                     f"{stashed.get('registry_keys')}, live registry {sorted(registry)}"
+                    + (f", missing entries {missing}" if missing else "")
                 )
             for k, l in registry.items():
                 l.unstash(self.slot, stashed[k])

@@ -11,6 +11,8 @@ checkpoint written against a DIFFERENT recurrent-layer registry is a cache MISS
       untouched; matching blob unstashes every layer; foreign registry raises;
   [3] Generator.recurrent_state_from_stashed converts CheckpointStale to None and
       prints the miss line, while a real fault still propagates (control);
+  [1b] Cache.new_from_stashed quarantines the slot (clear_slot) before returning it
+      to the free_list when state construction fails;
   [4] both job.py consumers treat None as the replay-from-zero miss: allocate_pages
       falls back to new_recurrent_state(), and the rewind path resets replay_from to 0.
 Run:  CUDA_VISIBLE_DEVICES= env -u PYTHONHOME -u PYTHONPATH -u LD_LIBRARY_PATH \\
@@ -27,6 +29,7 @@ SC = "exllamav3/modules/short_conv.py"
 GEN = "exllamav3/generator/generator.py"
 JOB = "exllamav3/generator/job.py"
 LOOP = "exllamav3/modules/arch_specific/inkling2_loop.py"
+CAC = "exllamav3/cache/cache.py"
 
 def src(path):
     with open(path, encoding = "utf8") as f:
@@ -71,6 +74,19 @@ mut1 = ast.unparse(excised)
 check("CONTROL: excising the validation node removes every CheckpointStale raise from unstash",
       "CheckpointStale" in ubody and "CheckpointStale" not in mut1)
 
+print("== [1b] slot quarantine on failed restore ==")
+cac = src(CAC)
+_quar = re.compile(
+    r"except BaseException:\s+(?:#[^\n]*\n\s+)*self\.clear_slot\(handle\)\s*"
+    r"self\.free_list\.appendleft\(handle\)\s+raise")
+check("new_from_stashed clears the slot before returning it to free_list",
+      _quar.search(cac) is not None)
+mut_q = cac.replace("self.clear_slot(handle)\n", "", 1)
+check("CONTROL: excising the clear call trips the quarantine arm",
+      _quar.search(cac) is not None and _quar.search(mut_q) is None)
+check("clear_slot covers non-TP and TP paths",
+      "def clear_slot" in cac and "mp_cache_recurrent_clear" in cac and "l.clear(slot)" in cac)
+
 print("== [2] runtime semantics ==")
 from exllamav3.modules.short_conv import CheckpointStale, checkpoint_is_compatible, ShortConvState
 
@@ -110,6 +126,16 @@ fake_state({(6, 0): fresh}).unstash(
     {"position": 5, "registry_keys": [(6, 0)], (6, 0): "BLOB"})
 check("compatible unstash delivers (slot, blob) to every layer",
       fresh.got == (3, "BLOB"))
+hole_a, hole_b = RecordingLayer(), RecordingLayer()
+try:
+    fake_state({(0, 0): hole_a, (6, 0): hole_b}).unstash(
+        {"position": 5, "registry_keys": [(0, 0), (6, 0)], (0, 0): "B"})
+    check("slot-hole blob (fingerprint OK, payload absent) raises before any layer copy", False)
+except CheckpointStale as e:
+    check("slot-hole blob (fingerprint OK, payload absent) raises before any layer copy",
+          hole_a.got is None and hole_b.got is None)
+    check("stale message names the missing entries (cured-event body is self-describing)",
+          "missing entries [(6, 0)]" in str(e))
 # CONTROL 2: a swapped registry must refuse delivery
 swapped = RecordingLayer()
 try:
