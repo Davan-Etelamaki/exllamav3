@@ -154,6 +154,14 @@ check("fold composes via lm(x + hidden_out(latent) + hidden_bias) one pass",
       "hidden_out.forward(latent.unsqueeze(1)" in msrc and "h_eff = hi + fold_h.squeeze(1)" in msrc)
 check("confidence = reciprocal softmax mass, not max logit (cpp se/cum rule)",
       "torch.clamp(sexp, min = 1.0)" in msrc)
+check("markov Linears receive kHalf at the boundary (exl3.py:142 rejects fp32 x; fault 12)",
+      "rnn.rnn_proj.forward(rnn_in.half()" in msrc
+      and "latent.unsqueeze(1).half()" in msrc
+      and "lm.prepare_for_device(h_eff, params).half()" in msrc)
+# CONTROL 6c: fp32 into bc.run_alloc reproduced fault 12 (A is incorrect datatype, kHalf)
+mut6c = msrc.replace("rnn_in.half()", "rnn_in").replace("latent.unsqueeze(1).half()", "latent.unsqueeze(1)")
+check("CONTROL: stripping head-boundary half casts trips the kHalf-input arm",
+      "rnn_in.half()" not in mut6c and "latent.unsqueeze(1).half()" not in mut6c)
 # CONTROL 7: a .weight fold reintroduced would AttributeError on the quantized lm head
 mut7 = msrc.replace("h_eff = hi + fold_h.squeeze(1)",
                     "lw = lm.weight\n            h_eff = hi + fold_h.squeeze(1)")
@@ -170,4 +178,4 @@ if fails:
         print("  -", f)
     sys.exit(1)
 print("INKLING MTP FENCE GREEN: registration, caps, append discipline, fold contract, "
-      "pack-keyed submodules, kHalf ctx boundary, markov shapes + functional fold; 9 planted controls proven to fire.")
+      "pack-keyed submodules, kHalf ctx boundary, markov shapes + functional fold, half-input head boundaries; planted controls proven to fire.")

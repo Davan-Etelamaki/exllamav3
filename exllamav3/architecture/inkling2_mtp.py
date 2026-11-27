@@ -335,7 +335,7 @@ class Inkling2MTPModel(Model):
             prev_emb = mw1[prev]                      # (b, rank) row, cpp get_rows(w1, prev)
             rnn_in = torch.cat(
                 [markov_state, prev_emb, hi, f_rnn[:, 0, :]], dim = -1)
-            raw = rnn.rnn_proj.forward(rnn_in, params).float()
+            raw = rnn.rnn_proj.forward(rnn_in.half(), params).float()   # exl3 kernels demand kHalf input
             if rnn.rnn_bias is not None and rnn.rnn_bias.numel() == raw.shape[-1]:
                 raw = raw + rnn.rnn_bias
             gate = torch.sigmoid(raw[:, :rank])
@@ -344,11 +344,11 @@ class Inkling2MTPModel(Model):
             markov_state = gate * markov_state + (1.0 - gate) * cand
             # base + fold_w@latent + fold_b in ONE lm pass: lm(x + ho(latent) + ho_bias)
             # == base + (unembed@ho)@latent + unembed@ho_bias (associativity; cpp:848-849)
-            fold_h = rnn.hidden_out.forward(latent.unsqueeze(1), params, out_dtype = torch.float)
+            fold_h = rnn.hidden_out.forward(latent.unsqueeze(1).half(), params, out_dtype = torch.float)
             if rnn.hidden_bias is not None and rnn.hidden_bias.numel() == self.hidden_size:
                 fold_h = fold_h + rnn.hidden_bias
             h_eff = hi + fold_h.squeeze(1)
-            logits = lm.forward(lm.prepare_for_device(h_eff, params), params).float()
+            logits = lm.forward(lm.prepare_for_device(h_eff, params).half(), params).float()
             logits = logits[..., :vocab]
             logits = 30.0 * torch.tanh(logits / 30.0)          # softcap, cpp:850
             mx, p = torch.max(logits, dim = -1)
