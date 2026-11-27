@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from ...cache import Cache
 from ...cache.recurrent import host_copy
 from ...model.config import Config
-from ...util.tensor import get_for_device, host_values, stage_host
+from ...util.tensor import _capturing, get_for_device, host_values, stage_host
 from ...constants import PAGE_SIZE
 from ...ext import exllamav3_ext as ext
 from .. import Module, Linear, RMSNorm
@@ -2043,23 +2043,58 @@ class InklingMoE(Module):
         # stage_host take both directions through a pinned slot - synchronous and byte-identical
         # when eager, recorded and re-readable when capturing. Routing stays the capture round's
         # (census deferred item A: device routing tables + a grouped expert tier own that next).
-        sel_cpu = host_values(sel_flat, ("inkling2", "moe_sel")).tolist()
-        order = sorted(range(len(sel_cpu)), key = lambda i: sel_cpu[i])
-        # Diet (2026-11-26): one upload of the whole sorted order, groups become device
-        # views. Decode never reaches this path (_coop_decode returns above), so no
-        # recorded graph depends on per-group source addresses; the eager group order is
-        # identical by construction, so index_add_ accumulates bitwise the same.
-        order_all = stage_host(order, x.device, ("inkling2", "moe_order_all"), torch.long)
+        #
+        # Two arms, split by shape and by capture state, not by a dial:
+        #   t > 1 and not capturing → GROUPING ON THE DEVICE. The prefill census (§CC, 2026-11-27)
+        #     put the ingest's critical path on this call site: one blocking read per executed MoE
+        #     layer, then Python sorting chunk_size × top_k entries before the next launch.
+        #     argsort(stable=True) is the SAME total order the host sort below produces (Python's
+        #     sorted is stable and keyed on the expert id), bincount+cumsum are the group
+        #     boundaries, and the host reads only the ≤2 × num_routed_experts boundary pair
+        #     instead of top_k × rows values plus a Python sort plus an order upload. Measured on
+        #     CPU at rows 2048 (n = 16,384): 2.696 ms of host work per MoE layer (tolist 0.044 +
+        #     sort 1.493 + upload 0.654 + group scan 0.505) → 0.448 ms including the read-back;
+        #     over the census's ~50 executed layers × ~46 chunks that is 6.2 s → 1.0 s of host
+        #     time per 93k-token ingest. Its GPU-side price is NOT measured here and is not
+        #     assumed: the sync frame's share absorbs the compute it waits for (the §CC correction),
+        #     and only the queued cuda-event census prices that. Group membership, group order and
+        #     the per-token index_add_ sequence are unchanged, so the result is bit-identical —
+        #     tests/cpu/inkling_moe_devdispatch_fence.py executes both arms over random routings.
+        #   t == 1 or capturing → THE HOST ROUND, verbatim. A decoded step carries top_k × batch
+        #     entries, where device grouping would buy three extra launches to save microseconds
+        #     (measured at rows 8: 0.010 ms), and a capture must keep baking the routing it
+        #     recorded: boundaries frozen from the capture round would otherwise meet a fresh
+        #     argsort on replay and hand tokens to the wrong expert.
+        if t > 1 and not _capturing():
+            order_all = torch.argsort(sel_flat, stable = True)
+            counts = torch.bincount(sel_flat, minlength = self.num_routed_experts)
+            chosen = torch.nonzero(counts).flatten()
+            ends = torch.cumsum(counts[chosen], 0)
+            bounds = host_values(torch.stack([chosen, ends], 0), ("inkling2", "moe_bounds"))
+            groups = list(zip(bounds[0].tolist(), bounds[1].tolist()))
+        else:
+            sel_cpu = host_values(sel_flat, ("inkling2", "moe_sel")).tolist()
+            order = sorted(range(len(sel_cpu)), key = lambda i: sel_cpu[i])
+            # Diet (2026-11-26): one upload of the whole sorted order, groups become device
+            # views. Decode never reaches this path (_coop_decode returns above), so no
+            # recorded graph depends on per-group source addresses; the eager group order is
+            # identical by construction, so index_add_ accumulates bitwise the same.
+            order_all = stage_host(order, x.device, ("inkling2", "moe_order_all"), torch.long)
+            groups = []
+            n = 0
+            while n < len(order):
+                e = sel_cpu[order[n]]
+                m = n
+                while m < len(order) and sel_cpu[order[m]] == e:
+                    m += 1
+                groups.append((e, m))
+                n = m
         tokens_all = torch.div(order_all, self.top_k, rounding_mode = "floor")
-        n = 0
-        while n < len(order):
-            e = sel_cpu[order[n]]
-            m = n
-            while m < len(order) and sel_cpu[order[m]] == e:
-                m += 1
-            entries = order_all[n:m]
-            tokens = tokens_all[n:m]
-            n = m
+        start = 0
+        for e, end in groups:
+            entries = order_all[start:end]
+            tokens = tokens_all[start:end]
+            start = end
             xs = flat.index_select(0, tokens)
             g = self.experts_g[e].forward(xs, params).float()
             u = self.experts_u[e].forward(xs, params).float()
