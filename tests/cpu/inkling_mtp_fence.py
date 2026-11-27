@@ -69,6 +69,13 @@ check("draft_verifier_params carries export_state_layer_instances",
       '"export_state_layer_instances"' in csrc)
 check("block_size -> default_draft_size block_size-1",
       '"default_draft_size": self.block_size - 1' in csrc)
+check("config.block_size published (generator.py:1558 dflash sizing reads it; deepseek_v4.py:102 precedent)",
+      "self.config.block_size = self.block_size" in csrc)
+# CONTROL 2c: withholding config.block_size reproduces the runtime crash
+# AttributeError: 'Inkling2LoopConfig' object has no attribute 'block_size' (fault 11)
+mut2c = csrc.replace("self.config.block_size = self.block_size", "pass")
+check("CONTROL: dropping the config.block_size publish trips the arm",
+      "self.config.block_size = self.block_size" not in mut2c)
 # CONTROL 2: swap dflash_draft for the forbidden mtp_draft
 mut2 = csrc.replace('"dflash_draft": True', '"mtp_draft": True')
 check("CONTROL: forbidden mtp_draft trips the caps arm",

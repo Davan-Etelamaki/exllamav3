@@ -71,6 +71,10 @@ class Inkling2MTPModel(Model):
         hd = int(m["head_dim"])
         eps = float(m["rms_norm_eps"])
         self.block_size = int(m["block_size"])
+        # Generator dflash round contract sizes the draft cache ring from
+        # draft_model.config.block_size (generator.py:1558); same convention as
+        # deepseek_v4.py:102. The shared target config carries none.
+        self.config.block_size = self.block_size
         self.n_taps = len(m["target_layer_ids"])
         self.markov_rank = int(m["markov_rank"])
         self.hidden_size = h
