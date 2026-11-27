@@ -310,12 +310,20 @@ class Inkling2MTPModel(Model):
         bsz, blk = state.shape[0], state.shape[1]
         device = state.device
 
-        # Exit conditioning vector, cpp:792. Anchor = this round's seed-row hidden, which is
-        # batch-current by construction: the stored raw taps are per-prefill (batch 1) while
-        # sampling runs across the joined batch (fault 13: cat expected 2 got 1). Deviation:
-        # the oracle folds row-3 fuse over the four TARGET taps here; the drafter's seed row is
-        # itself the fused anchor representation (fuse+ctx rings already baked into it).
-        f_rnn = rnn.dflare_norm.forward(state[:, 0:1, :].half(), params, out_dtype = torch.float)
+        # Exit conditioning vector, cpp:792: softmax(fuse[3]) over the stored anchor taps, normed.
+        # The taps persist across the conversation (oracle parity: refreshed by the target every
+        # verify round). The oracle keeps ONE [4][n_embd] anchor (cpp:138) and repeats f_rnn
+        # across the batch (ggml_repeat); rows that match their own anchor row keep it, a batch
+        # mismatch (joined batches reshuffle between rounds — fault 13) uses row 0 broadcast.
+        # Fallback when no anchor exists yet: this round's seed-row hidden, per row.
+        if self._anchor_taps is not None and len(self._anchor_taps) == self.n_taps:
+            f_rnn = rnn.dflare_norm.forward(
+                self._mix_taps(3, self._anchor_taps).half(), params, out_dtype = torch.float
+            )
+            if f_rnn.shape[0] != bsz:
+                f_rnn = f_rnn[0:1].expand(bsz, -1, -1)
+        else:
+            f_rnn = rnn.dflare_norm.forward(state[:, 0:1, :].half(), params, out_dtype = torch.float)
 
         # NO .weight access: the quantized Linear holds trellis/suh/svh/mul1 only. The cpp's
         # load-time fusion fold_w = unembed @ hidden_out.weight (cpp:531, applied at :895)

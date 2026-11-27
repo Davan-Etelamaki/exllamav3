@@ -158,13 +158,27 @@ check("markov Linears receive kHalf at the boundary (exl3.py:142 rejects fp32 x;
       "rnn.rnn_proj.forward(rnn_in.half()" in msrc
       and "latent.unsqueeze(1).half()" in msrc
       and "lm.prepare_for_device(h_eff, params).half()" in msrc)
-check("exit conditioning is batch-current (state seed row, not per-prefill stored taps; fault 13)",
-      "state[:, 0:1, :].half()" in msrc and "self._mix_taps(3, self._anchor_taps)" not in msrc)
-# CONTROL 6d: reading the stale per-prefill taps crashed joined batches (cat 2 vs 1)
-mut6d = msrc.replace("f_rnn = rnn.dflare_norm.forward(state[:, 0:1, :].half(), params, out_dtype = torch.float)",
-                     "f_rnn = rnn.dflare_norm.forward(self._mix_taps(3, self._anchor_taps), params, out_dtype = torch.float)")
-check("CONTROL: reverting exit to stored anchor taps trips the batch-currency arm",
-      "self._anchor_taps)" in mut6d and "state[:, 0:1, :].half()" not in mut6d)
+check("exit conditioning reads the persisted anchor taps at the kHalf boundary (cpp:792/138)",
+      "self._mix_taps(3, self._anchor_taps).half()" in msrc)
+check("anchor tap read is guarded by presence + tap count (no anchor yet = fallback, not crash)",
+      "if self._anchor_taps is not None and len(self._anchor_taps) == self.n_taps:" in msrc)
+check("exit anchor is batch-safe: row-0 broadcast when the stored batch mismatches (fault 13)",
+      "if f_rnn.shape[0] != bsz:" in msrc and "f_rnn = f_rnn[0:1].expand(bsz, -1, -1)" in msrc)
+check("seed-row fallback arm exists for the pre-anchor round",
+      "state[:, 0:1, :].half()" in msrc)
+# CONTROL 6d-a: dropping the half cast on the tap mix reintroduces the fault-12 kHalf refusal
+mut6da = msrc.replace("self._mix_taps(3, self._anchor_taps).half()",
+                      "self._mix_taps(3, self._anchor_taps)")
+check("CONTROL: stripping the exit-anchor half cast trips the kHalf arm",
+      "self._mix_taps(3, self._anchor_taps).half()" not in mut6da)
+# CONTROL 6d-b: without the broadcast guard, joined batches crash again (cat 2 vs 1 = fault 13)
+mut6db = msrc.replace("f_rnn = f_rnn[0:1].expand(bsz, -1, -1)", "f_rnn = f_rnn")
+check("CONTROL: removing the batch broadcast trips the batch-safety arm",
+      "f_rnn = f_rnn[0:1].expand(bsz, -1, -1)" not in mut6db)
+# CONTROL 6d-c: reverting to seed-row-only conditioning (the window-7 5% acceptance regression)
+mut6dc = msrc.replace("self._mix_taps(3, self._anchor_taps).half()", "state[:, 0:1, :].half()")
+check("CONTROL: reverting exit to seed-row-only trips the anchor-taps arm",
+      "self._mix_taps(3, self._anchor_taps)" not in mut6dc)
 # CONTROL 6c: fp32 into bc.run_alloc reproduced fault 12 (A is incorrect datatype, kHalf)
 mut6c = msrc.replace("rnn_in.half()", "rnn_in").replace("latent.unsqueeze(1).half()", "latent.unsqueeze(1)")
 check("CONTROL: stripping head-boundary half casts trips the kHalf-input arm",
