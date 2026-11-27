@@ -29,10 +29,13 @@ Run:  cd <repo> && env -u PYTHONHOME -u PYTHONPATH CUDA_VISIBLE_DEVICES= \
       PYTHONPATH=. ~/.venvs/tabby-exl3/bin/python tests/cpu/moe_fused_dispatch_repro.py
 Exit: 0 GREEN (grouped ≤ eager/10, bit-identical math, controls proven) · 1 RED (blocks merge).
 """
+import argparse
 import ast
 import copy
+import hashlib
 import importlib.util
 import pathlib
+import sys
 import types
 
 import torch
@@ -41,11 +44,30 @@ from torch.utils._python_dispatch import TorchDispatchMode
 torch.set_num_threads(2)
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-LOOP = ROOT / "exllamav3/modules/arch_specific/inkling2_loop.py"
+PLAN = ROOT / "exllamav3/modules/arch_specific/moe_coop_plan.py"
+_ARG = argparse.ArgumentParser(description="law-31 repro gate for the fused MoE tier")
+_ARG.add_argument("source", nargs = "?",
+                  help="inkling2_loop.py to baseline against. Default: this tree. Point it at "
+                       "the INSTALLED wheel's copy to satisfy §CM's 'eager baseline on installed "
+                       "wheel first'.")
+_ARG.add_argument("--require-installed", action = "store_true",
+                  help="exit 2 (NOT MEASURED) instead of running when the source lacks InklingMoE")
+_OPTS = _ARG.parse_args()
+LOOP = pathlib.Path(_OPTS.source).resolve() if _OPTS.source else \
+    ROOT / "exllamav3/modules/arch_specific/inkling2_loop.py"
 PLAN = ROOT / "exllamav3/modules/arch_specific/moe_coop_plan.py"
 _spec = importlib.util.spec_from_file_location("moe_coop_plan_repro", PLAN)
 plan = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(plan)
+
+_TEXT = LOOP.read_text(encoding = "utf8") if LOOP.exists() else ""
+if "class InklingMoE" not in _TEXT:
+    print(f"REPRO NOT MEASURED (rc=2): baseline source {LOOP} "
+          f"{'does not exist' if not LOOP.exists() else 'carries no InklingMoE'} — the eager "
+          f"baseline must be taken against an artifact that serves this arch (the workstation "
+          f"venv's installed exllamav3 1.6.7 has no Inkling module; the served install is on dot26)")
+    raise SystemExit(2)
+SHA1 = hashlib.sha1(LOOP.read_bytes()).hexdigest()
 
 ROWS = 2048                     # one prefill chunk (chunk_size); the shape §CH profiled
 PACK_E, PACK_TOPK, PACK_H, PACK_I = 128, 8, 2304, 1152
@@ -322,6 +344,7 @@ y_all = per_entry_down(stub_p, torch.randn(1, ROWS, H_p,
                                            generator = torch.Generator().manual_seed(9)).half())
 FLOOR, out_floor, _, _, _ = run(lambda s, x, m: arm_floor(s, x, m, y_all))
 
+print(f"baseline source: {LOOP} (sha1 {SHA1[:12]})")
 print(f"shape: rows={ROWS} (one {ROWS}-token prefill chunk), experts {PACK_E}, top_k {PACK_TOPK}; "
       f"ext ops recorded with production K/N (2304/1152)")
 print(f"\nEAGER baseline (same run): {EAGER.total} dispatcher ops per executed MoE layer-pass "
@@ -374,9 +397,11 @@ if fails:
     print(f"FAILURES ({len(fails)}):")
     for f in fails:
         print("  - " + f)
-    print("MOE FUSED-TIER REPRO GATE RED (law 31: blocks the merge): " + ", ".join(fails))
+    print("MOE FUSED-TIER REPRO GATE RED (law 31: blocks the merge): " + ", ".join(fails)
+      + f" [regime: CPU dispatcher-ops; baseline {LOOP} sha1 {SHA1[:12]}]")
     raise SystemExit(1)
-print(f"MOE FUSED-TIER REPRO GATE GREEN (CPU, dispatcher-ops currency, rows={ROWS}): eager "
+print(f"MOE FUSED-TIER REPRO GATE GREEN (regime: CPU dispatcher-ops, rows={ROWS}, baseline "
+      f"{LOOP} sha1 {SHA1[:12]}): eager "
       f"{EAGER.total} → glued {GLUED.total} → grouped {GROUPED.total} per executed MoE layer-pass; "
       f"§CJ bar eager/10 = {bar:.1f} met by the grouped arm only; math bit-identical; planted "
       f"extra-op arm proven to trip. On-card confirmation is still owed: one nsys census after "
