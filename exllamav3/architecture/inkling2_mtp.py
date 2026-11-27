@@ -197,6 +197,9 @@ class Inkling2MTPModel(Model):
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        # Round contract: input_ids is the seed column only; the sampling loop needs it back
+        # as the markov prev-token for slot 0
+        params["inkling_seed_ids"] = input_ids.clone()
         return prepare_for_attn(input_ids, params)
 
 
@@ -273,13 +276,91 @@ class Inkling2MTPModel(Model):
 
     def sample_from_state(self, state: torch.Tensor, params: dict) -> torch.Tensor:
         """
-        TODO(C3): markov loop over the block - base logits from the target's lm_head (the final
-        norm already ran in the module stream), rnn_proj full-cat state update per slot, bias
-        fold_w @ latent + markov_w1[prev] with fold in TORCH ORDER (no transpose),
-        logits = 30*tanh((base + bias)/30), prev = argmax, tau 0.35 truncation writing
-        params["draft_conf"]; returns (b, block_size) with column 0 = the seed.
+        Sequential markov draft over the block (deepseek_v4_mtp's loop in spirit): base logits
+        through the target's lm_head (the drafter's final norm already ran in the module
+        stream), bigram bias 30*tanh((base + fold)/30) with the rnn_hidden state update
+        gate/cand/latent (task contract: gate=sigmoid(first third), cand=tanh(second third),
+        latent=tanh(third third), state = gate*old + (1-gate)*cand), fold in TORCH ORDER
+        (hidden_out @ lm_head, no transpose where the storage allows it), prev = argmax feeding
+        markov_w1[prev]. tau = 0.35 truncates params["draft_conf"] at the first low-confidence
+        slot. Returns (b, block_size) with column 0 = the seed (generator crops [:,1:]).
+
+        Deviation flags: f_rnn exit vector = rms(softmax(fuse_weight)[3] . anchor taps,
+        markov_head.dflare_norm) per cpp:792; rnn bias vectors applied only if loaded; the
+        block's hidden rows are computed in parallel from masked inputs and the markov chain
+        post-processes them (the oracle re-feeds prev embeddings per slot - acceptance-tuning
+        wheel can revisit).
         """
-        raise NotImplementedError("Inkling2MTP: markov sampling lands in C3")
+        tgt = self.attached_model()
+        lm = tgt.modules[tgt.logit_layer_idx]
+        vocab = self.config.vocab_size
+        rnn = self.markov_head
+        rank = self.markov_rank
+        bsz, blk = state.shape[0], state.shape[1]
+        device = state.device
+
+        # Exit conditioning vector (fuse row 3 over the anchor taps), cpp:792
+        if self._anchor_taps is not None and len(self._anchor_taps) == self.n_taps:
+            f_rnn = rnn.dflare_norm.forward(
+                self._mix_taps(3, self._anchor_taps), params, out_dtype = torch.float
+            )
+        else:
+            f_rnn = torch.zeros((bsz, 1, self.input_layer.hidden_size), device = device)
+
+        # fold_w in TORCH ORDER: hidden_out.weight (rank, hidden) composed with the target's
+        # lm_head into (rank, vocab); orientation resolved once from the storage shapes
+        lw = lm.weight
+        hw = rnn.hidden_out.weight
+        if hw.shape[1] == lw.shape[0]:
+            fold_w = hw.mm(lw)                    # lm stored (hidden, vocab): pure torch order
+        elif hw.shape[1] == lw.shape[1]:
+            fold_w = hw.mm(lw.t())                 # lm stored (vocab, hidden): documented
+        else:
+            raise RuntimeError(
+                f"Inkling2MTP: cannot compose fold_w from hidden_out {tuple(hw.shape)} and lm_head {tuple(lw.shape)}")
+        if fold_w.shape[-1] != vocab:
+            fold_w = fold_w.t()
+
+        mw1 = rnn.markov_w1                          # bigram table (rank, rank) or (vocab, rank)
+        markov_state = torch.zeros((bsz, rank), device = device)
+        prev = params.get("inkling_seed_ids")
+        prev = prev[:, 0] if prev is not None and prev.dim() > 1 else (prev if prev is not None else torch.zeros(bsz, dtype = torch.long, device = device))
+        prev = prev.to(device).long().clamp(0, mw1.shape[0] - 1)
+        if mw1.shape[1] != rank and mw1.shape[0] == rank:
+            mw1 = mw1.t()
+
+        ids = torch.zeros((bsz, blk), dtype = torch.long, device = device)
+        ids[:, 0] = prev
+        conf = torch.zeros((bsz, blk - 1), device = device)
+        for i in range(blk - 1):
+            hi = state[:, i, :].float()
+            base = lm.forward(lm.prepare_for_device(state[:, i, :], params), params)
+            base = base[..., :vocab].float()
+            prev_emb = mw1[prev][:, :rank] if mw1.shape[0] != rank else mw1[prev]
+            rnn_in = torch.cat(
+                [markov_state, prev_emb, hi, f_rnn[:, 0, :]], dim = -1)
+            raw = rnn.rnn_proj.forward(rnn_in, params).float()
+            if rnn.rnn_bias is not None and rnn.rnn_bias.numel() == raw.shape[-1]:
+                raw = raw + rnn.rnn_bias
+            gate = torch.sigmoid(raw[:, :rank])
+            cand = torch.tanh(raw[:, rank:2 * rank])
+            latent = torch.tanh(raw[:, 2 * rank:3 * rank])
+            markov_state = gate * markov_state + (1.0 - gate) * cand
+            bias = (latent + (prev_emb @ mw1[:, :rank] if prev_emb.shape[-1] == rank else 0.0)).mm(fold_w)
+            if rnn.hidden_bias is not None and rnn.hidden_bias.numel() == vocab:
+                bias = bias + rnn.hidden_bias
+            logits = 30.0 * torch.tanh((base + bias) / 30.0)
+            c, p = torch.max(logits, dim = -1)
+            conf[:, i] = c
+            ids[:, i + 1] = p
+            prev = p
+        # Constant-confidence truncation: everything after the first sub-tau draft is dropped
+        alive = torch.cumprod((conf >= 0.35).float(), dim = -1)
+        params["draft_conf"] = conf * alive
+        for b in range(bsz):
+            keep = int(alive[b].sum().item())
+            ids[b, keep + 1:] = ids[b, keep]
+        return ids
 
 
     @staticmethod
@@ -413,6 +494,8 @@ class Inkling2MTPMarkovHead(Module):
         for m in (self.rnn_proj, self.hidden_out, self.dflare_norm):
             self.register_submodule(m)
         self.markov_w1 = None
+        self.rnn_bias = None
+        self.hidden_bias = None
 
 
     @override
@@ -422,11 +505,25 @@ class Inkling2MTPMarkovHead(Module):
             f"{self.key}.markov_w1.weight", device, optional = False,
             allow_bf16 = True, no_defer = True
         ).float()
+        # Biases are applied manually in the sampling loop (the pack carries them even where
+        # Linear modules don't own them); optional in case the converter folded them elsewhere
+        self.rnn_bias = self.config.stc.get_tensor(
+            f"{self.key}.rnn_proj.bias", device, optional = True,
+            allow_bf16 = True, no_defer = True
+        )
+        self.rnn_bias = None if self.rnn_bias is None else self.rnn_bias.float()
+        self.hidden_bias = self.config.stc.get_tensor(
+            f"{self.key}.hidden_out.bias", device, optional = True,
+            allow_bf16 = True, no_defer = True
+        )
+        self.hidden_bias = None if self.hidden_bias is None else self.hidden_bias.float()
 
 
     @override
     def unload(self):
         self.markov_w1 = None
+        self.rnn_bias = None
+        self.hidden_bias = None
         super().unload()
 
 
@@ -489,6 +586,9 @@ class Inkling2MTPInputLayer(Module):
         self.fuse_weight = self.config.stc.get_tensor(
             "fuse_weight", device, optional = False, allow_bf16 = True, no_defer = True
         ).float()
+        # rows 0..2 feed the three blocks, row 3 conditions the markov exit (cpp:792)
+        assert self.fuse_weight.shape[0] >= 4, \
+            f"Inkling2MTP: fuse_weight needs >=4 rows (3 blocks + exit), got {tuple(self.fuse_weight.shape)}"
         self.mask_embed = self.config.stc.get_tensor(
             self.key_mask_embedding, device, optional = False, allow_bf16 = True, no_defer = True
         ).float()
