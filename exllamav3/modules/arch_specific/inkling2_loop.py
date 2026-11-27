@@ -1233,6 +1233,7 @@ class InklingMoE(Module):
         baked bsz equals the bucket and rows above the live count are masked downstream;
         below it (eager) the live-row shapes run against the oversized arena — bsz comes
         from x.size(0) in exl3_moe_coop_run and every scratch index is a superset."""
+        self._coop_refuse_reason = None
         if not self.config.infer_params.moe_coop_decode:
             return None
         rows = flat.size(0)
@@ -1295,14 +1296,20 @@ class InklingMoE(Module):
         # One-shot surface of the grouped-decline reason: an inert coop tier is otherwise
         # invisible (witness 2026-11-27: eager python dispatch at 6.2 tok/s/lane with no
         # log naming why the grouped tier declined this pack)
-        if self._coop_refuse_reason is not None and not getattr(
-            type(self), "_coop_decline_logged", False
-        ):
-            type(self)._coop_decline_logged = True
-            print(
-                f" !! moe coop decode DECLINED: {self._coop_refuse_reason} "
-                f"(layer {self.layer_idx}); decode runs python-dispatch"
-            )
+        if self._coop_refuse_reason is not None:
+            # The ladder refusal at load/prefill shapes is BY DESIGN (the tier is
+            # decode-only); it must not consume the one-shot that names a real
+            # DECODE-shape decline (boot 2026-11-27: the 2048-row dummy forward ate the
+            # single print and hid the decode-side verdict).
+            expected_prefill = "above the decode ladder" in self._coop_refuse_reason
+            flag = "_coop_prefill_logged" if expected_prefill else "_coop_decline_logged"
+            if not getattr(type(self), flag, False):
+                setattr(type(self), flag, True)
+                print(
+                    f" !! moe coop decode DECLINED: {self._coop_refuse_reason} "
+                    f"(layer {self.layer_idx})"
+                    + ("" if expected_prefill else "; decode runs python-dispatch")
+                )
 
         sel_flat = sel.reshape(-1)
         w_flat = w.reshape(-1)

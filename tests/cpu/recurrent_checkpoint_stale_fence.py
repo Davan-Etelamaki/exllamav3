@@ -181,9 +181,14 @@ check("InklingMoE stores layer_idx (DECLINED print dereferences it)",
       and "layer_idx" in [a.arg for a in init_fn.args.args])
 decline_fn = next(n for n in fns
                   if "_coop_decline_logged" in ast.unparse(n))
-dbg = ast.unparse(decline_fn)
+dbg = ast.unparse(decline_fn).replace("'", '"')
 check("decline print flags use type(self), not a bare class identifier",
       "type(self)" in dbg and "Inkling2LoopSparseMoeBlock" not in dbg)
+check("_coop_decode clears the reason at entry (a print always names THIS call's decline)",
+      re.search(r"def _coop_decode\(.*?\"\"\".*?\n\s*self\._coop_refuse_reason = None", lsrc, re.S) is not None)
+check("prefill-shaped ladder refusals get their own one-shot, not the decode slot",
+      '"_coop_prefill_logged"' in dbg and '"_coop_decline_logged"' in dbg
+      and "above the decode ladder" in dbg)
 # CONTROL 5: reintroducing the phantom name (the 2026-11-27 boot-death NameError) trips the arm
 mut5 = dbg.replace("type(self)", "Inkling2LoopSparseMoeBlock")
 check("CONTROL: planting the phantom class name trips the type(self) arm",
