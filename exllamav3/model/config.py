@@ -48,15 +48,20 @@ class InferParams:
 
     # Resident captured graphs per sliding attention layer while inkling_attn_graph is on. Each
     # graph keeps its private pool alive between rounds (the padded K/V assembly and the fp32
-    # relative-bias temporaries never return to the allocator), costing roughly
-    # 3·rows·cols·kv_heads·head_dim·2 B + 2·heads·rows·cols·4 B per graph — on the served pack
-    # about 65 MB at rows=1/cols=1024 and about 520 MB at rows=8 — and the 4090 has ONE virtual
-    # address space shared by every layer's pools, which is what the MoE routegraph capture
-    # exhausted on dot26. Admission is frequency-filtered (below) and the resident set is
-    # LRU-evicted at this cap, because a hard cap that fills with cold fleet (rows × context)
-    # corners refuses the hot key forever: the 2026-11-27 field failure where the arm engaged on
-    # zero requests. 0 disables capture even with the switch on.
-    inkling_attn_graph_max_graphs: int = 4
+    # relative-bias temporaries never return to the allocator): 3·rows·cols·kv_heads·head_dim·2 B
+    # + 2·heads·rows·cols·4 B — on the served geometry (kv_heads 8, head_dim 128, heads 24) that is
+    # ≈6.5 MB at rows=1/cols=1024, ≈26 MB at rows=1/cols=4096 and ≈210 MB at rows=8/cols=4096, and
+    # the 4090 has ONE virtual address space for every layer's pools. Default 1 because that is
+    # what the served card affords — measured 2026-11-28 on dot26 (wheel 1.6.7-068309adb59db,
+    # fleet load): the engine holds 23.47/23.59 GiB with ~13 MiB free, cap=4 across ~20 sliding
+    # layers reserved ~2.1 GiB of pools (~27 MB per graph, matching the estimate), and the capture
+    # forward's own 20 MiB fp32 allocation died mid-capture. One graph per layer still captures
+    # captures the shape that matters (the hot single-row bucket at the served context), and it is
+    # the only shape that can pay for its pool. Admission is frequency-filtered (below),
+    # LRU-evicted at this cap, and gated by a pre-capture VRAM margin of 2x this estimate
+    # (InklingAttention._sliding_capture): a card with no room logs a vram-margin refusal instead
+    # of fighting an OOM. 0 disables capture even with the switch on.
+    inkling_attn_graph_max_graphs: int = 1
 
     # Requests a (rows bucket, context bucket, pool identity) key must accumulate since boot
     # before it qualifies for capture. Decode accrues one request per step per sliding layer, so
