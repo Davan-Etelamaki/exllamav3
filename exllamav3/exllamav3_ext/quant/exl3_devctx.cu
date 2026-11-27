@@ -2,6 +2,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cooperative_groups.h>
+#include <cstdio>
 namespace cg = cooperative_groups;
 #include "exl3_devctx.cuh"
 #include "exl3_l2win.cuh"
@@ -148,4 +149,71 @@ void prepare_ctx(int device)
     // policy is unarmed and exl3_l2win_ctx_carve returns before its first CUDA call — no attribute
     // query, no SetLimit, no served-path delta.
     DevCtx::instance().get_l2win_carve(device);
+}
+
+namespace
+{
+
+// Capability query for the banner: -1 when the device cannot answer, and the failed call's error is
+// consumed here so a later cudaGetLastError() (torch's launch checks) does not attribute it to an
+// unrelated call. Deliberately not cuda_check: a banner must never abort the import it runs in.
+long long banner_attr(int device, cudaDeviceAttr attr)
+{
+    int value = 0;
+    if (cudaDeviceGetAttribute(&value, attr, device) != cudaSuccess)
+    {
+        cudaGetLastError();
+        return -1;
+    }
+    return (long long) value;
+}
+
+}   // namespace
+
+void exl3_device_banner(void)
+{
+    static bool printed = false;
+    if (printed)
+        return;
+    printed = true;
+
+    // The device this process is bound to. At module init no model has been placed yet, so this is
+    // the ordinal CUDA defaults to; a box that has already chosen one gets its own card's numbers.
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess)
+    {
+        cudaGetLastError();
+        device = 0;
+    }
+
+    long long l2_bytes = -1;
+    int major = -1, minor = -1;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device) == cudaSuccess)
+    {
+        l2_bytes = (long long) prop.l2CacheSize;
+        major = prop.major;
+        minor = prop.minor;
+    }
+    else
+        cudaGetLastError();
+
+    // The two ceilings the persisting-L2 carve and the access-policy window are bounded by. Asked
+    // of the device rather than assumed: a carve arithmetic claim is only as good as these, and
+    // until they were read nothing on this card printed them. HIP exposes neither, so there they
+    // report -1 rather than failing the compile.
+#if defined(USE_ROCM)
+    const long long persisting_max = -1;
+    const long long policy_window_max = -1;
+#else
+    const long long persisting_max = banner_attr(device, cudaDevAttrMaxPersistingL2CacheSize);
+    const long long policy_window_max = banner_attr(device, cudaDevAttrMaxAccessPolicyWindowSize);
+#endif
+    // cudaDevAttrMaxSharedMemoryPerBlockOptin is the driver's own spelling of the opt-in shared
+    // memory per block (there is no cudaDevAttrSharedMemPerBlockOptin); it is what get_smem_max reads.
+    const long long smem_optin = banner_attr(device, cudaDevAttrMaxSharedMemoryPerBlockOptin);
+    const long long regs_per_block = banner_attr(device, cudaDevAttrMaxRegistersPerBlock);
+
+    printf("INKLING-DEVICEPROP l2CacheSize=%lld persistingMax=%lld accessPolicyWindowMax=%lld sm=%d%d sharedMemPerBlockOptin=%lld regsPerBlock=%lld\n",
+           l2_bytes, persisting_max, policy_window_max, major, minor, smem_optin, regs_per_block);
 }

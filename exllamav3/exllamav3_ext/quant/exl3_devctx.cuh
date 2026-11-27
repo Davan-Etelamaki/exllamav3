@@ -75,3 +75,9 @@ int g_get_smem_max(int device);
 size_t g_get_l2win_carve(int device);
 
 void prepare_ctx(int device);
+
+// One-time device-runtime banner, printed from the extension module init (before any model load):
+// the L2 carve ceiling and the access-policy window ceiling that every set-aside arithmetic claim
+// is bounded by, plus the smem/register per-block limits. Prints INKLING-DEVICEPROP once per
+// process; a query the device cannot answer reads -1, and no query can abort the import.
+void exl3_device_banner(void);
