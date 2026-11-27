@@ -55,13 +55,20 @@ class Inkling2LoopConfig(Config):
         # layer_map (e.g. tabbyAPI forwarding one) is overridden, not collided with.
         kwargs.pop("layer_map", None)
         kwargs.pop("config_key", None)
+        from .inkling2_mtp import Inkling2MTPModel
         super().__init__(
             directory,
-            {"text": Inkling2LoopTextModel},
+            {"text": Inkling2LoopTextModel, "mtp": Inkling2MTPModel},
             layer_map = layer_map,
             config_key = "text_config",
             **kwargs,
         )
+        # MTP drafter component: config.json carries its dial set at top level and the pack
+        # ships mtp.safetensors next to the model shards (root key namespace, no prefix).
+        # A pack without the file serves text-only, exactly like the qwen3_5 pop-guard.
+        self.mtp_config = peek.get("mtp_config")
+        if not os.path.isfile(os.path.join(directory, "mtp.safetensors")) or not self.mtp_config:
+            self.model_classes.pop("mtp", None)
 
         # The readout lives in a head/ subdirectory with its own .safetensors files
         head_dir = os.path.join(directory, "head")

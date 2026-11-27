@@ -1587,4 +1587,12 @@ class InklingLayer(Module):
             flow["prev_bank"] = flow["bank"][self.num_pre_loop_blocks + 1:]
             flow["prev_hidden"] = out
 
+        if export_state:
+            s = params.get("export_states")
+            if not s:
+                s = params["export_states"] = []
+            out_ = out.half() if out.dtype != torch.half else out
+            out_ = out_.clamp_(-65504.0, 65504.0)
+            s.append(out_)
+
         return out
