@@ -17,6 +17,25 @@ from ..cache.recurrent import (
 
 
 
+class CheckpointStale(RuntimeError):
+    """
+    A recurrent checkpoint written against a different recurrent-layer registry (wheel or
+    model epoch changed) cannot be unstashed onto the live layers. Callers must treat it as
+    a cache MISS — replay from zero — never as an abort: the fleet lost requests to
+    KeyError(6,0) from exactly this shape (dot26, pre-MTP baseline and again 2026-11-27
+    00:56 on resumed 25k-token conversations).
+    """
+
+
+def checkpoint_is_compatible(stashed: dict, registry_keys) -> bool:
+    """
+    Whether a stash was written by this exact recurrent-layer registry. Blobs without
+    registry_keys (written before this fingerprint existed) are stale by design, so the
+    disk pool self-heals on first touch.
+    """
+    return stashed.get("registry_keys") == sorted(registry_keys)
+
+
 def mp_cache_short_conv_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
     recurrent_modules = local_context["recurrent_modules"]
     for module in recurrent_modules:
@@ -96,7 +115,9 @@ class ShortConvState:
     def stash(self):
         stashed = self.stash_header()
         if not self.cache.model.loaded_tp:
-            stashed.update(self.stash_layers(self.cache.get_all_recurrent_layers()))
+            registry = self.cache.get_all_recurrent_layers()
+            stashed["registry_keys"] = sorted(registry)
+            stashed.update(self.stash_layers(registry))
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot))
@@ -107,7 +128,13 @@ class ShortConvState:
     def unstash(self, stashed: dict):
         assert self.position == stashed["position"]
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
+            registry = self.cache.get_all_recurrent_layers()
+            if not checkpoint_is_compatible(stashed, registry):
+                raise CheckpointStale(
+                    f"recurrent checkpoint at position {stashed['position']} written by registry "
+                    f"{stashed.get('registry_keys')}, live registry {sorted(registry)}"
+                )
+            for k, l in registry.items():
                 l.unstash(self.slot, stashed[k])
         else:
             cp_handle = stashed["tp_handle"]

@@ -1081,6 +1081,12 @@ class Job:
                     if stashed is not None:
                         replay_from = stashed["position"]
                         self.recurrent_state = self.generator.recurrent_state_from_stashed(stashed, replay_from)
+                        if self.recurrent_state is None:
+                            # The stash was stale (dropped as a cache miss, see
+                            # recurrent_state_from_stashed): no position is trustworthy,
+                            # so replay the whole sequence with a fresh state.
+                            replay_from = 0
+                            self.recurrent_state = self.generator.new_recurrent_state()
                     else:
                         replay_from = 0
                         self.recurrent_state = self.generator.new_recurrent_state()
@@ -1756,7 +1762,13 @@ class Job:
                         stashed_recurrent_state,
                         position = cached_pages * PAGE_SIZE,
                     )
-                    self.last_recurrent_checkpoint_pos = self.recurrent_state.position
+                    if self.recurrent_state is None:
+                        # A stale recurrent checkpoint is a cache miss, not an aborted
+                        # request: the cached K/V pages stay valid and the fresh state
+                        # trails them, so prefill replays the recurrent gap before decode.
+                        self.recurrent_state = self.generator.new_recurrent_state()
+                    else:
+                        self.last_recurrent_checkpoint_pos = self.recurrent_state.position
 
             # Metrics
             self.cached_pages += cached_pages

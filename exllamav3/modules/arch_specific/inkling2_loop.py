@@ -1238,6 +1238,7 @@ class InklingMoE(Module):
                                        flat.dtype == torch.half,
                                        hasattr(ext, "exl3_moe_coop"))
         if reason is not None:
+            self._coop_refuse_reason = reason
             return None
         bucket = moe_coop_plan.padded_bucket_rows(rows)
         st = self._coop_by_bucket.get(bucket) or self._coop_state(flat.device, bucket)

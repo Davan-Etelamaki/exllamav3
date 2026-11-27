@@ -6,6 +6,7 @@ from ..model.model import Model
 from ..model.prefill_pipeline import PrefillPipeline
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
+from ..modules.short_conv import CheckpointStale
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 
@@ -1692,12 +1693,18 @@ class Generator:
 
 
     def recurrent_state_from_stashed(self, stashed: dict, position: int) -> PairedState:
-        """The pair restored from a checkpoint stash (PairedState.stash) at `position`"""
+        """The pair restored from a checkpoint stash (PairedState.stash) at `position`.
+        Returns None when the checkpoint is stale (written by a different recurrent-layer
+        registry): the caller falls back to a fresh state, whose position trails the K/V
+        position, so prefill replays the gap — a cache miss, not an aborted request."""
         target = draft = None
         try:
             target = self.cache.new_from_stashed(stashed["target"], position) if self.target_recurrent else None
             draft = self.draft_cache.new_from_stashed(stashed["draft"], position) if self.draft_recurrent else None
             return PairedState(target, draft)
+        except CheckpointStale as stale:
+            print(f" !! recurrent checkpoint at position {position} dropped as stale: {stale}")
+            return None
         except BaseException:
             if draft is not None:
                 draft.free()
