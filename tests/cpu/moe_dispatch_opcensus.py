@@ -182,6 +182,115 @@ for rows in (1, 8, 32, 33, 2048):
     print(f"  refusal(rows={rows:5d}, cuda+fp16+ext present) → "
           f"{'ADMITTED' if r is None else r}")
 
+print("\n== priced proposal (NOT landed): absorb the MoE torch glue the census §CH names ==")
+# §CH: at::native eager glue is 49.70 % of GPU time and cudaLaunchKernel 10,377,201 calls are
+# 64.0 % of host API time. Most of the MoE dispatch's cost is NOT the expert GEMMs — it is the
+# per-group elementwise swiglu and its casts, which are row-independent and can therefore run
+# ONCE over all groups instead of once per group. This prototype mirrors the served op sequence
+# exactly, proves the mirror bit-identical against the served forward, then counts the fused
+# formulation. Nothing here changes the tree; it prices it.
+PACK_I = 1152           # per-expert intermediate width from §CG's pack arithmetic (bytes only)
+
+
+def dispatch(stub, x, fused = False, window = 0):
+    """Mirror of InklingMoE.forward's dispatch (same router chain, same group order, same
+    elementwise sequence). fused=True hoists the swiglu out of the group loop; window>0 bounds
+    the fp32 temporaries by processing the entry order in windows."""
+    b, t, h = x.shape
+    flat = x.reshape(-1, h)
+    hs = flat.float()
+    scores = torch.sigmoid(torch.matmul(hs, stub.router_w.T))
+    sel = torch.topk(scores + stub.router_bias, stub.top_k, dim = -1, sorted = False).indices
+    w = scores.gather(1, sel)                       # weights come from the UNBIASED scores
+    w = w / (w.sum(dim = -1, keepdim = True) + 1e-20)
+    w = w * stub.route_scale
+    sel_flat = sel.reshape(-1)
+    w_flat = w.reshape(-1)
+    out = torch.zeros((b * t, h), dtype = torch.float, device = x.device)
+    order_all = torch.argsort(sel_flat, stable = True)
+    counts = torch.bincount(sel_flat, minlength = stub.num_routed_experts)
+    chosen = torch.nonzero(counts).flatten()
+    ends = torch.cumsum(counts[chosen], 0)
+    bounds = torch.stack([chosen, ends], 0)
+    pairs = list(zip(bounds[0].tolist(), bounds[1].tolist()))
+    tokens_all = torch.div(order_all, stub.top_k, rounding_mode = "floor")
+    spans, start = [], 0
+    for e, end in pairs:
+        spans.append((e, start, end))
+        start = end
+    if not fused:
+        for e, s, end in spans:
+            xs = flat.index_select(0, tokens_all[s:end])
+            g = (xs @ stub.experts_g[e].w).float()
+            u = (xs @ stub.experts_u[e].w).float()
+            act = torch.tanh(g / stub.gate_softcap) * stub.gate_softcap
+            act = act * torch.sigmoid(g)
+            act = act * (torch.tanh(u / stub.up_softcap) * stub.up_softcap)
+            y = (act.to(torch.half) @ stub.experts_d[e].w)
+            out.index_add_(0, tokens_all[s:end],
+                           y.float() * w_flat.index_select(0, order_all[s:end]).unsqueeze(-1))
+        return out.view(b, t, h)
+    gs, us = [], []
+    for e, s, end in spans:
+        xs = flat.index_select(0, tokens_all[s:end])
+        gs.append(xs @ stub.experts_g[e].w)
+        us.append(xs @ stub.experts_u[e].w)
+    gcat, ucat = torch.cat(gs, 0), torch.cat(us, 0)
+    n = gcat.shape[0]
+    act = torch.empty((n, gcat.shape[1]), dtype = torch.half, device = x.device)
+    step = window if window > 0 else n
+    for lo in range(0, n, step):
+        hi = min(lo + step, n)
+        g = gcat[lo:hi].float()
+        u = ucat[lo:hi].float()
+        a = torch.tanh(g / stub.gate_softcap) * stub.gate_softcap
+        a = a * torch.sigmoid(g)
+        a = a * (torch.tanh(u / stub.up_softcap) * stub.up_softcap)
+        act[lo:hi] = a.to(torch.half)
+    for e, s, end in spans:
+        y = act[s:end] @ stub.experts_d[e].w
+        out.index_add_(0, tokens_all[s:end],
+                       y.float() * w_flat.index_select(0, order_all[s:end]).unsqueeze(-1))
+    return out.view(b, t, h)
+
+
+ROWS_BIG = 2048
+FN_REF, STUB_REF, calls_ref = build(None, False)
+X_BIG = torch.randn(1, ROWS_BIG, H, generator = torch.Generator().manual_seed(9)).half()
+
+
+def counted(fn_call):
+    with Count() as c:
+        out = fn_call()
+    return c, out
+
+
+c_plain, out_plain = counted(lambda: dispatch(STUB_REF, X_BIG, fused = False))
+c_served, out_served = counted(lambda: FN_REF(STUB_REF, X_BIG.clone(), {}))
+mirrored = torch.equal(out_plain, out_served)
+print(f"mirror check: the plain dispatch reproduces the served forward bit-exactly: {mirrored} "
+      f"(max|Δ| {(out_plain - out_served).abs().max().item():.3e})")
+c_fused, out_fused = counted(lambda: dispatch(STUB_REF, X_BIG, fused = True))
+c_win, out_win = counted(lambda: dispatch(STUB_REF, X_BIG, fused = True, window = 2048))
+n_entries = ROWS_BIG * PACK_TOPK
+for label, c, out in (("served per-group swiglu (today's shape)", c_plain, out_plain),
+                      ("fused swiglu, unbounded buffer", c_fused, out_fused),
+                      ("fused swiglu, 2048-entry windows", c_win, out_win)):
+    ok = torch.equal(out, out_served)
+    print(f"  {label:<40} kernel-class {c.kernel_class:5d} per MoE execution  "
+          f"bit-identical={ok}")
+mb = lambda rows_, itemsize: rows_ * PACK_I * itemsize / 2 ** 20
+print(f"  transient peak, pack geometry (I={PACK_I}, n={n_entries}): "
+      f"unbounded = 2 fp16 cats {2 * mb(n_entries, 2):.0f} MiB + 2 fp32 {2 * mb(n_entries, 4):.0f} "
+      f"MiB + act fp16 {mb(n_entries, 2):.0f} MiB = {2 * mb(n_entries, 2) + 2 * mb(n_entries, 4) + mb(n_entries, 2):.0f} MiB; "
+      f"windows=2048 = {2 * mb(n_entries, 2) + mb(n_entries, 2) + 2 * mb(2048, 4):.0f} MiB "
+      f"(bytes from shapes — arithmetic, not a GPU measurement)")
+print(f"  reduction vs the mirrored served dispatch: {c_plain.kernel_class} → "
+      f"{c_fused.kernel_class} (unbounded) / {c_win.kernel_class} (windowed) kernel-class ops; "
+      f"ratio {c_plain.kernel_class / c_fused.kernel_class:.1f}× / "
+      f"{c_plain.kernel_class / c_win.kernel_class:.1f}×")
+fused_ok = mirrored and torch.equal(out_fused, out_served) and torch.equal(out_win, out_served)
+
 print("\n== control: the counter reacts to a planted extra op ==")
 tree = ast.parse(LOOP.read_text(encoding = "utf8"))
 moe = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "InklingMoE"][0]
@@ -193,9 +302,14 @@ PLANTED, n_planted = census(1, source_text = mut)
 print(f"decode with one planted add per group: kernel-class {PLANTED.kernel_class} vs "
       f"{DEC_HOST.kernel_class} baseline → +{PLANTED.kernel_class - DEC_HOST.kernel_class} "
       f"(expected +{n_dec}); groups {n_planted}")
-ok = PLANTED.kernel_class - DEC_HOST.kernel_class == n_dec
-print("\nCENSUS " + ("OK: the counter counts, the served decode path is dispatch-bound at "
-                    f"{DEC_HOST.kernel_class * LAYERS_PER_TOKEN} kernel-class aten ops per token, "
-                    "and the coop ladder admits every decode shape up to rows=32"
-                    if ok else "RED: the counter did not react to the planted op"))
+ok = (PLANTED.kernel_class - DEC_HOST.kernel_class == n_dec) and fused_ok
+print("\nCENSUS " + (
+    "OK (CPU, mock expert interior, eager dispatch — the path prefill always runs and decode "
+    f"runs when coop declines): eager MoE dispatch = {DEC_HOST.kernel_class} kernel-class aten "
+    f"ops per executed layer-pass = {DEC_HOST.kernel_class * LAYERS_PER_TOKEN} per token pass; "
+    f"hoisting the swiglu out of the group loop takes an executed layer-pass to "
+    f"{c_fused.kernel_class} (unbounded buffer) / {c_win.kernel_class} (windowed) bit-identically; "
+    "and the coop ladder admits every decode shape up to rows=32"
+    if ok else "RED: the counter did not react to the planted op, or the fused prototype is not "
+               "bit-identical to the served dispatch"))
 raise SystemExit(0 if ok else 1)
