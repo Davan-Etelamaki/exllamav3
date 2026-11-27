@@ -110,8 +110,8 @@ def override(fn):
 
 BASE_NS = {"torch": torch, "moe_coop_plan": plan, "logger": Book(), "override": override,
            # InklingMoE.forward consults the capture predicate (the device-grouping arm landed by
-           # cf0df7fa). This fence exercises the eager path, so the stub says "not capturing".
-           "_capturing": lambda: False}
+           # cf0df7fa) and the fused-swiglu window constant (the fused arm), so the namespace carries both.
+           "_capturing": lambda: False, "_MOE_FUSE_WINDOW": 2048}
 
 
 def run_nodes(nodes, ns):

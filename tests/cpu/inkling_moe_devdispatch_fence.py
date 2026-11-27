@@ -98,6 +98,7 @@ def build(source_text, capture = False):
     ns = {"torch": torch, "moe_coop_plan": plan, "logger": types.SimpleNamespace(
         warning = lambda *_: None, info = lambda *_: None), "override": override,
         "_capturing": capturing, "host_values": host_values, "stage_host": stage_host,
+        "_MOE_FUSE_WINDOW": 2048,          # the fused-swiglu window constant the merged forward reads
         "get_for_device": lambda params, k, d: None}
     node = ast.parse(source_text).body[0]
     node.decorator_list = []
@@ -113,7 +114,9 @@ def build(source_text, capture = False):
                                  dtype = torch.half)
 
         def forward(self, x, params, out_dtype = None):
-            calls.append(self.tag)
+            # The per-group INPUT travels with the tag: a token handed to the wrong expert
+            # changes the checksum, so sequence equality means "same expert, same rows".
+            calls.append((self.tag[0], self.tag[1], x.shape[0], x.float().sum().item()))
             return x @ self.w
 
     experts_g, experts_u, experts_d = [], [], []
@@ -181,15 +184,33 @@ for rows, seed, skew in CASES:
     out_dev, spy_dev, calls_dev, _ = run(FORWARD_SRC, x)
     out_host, spy_host, calls_host, _ = run(FORWARD_SRC, x, capture = True)
     same_bits = torch.equal(out_dev, out_host)
-    seq_equal = calls_dev == calls_host
+    # The fused arm runs every gate/up before any down (that is the fusion), the seam
+    # interleaves them per group — so visitation is compared PER PROJECTION FAMILY: same
+    # expert, same group order, same rows (checksum) in both arms.
+    fam = lambda cs, k: [c for c in cs if c[0] == k]
+    seq_equal = all(fam(calls_dev, k) == fam(calls_host, k) for k in ("g", "u", "d"))
     check(f"rows={rows} skew={skew}: device arm is bit-identical to the host arm "
-          f"and calls the same experts in the same order",
+          f"and feeds each expert the same rows in the same group order",
           same_bits and seq_equal,
           f"equal={same_bits} seq={seq_equal} "
           f"max|Δ|={(out_dev - out_host).abs().max().item():.3e}")
     worst_seq = max(worst_seq, len(calls_dev))
 check("both arms visit exactly one (g,u,d) triplet per non-empty expert",
       worst_seq % 3 == 0 and worst_seq // 3 <= E, f"{worst_seq // 3} experts touched")
+
+print("[1b] the fused arm phases gate/up before down; the capture seam keeps today's interleave")
+x_phase = make_case(2048, 11, None)
+_, _, c_fused_arm, _ = run(FORWARD_SRC, x_phase)
+_, _, c_seam, _ = run(FORWARD_SRC, x_phase, capture = True)
+idx = lambda cs, k: [i for i, c in enumerate(cs) if c[0] == k]
+check("fused arm: every gate/up projection completes before the first down projection "
+      "(the activation is hoisted out of the group loop)",
+      max(idx(c_fused_arm, "g")) < min(idx(c_fused_arm, "d")),
+      f"last g at {max(idx(c_fused_arm, 'g'))}, first d at {min(idx(c_fused_arm, 'd'))}")
+check("capture seam: down projections still interleave with gate/up (per-expert chain the "
+      "graph baked is unchanged)",
+      max(idx(c_seam, "g")) > min(idx(c_seam, "d")),
+      f"last g at {max(idx(c_seam, 'g'))}, first d at {min(idx(c_seam, 'd'))}")
 
 # ------------------------------------------------------------------ [2] payload
 print("[2] the device arm shrinks what crosses the boundary")
