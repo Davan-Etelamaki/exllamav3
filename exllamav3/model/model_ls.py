@@ -122,6 +122,7 @@ class Model_LSMixin(ABC):
         export_state_layers: set[int] | None = None,
         attached_modules: dict[int, list] | None = None,
         attn_device: torch.device | str | int | None = None,
+        export_state_layer_instances: set[tuple[int, int]] | None = None,
     ):
         current_device_i = 0
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)

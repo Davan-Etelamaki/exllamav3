@@ -721,6 +721,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                         draft_model.draft_verifier_params.get("export_state_layers") if draft_model else None,
                         attached,
                         attn_device,
+                        export_state_layer_instances = draft_model.draft_verifier_params.get("export_state_layer_instances") if draft_model else None,
                     )
                     self.output_device = self.modules[-1].device
 
