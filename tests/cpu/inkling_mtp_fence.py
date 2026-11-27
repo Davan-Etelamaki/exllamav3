@@ -56,8 +56,8 @@ cls = next(n for n in ast.walk(tree)
 csrc = ast.unparse(cls).replace("'", '"')
 check("dflash_draft caps (not mtp_draft: recurrent assert generator.py:297)",
       '"dflash_draft": True' in csrc and '"mtp_draft": True' not in csrc)
-check("instance taps {(5,0),(11,1),(17,2),(23,2)} (raw visits 5/23/41/48)",
-      "MTP_TAP_TARGETS = ((5, 0), (11, 1), (17, 2), (23, 2))" in msrc)
+check("instance taps {(5,0),(11,1),(17,2),(23,0)} (per-layer visit counters)",
+      "MTP_TAP_TARGETS = ((5, 0), (11, 1), (17, 2), (23, 0))" in msrc)
 check("no norm-key tap (dflash prefill never runs final RMSNorm)",
       '"export_state_norm_keys"' not in csrc)
 # CONTROL 2b: a norm-key tap reintroduced would never fire -> silent 3-tap starvation

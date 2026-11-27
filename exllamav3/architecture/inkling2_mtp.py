@@ -25,9 +25,10 @@ from ..util.tensor import get_for_device
 #    sliding_window_size 1024 on local layers {0,2}, layer 1 global, rms_norm_eps 1e-6,
 #    markov_head_type rnn_hidden, markov_rank 256, target_layer_ids [5, 23, 41, 48].
 #    (The stanza carries no num_hidden_layers; the pack census fixes it at 3.)
-#  - target_layer_ids are LAYER-VISITS over the unrolled loop map (0..5, 6..17 x3, 18..23):
-#    visit 5 = (layer 5, instance 0), visit 23 = (layer 11, instance 1), visit 41 = (layer 17,
-#    instance 2), visit 48 = (layer 23, instance 2) output - raw, NOT final-normed (dflash
+#  - target_layer_ids are LAYER-VISITS over the unrolled loop map (0..5, 6..17 x3, 18..23);
+#    instance = per-physical-layer visit counter (model.py inner_count): visit 5 = (5, 0),
+#    visit 23 = (11, 1), visit 41 = (17, 2), visit 48 = tail layer 23 ran once -> (23, 0),
+#    the last prefill module (last_kv_module_idx_instance) - raw, NOT final-normed (dflash
 #    prefill never runs the final RMSNorm; laguna parity). Instance taps fire through the
 #    export_state_layer_instances seam in modules/arch_specific/inkling2_loop.py (append landed
 #    with this commit). Execution order equals tap order.
@@ -51,7 +52,7 @@ from ..util.tensor import get_for_device
 # inclusion verified against Inkling2InputRead. C1 ships the module tree, caps and seams.
 
 MTP_NUM_LAYERS = 3
-MTP_TAP_TARGETS = ((5, 0), (11, 1), (17, 2), (23, 2))
+MTP_TAP_TARGETS = ((5, 0), (11, 1), (17, 2), (23, 0))
 
 
 class Inkling2MTPModel(Model):
@@ -171,8 +172,9 @@ class Inkling2MTPModel(Model):
 
         self.attached_model = None
         # Target-side tap requests: RAW hidden states at the logical target_layer_ids
-        # [5,23,41,48] mapped onto (layer_idx, instance) pairs. Visit 48 = the last physical
-        # instance's output, NOT the final-normed hidden: dflash prefill stops before the
+        # [5,23,41,48] mapped onto (layer_idx, instance) pairs (instance = per-layer visit
+        # counter, model.py inner_count). Visit 48 = tail layer (23, 0) output - the last
+        # prefill module, NOT the final-normed hidden: dflash prefill stops before the
         # final RMSNorm (job.py to_output is mtp_draft-only), so a norm-key tap never fires
         # here; the norm is the drafter's own job (per-layer dflare_norm post-mix, cpp:631).
         # Same contract as the native dflash_laguna.py (export_state_layers = raw target ids).
