@@ -218,11 +218,14 @@ class RecurrentCache(OrderedDict):
             self.move_to_end(key)
             self._settle(self[key])
         if key in self:
-            return self[key]
+            stashed = self[key]
+            print("[REC_EMIT] restore key=%s pos=%s slot=%s src=ram" % (str(key)[:12], stashed.get("position"), stashed.get("tp_handle")), flush=True)
+            return stashed
         if self.disk_tier is not None:
             stashed = self.disk_tier.read_state(key)
             if stashed is not None:
                 self._insert(key, stashed, persist = False)
+                print("[REC_EMIT] restore key=%s pos=%s slot=%s src=disk" % (str(key)[:12], stashed.get("position"), stashed.get("tp_handle")), flush=True)
                 return stashed
         return default
 
@@ -337,6 +340,8 @@ class RecurrentCache(OrderedDict):
             self.unwritten.append((key, stashed))
         elif persist and self.disk_tier is not None and is_content_hash(key):
             self.disk_tier.note_state(key, stashed)
+        if persist:
+            print("[REC_EMIT] save key=%s pos=%s slot=%s deferred=%s" % (str(key)[:12], stashed.get("position"), stashed.get("tp_handle"), deferred), flush=True)
 
 
     def prune_stranded(self) -> int:
@@ -348,13 +353,14 @@ class RecurrentCache(OrderedDict):
         """
         if self.pagetable is None:
             return 0
-        stranded = [k for k in self if not self.pagetable.is_resumable(k)]
-        for k in stranded:
+        stranded = [(k, self[k].get("position"), self[k].get("tp_handle")) for k in self if not self.pagetable.is_resumable(k)]
+        for k, _, _ in stranded:
             popped = self.pop(k)
             self.metrics["stash_pruned"] += 1
             self._release(popped)
         if stranded:
             self.update_total_size()
+        print("[REC_EMIT] poolpass dropped=%d pos=%s slot=%s" % (len(stranded), [p for _, p, _ in stranded][:12], [h for _, _, h in stranded][:12]), flush=True)
         return len(stranded)
 
 
