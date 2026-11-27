@@ -1015,18 +1015,20 @@ class InklingAttention(Module):
 
     def _attend_keytile_cols(self, S, rows, d, itemsize):
         """Largest key-column block whose dominant fp32 temporaries — the (h, rows, cols)
-        relative bias, the (kvh, grp*rows, cols) scores, and the per-chunk (kvh, d, cols) fp32
-        K cast — together fit the per-call byte budget.
+        relative bias, the (kvh, grp*rows, cols) scores, and the per-chunk (kvh, d, cols) fp32 K
+        and V casts — together fit the per-call byte budget.
 
         The query-tile dial (_attend_one_tile) bounds rows, but the scores/bias plane grows
         with the KEY axis too, so a long-S prefill keeps an (h, rows, S) slab no matter how
         small rows gets — the same O(S) peak _attend_one pays. Column tiling bounds the part
         the row dial cannot reach. The per-column cost carries BOTH the row-dependent terms
-        (bias + scores, 2*h*rows*itemsize) and the row-INDEPENDENT fp32 K cast (kvh*d*itemsize);
-        the keytile branch's byte model omitted the cast, which is the term that dominates the
-        peak while rows stays small (the defect this merge does not carry). Floored at rel_extent
-        so one chunk still covers a full relative window; capped at S so a short cache is a single
-        chunk (launch-neutral, identical to the control arm's iteration count)."""
+        (bias + scores, 2*h*rows*itemsize) and the row-INDEPENDENT fp32 casts (K and V,
+        2*kvh*d*itemsize); the keytile branch's byte model omitted the casts, the term that
+        dominates the peak while rows stays small (a defect this merge does not carry), and the
+        V cast is the per-chunk fp32 copy the long-context PV accumulation (see _attend_one_
+        keytile) requires to stay off fp16 overflow. Floored at rel_extent so one chunk still
+        covers a full relative window; capped at S so a short cache is a single chunk (launch-
+        neutral, identical to the control arm's iteration count)."""
         S = int(S)
         rows = max(1, int(rows))
         budget = getattr(self, "attend_tile_bytes", _ATTEND_TILE_BYTES)
@@ -1035,7 +1037,7 @@ class InklingAttention(Module):
             budget = min(budget, max(8 * 1024 * 1024, free // 2))
         h = self.num_kv_heads * self.num_kv_groups
         kvh = self.num_kv_heads
-        per_col = 2 * h * rows * itemsize + kvh * d * itemsize   # bias+scores (row-scaled) + K cast (row-free)
+        per_col = 2 * h * rows * itemsize + 2 * kvh * d * itemsize   # bias+scores (row-scaled) + K cast + V cast (row-free)
         if not per_col:
             return S
         cols = budget // per_col
@@ -1182,8 +1184,15 @@ class InklingAttention(Module):
                 p = torch.where(live[..., None], torch.exp(sc - m_new[..., None]),
                                 torch.zeros_like(sc))
                 l = l * alpha + p.sum(dim = -1)
+                # FP32 PV accumulation. The online-softmax numerator is UN-normalized until the
+                # final /l, so its partial sum Σ exp(sc-m)·v scales with attention breadth × |v|
+                # and overflows fp16 (max 65504) at long context — a broad-attention, RMS~2-value
+                # prefill over 63k keys reaches ~127k here. The eager arm escapes it because it
+                # normalises weights before its half matmul. Keeping the V product in fp32 (as
+                # flash-attention keeps O fp32) bounds the per-chunk partial to fp32 range; the
+                # single .to(v.dtype) happens after /l, when the result is back to O(|v|).
                 acc = acc * alpha[..., None] + torch.matmul(
-                    p.to(v.dtype).reshape(kvh, grp * tt, cc), vx[:, ks:ke, :]
+                    p.reshape(kvh, grp * tt, cc), vx[:, ks:ke, :].float()
                 ).view(kvh, grp, tt, d)                                   # (kvh,grp,tt,d)
                 m = m_new
             outs.append((acc / l.clamp(min = 1e-30)[..., None]).to(v.dtype))   # (kvh,grp,tt,d)

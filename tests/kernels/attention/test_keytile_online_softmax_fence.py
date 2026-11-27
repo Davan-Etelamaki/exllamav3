@@ -191,6 +191,19 @@ def build_ns_no_rescale(ns_src):
     return ns
 
 
+def build_ns_fp16pv(ns_src):
+    """Sabotage: revert the PV accumulation to fp16 (p.to(half) @ vx.half). The online-softmax
+    numerator is un-normalised until the final /l, so at long context its fp16 partial overflows
+    (> 65504) and poisons acc -> non-finite out; the fixed fp32 accumulation stays finite."""
+    sab = ns_src.replace(
+        "p.reshape(kvh, grp * tt, cc), vx[:, ks:ke, :].float()",
+        "p.to(v.dtype).reshape(kvh, grp * tt, cc), vx[:, ks:ke, :]  # SABOTAGE: fp16 PV")
+    assert sab != ns_src, "sabotage transform did not land: fp32 PV line not found"
+    ns = {"torch": torch, "F": F, "math": __import__("math"), "os": os, "_os": os}
+    exec(compile(sab, "<sabotage-fp16pv>", "exec"), ns)
+    return ns
+
+
 def main():
     if torch.cuda.is_available():
         print("[warn] CUDA visible — this fence is meant to run under CUDA_VISIBLE_DEVICES=")
@@ -293,6 +306,44 @@ def main():
     verdict = "fires" if red else "IS VACUOUS"
     print(f"[{'PASS' if red else 'FAIL'}] SABOTAGE (no running-max rescale): worst maxabs="
           f"{worst_sab:.3e} must be > {SAB_TOL:.0e} -> detector {verdict}")
+
+    # ---- (D) context sweep at SERVED dims: both arms finite at S >= 32k ---------------------
+    # Inkling 2 mini (qwen4_exp) full-attention dims: h=24, kvh=2, grp=12, head_dim=256.
+    SVH, SGRP, SD, SE = 2, 12, 256, 1024
+    SH = SVH * SGRP
+    ST = 128
+    for Ss in (8192, 32768, 65536):
+        inp = make_input(SH, SVH, SGRP, SD, ST, Ss, SE, seed=13, vscale=8.0)
+        o_ct = run(make_self(ns, SVH, SGRP, SE, SD, method="_attend_one"), inp)
+        o_tl = run(make_self(ns, SVH, SGRP, SE, SD, method="_attend_one_keytile"), inp)
+        ct_fin = bool(torch.isfinite(o_ct).all()); tl_fin = bool(torch.isfinite(o_tl).all())
+        eq = float((o_tl.float() - o_ct.float()).abs().max()) if (ct_fin and tl_fin) else float("nan")
+        passed = ct_fin and tl_fin and eq <= ABS_TOL
+        ok = ok and passed
+        print(f"[{'PASS' if passed else 'FAIL'}] SWEEP served S={Ss} T={ST}: control_finite={ct_fin} "
+              f"keytile_finite={tl_fin} maxabs={eq:.3e} (<= {ABS_TOL:.0e})")
+
+    # ---- (E) fp16-PV-overflow sabotage: fp32 PV finite, reverted fp16 PV overflows ----------
+    # Broad (near-uniform) attention over the full served context with RMS~2 values: the
+    # un-normalised PV partial Σ p·v ~ S·|v| crosses fp16 65504 -> inf; fp32 accumulation stays
+    # finite and the final /l brings it back to O(|v|). This is the long-context abort mechanism.
+    sab16 = build_ns_fp16pv(src)
+    Sv = 63387
+    gg = torch.Generator().manual_seed(42)
+    q = torch.randn(SH, ST, SD, generator=gg, dtype=torch.half)
+    k = torch.randn(Sv, SVH, SD, generator=gg, dtype=torch.half) * 0.02   # flat scores -> p ~ 1
+    v = torch.full((Sv, SVH, SD), 2.0, dtype=torch.half)                  # positive DC, RMS~2
+    rel = torch.zeros(SH, ST, SE, dtype=torch.float)                      # flat bias -> uniform attn
+    sink = torch.randn(ST, SH, generator=gg, dtype=torch.float)
+    qp = Sv + torch.arange(ST, dtype=torch.long); kp = torch.arange(Sv, dtype=torch.long)
+    sv = dict(q=q, k=k, v=v, rel_small=rel, sink=sink, q_pos=qp, kv_pos=kp, kv_valid=None)
+    o_fix = run(make_self(ns, SVH, SGRP, SE, SD, method="_attend_one_keytile"), sv)
+    o_fp16 = run(make_self(sab16, SVH, SGRP, SE, SD, method="_attend_one_keytile"), sv)
+    fix_fin = bool(torch.isfinite(o_fix).all()); fp16_bad = (not bool(torch.isfinite(o_fp16).all()))
+    passed = fix_fin and fp16_bad
+    ok = ok and passed
+    print(f"[{'PASS' if passed else 'FAIL'}] OVERFLOW served S={Sv}: fixed fp32-PV finite={fix_fin} | "
+          f"reverted fp16-PV nonfinite={fp16_bad} (proves fp32 PV accumulation is load-bearing)")
 
     print(f"\nFENCE {'PASS' if ok else 'RED'}")
     return 0 if ok else 1
