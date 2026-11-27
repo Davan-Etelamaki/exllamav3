@@ -141,6 +141,8 @@ class Inkling2MTPModel(Model):
             )]
 
         self.last_kv_module_idx = len(self.modules) - 1
+        self.blocks = [mm for mm in self.modules if isinstance(mm, Inkling2MTPBlock)]
+        self._anchor_taps = None
 
         # rnn markov head: rnn_proj / hidden_out Linears + raw markov_w1 bigram selector,
         # passthrough in the linear stream, consumed via member attributes by the sampling loop
@@ -224,14 +226,49 @@ class Inkling2MTPModel(Model):
         lengths: list[int] = None,
     ):
         """
-        Fill each drafter layer's context ring from the target taps (laguna pattern: per-layer
-        attn_norm on the shared features, k/v ctx-project, rope at the cache_seqlens offset with
-        k_norm_ctx applied, cache.update_layer_direct rows).
-        TODO(C2): ctx projections live on Inkling2MTPBlock (k_proj_ctx/v_proj_ctx/k_norm_ctx);
-        fuse per tap-set then write; q_proj_ctx is projected for ring parity only if the oracle
-        consumes it - flag in the C2 commit.
+        Fill each drafter layer's context ring from the target taps, mirroring
+        dflash_laguna.update_kv_from_target: per-layer mix softmax(fuse_weight)[L] over the four
+        taps, THAT layer's dflare_norm on the mix (cpp:631-640), k/v ctx projection, rope at the
+        cache_seqlens offset with k_norm_ctx applied, then cache.update_layer_direct rows. The
+        block forward then attends these rows as its context - the taps enter the draft sequence
+        through the ring, which persists across rounds.
+
+        Deviation flag: q_proj_ctx is not written anywhere; the oracle's ctx attention consumes
+        the ring K/V only (laguna-parity). If C3 telemetry shows the block's q should mix into
+        the ring query side, revisit.
         """
-        raise NotImplementedError("Inkling2MTP: update_kv_from_target lands in C2")
+        if lengths is not None:
+            max_length = max(lengths)
+            target_hidden = [t[:, :max_length] for t in target_hidden]
+        device = self.input_layer.device
+        target_hidden = [to_device(t, device) for t in target_hidden]
+        assert len(target_hidden) == self.n_taps, \
+            f"Inkling2MTP: expected {self.n_taps} exported taps, got {len(target_hidden)}"
+
+        # Last-position taps anchor the markov exit (cpp:792 fuse row 3 + markov dflare_norm)
+        self._anchor_taps = [t[:, -1:, :] for t in target_hidden]
+
+        for L in range(MTP_NUM_LAYERS):
+            block = self.blocks[L]
+            attn = block.attn
+            mix = self._mix_taps(L, target_hidden)
+            mix = block.dflare_norm.forward(mix, params, out_dtype = torch.half)
+            k = block.k_proj_ctx.forward(mix, params)
+            v = block.v_proj_ctx.forward(mix, params)
+            bsz, seqlen, _ = k.shape
+            k = k.view(bsz, seqlen, attn.num_kv_heads, attn.head_dim)
+            v = v.view(bsz, seqlen, attn.num_kv_heads, attn.head_dim)
+            block_table = get_for_device(params, "block_table", device)
+            cache_seqlens = get_for_device(params, "cache_seqlens", device)
+            # rope at per-row cache offsets, k_norm_ctx as the pre-rope norm (laguna call shape)
+            k, _ = attn.rope.apply(
+                k, None, 0, cache_seqlens, None, True,
+                block.k_norm_ctx.weight, None, block.k_norm_ctx.rms_norm_eps,
+                block.k_norm_ctx.constant_bias, None,
+            )
+            cache.update_layer_direct(
+                attn.layer_idx, cache_seqlens, block_table, k, v, seqlen, 0
+            )
 
 
     def sample_from_state(self, state: torch.Tensor, params: dict) -> torch.Tensor:
