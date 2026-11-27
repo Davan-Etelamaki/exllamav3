@@ -46,6 +46,29 @@ _ATTEND_TILE_BYTES = int(_os.environ.get("INKLING_ATTEND_TILE_BYTES", 512 * 1024
 # Floor at rel_extent so a chunk still covers one full relative window.
 _ATTEND_K_CHUNK_BYTES = int(_os.environ.get("INKLING_ATTEND_K_CHUNK_BYTES", 64 * 1024 * 1024))
 
+# Contract of the sm_89 flash-prefill kernel (infer_params.inkling_attn_flashprefill), mirrored from
+# exllamav3/exllamav3_ext/inkling/fa_prefill.cuh — tests/cpu/inkling_fa_prefill_fence.py pins that
+# these agree with the #defines in inkling/fa_prefill.cuh, so the mirror cannot rot silently. A pass
+# shorter than one query tile never asks the kernel; the audit bound is the largest |output|
+# difference the arm may show against the fused path before it is taken out of service: served
+# attention outputs are fp16 with a quantum of 4.88e-4 at |x|=1, and the arm's reordered exp summation
+# plus fp16 P puts its expected diff near 1e-3, so 2e-2 sits two orders above what the arm can
+# legitimately produce and far below anything that would move a logit.
+_FA_MIN_ROWS = 64
+_FA_AUDIT_BOUND = 2e-2
+_FA_AUDIT_CLASSES = 8          # per layer: one audit per (T,S) shape class, at most this many.
+                               # Served-config arithmetic (window 262,144, chunk_size 2,048, global
+                               # layers 5/11/17/23): a 63,387-token prefill runs full chunks at
+                               # T=2,048 (bit_length 12) while the cache walks 2,048 → 61,440, whose
+                               # bit_lengths are 12,13,14,15,16 = 5 classes; the final partial chunk
+                               # (1,947 rows → 11) is a 6th; decode adds one more every time the cache
+                               # crosses a power of two (T=1 → bit_length 1), so 7 and 8 cover the
+                               # first two crossings. Cost stays bounded: one duplicate fused pass per
+                               # class per global layer = 8 × 4 = 32 extra passes per session. The
+                               # 4 this replaces was exceeded inside the ingest itself, silently —
+                               # reaching the cap now prints INKLING-FLASHAUDITCAP once per layer.
+_FA_SMEM_BUDGET = 0            # 0 = no caller cap: fa_prefill_plan sizes the block against the device
+
 
 def _fresh_flow() -> dict:
     return {"bank": [], "pre_bank": None, "pre_hidden": None, "prev_bank": None, "prev_hidden": None}
@@ -902,6 +925,19 @@ class InklingAttention(Module):
         self._attn_graph_failed = None
         self._attn_graph_logged = set()
         self._attn_margin_wait = 0      # rounds to skip the VRAM probe after a margin refusal
+        # Persisting-L2 window state (infer_params.inkling_attn_l2win, off by default): armed means
+        # this layer's carve is in place; refused means a call came back declined and the layer stops
+        # asking, so a card that cannot honour the window pays one probe, not one per round.
+        self._l2win_armed = False
+        self._l2win_refused = False
+        self._l2win_dev_idx = 0
+        self._fa_refused = False
+        self._fa_audited = set()      # (T,S) shape classes already bounded, see _fa_audit_class
+        self._fa_audit_capped = False  # the cap-exhausted line is printed once per layer, not per pass
+        # sm_89 flash-prefill kernel state (infer_params.inkling_attn_flashprefill, off by default):
+        # refused means a pass was declined and this layer stops asking, so a card or a geometry the
+        # kernel cannot serve pays one probe and one INKLING-FLASHDECLINE line, not one per round;
+        # audited is the once-per-layer bounded-diff check against the fused path that gates the arm.
 
     @override
     def optimizer_targets(self):
@@ -910,6 +946,10 @@ class InklingAttention(Module):
     @override
     def load(self, device, **kwargs):
         super().load(device, **kwargs)
+        # The carve is a per-device limit against the context, so it is taken while the device is
+        # being set up, not on the first decode round that would want it. Gate OFF: no ext call.
+        if self.config.infer_params.inkling_attn_l2win:
+            self._l2win_arm(device)
         for cl in self.cache_layers:
             cl.alloc(device)
         self.q_scale = self.config.stc.get_tensor(self.k_q_scale, device, optional = False, allow_bf16 = True, no_defer = True).float()
@@ -928,6 +968,45 @@ class InklingAttention(Module):
         self._attn_graph_failed = None
         self._attn_margin_wait = 0
         super().unload()
+
+    def _l2win_arm(self, device):
+        """Take this device's persisting-L2 carve for the row span this layer's decode rounds ask
+        for. The bytes come from the served shapes (heads, kv heads, head dim, relative extent), so
+        the window follows the model instead of a remembered constant. A zero return is a refusal the
+        extension already gave a reason for; the layer then stops asking and every round keeps
+        ordinary L2 behaviour."""
+        dev = device if isinstance(device, torch.device) else torch.device(device)
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        self._l2win_dev_idx = idx
+        carve = ext.exl3_l2win_arm(idx, self.num_q_heads, self.num_kv_heads, self.head_dim,
+                                   self.rel_extent)
+        self._l2win_armed = bool(carve > 0)
+        if self._l2win_armed:
+            logger.warning(f"INKLING-L2WIN armed L{self.layer_idx:02d} device={idx} "
+                           f"carve={carve / 2 ** 20:.1f} MiB shapes=h{self.num_q_heads}/"
+                           f"kvh{self.num_kv_heads}/d{self.head_dim}/rel{self.rel_extent}")
+        else:
+            self._l2win_refused = True
+            logger.warning(f"INKLING-L2WIN DECLINED L{self.layer_idx:02d} device={idx}: "
+                           f"{ext.exl3_l2win_refusal(idx)}")
+
+    def _l2win_round(self, hot, rows):
+        """Steer this round's attention stream onto the carved slice, over the hot row span. Checked
+        per call, like the attend arms: with the gate off the extension is never touched, so the
+        served path issues neither cudaDeviceSetLimit nor cudaStreamSetAttribute. Torch owns stream
+        creation, so the handle is the current stream of this thread — which is the stream the round
+        really runs on, including inside a warm-up side stream or a graph capture."""
+        if (not self.config.infer_params.inkling_attn_l2win
+                or self._l2win_refused or hot is None or rows <= 0):
+            return
+        if not self._l2win_armed:
+            self._l2win_arm(self.device)          # gate flipped after load: arm once, lazily
+            if self._l2win_refused:
+                return
+        if ext.exl3_l2win_stream(self._l2win_dev_idx, hot.data_ptr(), int(rows)) < 0:
+            self._l2win_refused = True
+            logger.warning(f"INKLING-L2WIN DECLINED L{self.layer_idx:02d} stream window: "
+                           f"{ext.exl3_l2win_refusal(self._l2win_dev_idx)}")
 
     @override
     def get_tensors(self):
@@ -1044,6 +1123,32 @@ class InklingAttention(Module):
         cols = max(self.rel_extent, cols)                        # floor: one full relative window
         return min(S, max(1, cols))
 
+    def _attend_biasfuse_cols(self, S, rows, d, itemsize):
+        """Largest key block whose dominant fp32 temporaries fit the per-call byte budget.
+
+        The keytile budget (_attend_keytile_cols) charges TWO row-scaled planes per column — the
+        scores and the (h, rows, cols) relative bias. This arm never builds that bias plane: the
+        bias exists only as a rel_extent-wide band per row (h * rows * rel_extent * 4 bytes, a
+        column-independent reserve) and the softmax epilogue runs in place on the scores plane, so
+        the row-scaled cost per column is one plane, not two. Same budget, same rel_extent floor
+        and same S cap: a short cache stays one block (launch-neutral) while the served long-S
+        prefill buys a wider block out of the same ceiling."""
+        S = int(S)
+        rows = max(1, int(rows))
+        budget = getattr(self, "attend_tile_bytes", _ATTEND_TILE_BYTES)
+        if torch.cuda.is_available():
+            free = int(torch.cuda.mem_get_info()[0])
+            budget = min(budget, max(8 * 1024 * 1024, free // 2))
+        h = self.num_kv_heads * self.num_kv_groups
+        kvh = self.num_kv_heads
+        budget -= h * rows * self.rel_extent * itemsize          # the band reserve, once
+        per_col = h * rows * itemsize + 2 * kvh * d * itemsize   # scores plane + fp32 K and V casts
+        if per_col <= 0 or budget <= 0:
+            return min(S, max(1, self.rel_extent))
+        cols = budget // per_col
+        cols = max(self.rel_extent, cols)                        # floor: one full relative window
+        return min(S, max(1, cols))
+
     def _attend_one(self, q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid = None):
         # single sequence: q (h,T,d) half; k/v (S_,kvh,d) half; rel_small (h,T,extent) fp32;
         # sink (T,h) fp32; q_pos (T,), kv_pos (S_,) int on device;
@@ -1124,6 +1229,242 @@ class InklingAttention(Module):
                         .view(kvh, grp, qe - qs, d))                      # (kvh,grp,tt,d)
         attn = torch.cat(outs, dim = 2).reshape(h, T, d)
         return attn
+
+    def _attend_one_biasfuse(self, q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid = None):
+        # Fused score+bias+mask+softmax epilogue of _attend_one, behind
+        # infer_params.inkling_attn_biasfuse. Same signature and shapes as _attend_one (each caller
+        # swaps only the method name), so the switch is a checked-per-call method choice exactly as
+        # inkling_attn_keytile and inkling_attn_graph select their arms. Two full-width fp32 planes
+        # of the served body disappear:
+        #   * the (h, tt, S) RELATIVE BIAS. The served path gathers it at full context width and
+        #     then zeroes every column its `dist < rel_extent` mask rejects, so only a rel_extent-
+        #     wide band per row is ever non-zero (12.7 GiB of mostly-zeros at S=23k, T=2048). Here
+        #     the band is gathered at the point of consumption — (h, tt, min(rel_extent, cols)) per
+        #     (query tile, key block) — and scatter-added into the scores over its own columns.
+        #     Band legs are COUNTED, not searched: kv_pos is strictly increasing across a row (the
+        #     global path passes arange(S), ring_geometry passes ring columns then chunk rows), so
+        #     dist decreases monotonically and the columns with 0 <= dist < rel_extent form one
+        #     contiguous run [lo, lo + width). Entries past the run are multiplied to zero before the
+        #     add; columns that kv_valid rejects are added anyway and then masked, exactly as the
+        #     served `where` leaves them at zero before its masked_fill.
+        #   * the (h, tt, S) fp32 SCORES plane: the key axis is blocked (cols from
+        #     _attend_biasfuse_cols), so the scores exist only as (kvh, grp*tt, cols), and the
+        #     epilogue runs IN PLACE on it — masked_fill_, then sub(out=) and exp(out=) — instead of
+        #     materialising a -inf copy, an (S+1) sink concat, a softmax output plane and an fp16
+        #     weight copy.
+        # The softmax is the online (rescaled) form, seeded by the sink (m = sink, l = 1, acc = 0):
+        # exp(sink - m) = 1 folds the sink into the denominator as one term and leaves the numerator
+        # untouched, so the (S+1) concat disappears and a row whose keys are all masked keeps
+        # m = sink, l = 1 and returns zeros, as _attend_one does. Division by l is DEFERRED, so the
+        # PV partial is un-normalised and scales with attention breadth × |v|: it accumulates in
+        # fp32 and takes its single .to(v.dtype) only after /l, because fp16 (max 65504) overflowed
+        # at ~63k keys and poisoned every logit (4cb7529a, dsh-keytile-merge). Rescaling reorders
+        # the exp summation, so this arm is numerically equivalent (<=1e-4 abs), NOT bit-identical;
+        # scaling rides on q4 rather than on the scores plane, one full-plane pass cheaper and of
+        # the same order as the rescaling itself. tests/cpu/inkling_attn_biasfuse_fence.py asserts
+        # the equivalence, the band identity, the traffic census and the fp32-accumulation law.
+        h, T, d = q.shape
+        S = k.shape[0]
+        grp = self.num_kv_groups
+        kvh = self.num_kv_heads
+        ext = self.rel_extent
+        dev = q.device
+        rows = self._attend_one_tile(S, T, 4)
+        cols = self._attend_biasfuse_cols(S, rows, d, 4)
+        if cols <= ext and not (cols >= S):
+            # The budget pins blocks at the rel_extent floor: the band machinery re-launches per
+            # block without buying any block widening, so fusion is pure overhead. Fall back to the
+            # served body BEFORE any materialisation — economics, not numerics; the arms agree
+            # wherever this fires, and the census must see zero fused-side residue at the gate.
+            return self._attend_one(q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid)
+        kxf = k.transpose(0, 1).transpose(1, 2)                            # (kvh,d,S) fp16 view, no cast
+        vx = v.transpose(0, 1)                                             # (kvh,S,d), NOT expanded
+        q4 = q.view(kvh, grp, T, d).float() * self.scaling                 # scaling folded onto q
+        single = cols >= S                                                 # one block = whole cache
+        band = min(ext, cols)                                              # per-block band width
+        legs = torch.arange(band, device = dev)                            # band-local column legs
+        outs = []
+        for qs in range(0, T, rows):
+            qe = min(qs + rows, T)
+            tt = qe - qs
+            qp = q_pos[qs:qe]                                              # (tt,)
+            rel = rel_small[:, qs:qe, :]                                   # (h,tt,ext) fp32
+            snk = sink[qs:qe].T.view(kvh, grp, tt).float()                 # (kvh,grp,tt)
+            m = snk.clone()                                                # running max, sink-seeded
+            # One block covering the whole cache needs no denominator carry and no fp32 accumulator:
+            # the division happens before the value matmul there, so the fp16 PV the served arm uses
+            # stays safe and single-token decode (T == 1, always one block) gains no launches at all.
+            l = None if single else torch.ones_like(m)                     # denominator carry, sink = 1
+            acc = None if single else torch.zeros(kvh, grp, tt, d, device = dev,
+                                                  dtype = torch.float32)
+            q4t = q4[:, :, qs:qe].reshape(kvh, grp * tt, d)
+            for ks in range(0, S, cols):
+                ke = min(ks + cols, S)
+                cc = ke - ks
+                kb = kv_pos[ks:ke]                                         # (cc,)
+                dist = qp[:, None] - kb[None, :]                           # (tt,cc)
+                causal = dist >= 0
+                if kv_valid is not None:
+                    # padded ring columns join the causal refusal; all-True when every column is
+                    # real (global path, exact-fit sliding), so it cannot change a value.
+                    causal = causal & kv_valid[None, ks:ke]
+                sc = torch.matmul(q4t, kxf[:, :, ks:ke].float()).view(kvh, grp, tt, cc)
+                lo = (dist >= ext).sum(dim = 1)                            # run start, per row (tt,)
+                width = ((dist >= 0) & (dist < ext)).sum(dim = 1)          # run length, per row (tt,)
+                col = lo[:, None] + legs[None, :]                          # (tt,band) block-local cols
+                in_band = legs[None, :] < width[:, None]                   # (tt,band) legs inside the run
+                cix = col.clamp(0, cc - 1)
+                bix = (qp[:, None] - kb[cix]).clamp(0, ext - 1)            # index into rel's ext axis
+                w = min(band, cc)                                          # columns of this block the band can touch
+                bias = rel.gather(-1, bix[:, :w].unsqueeze(0).expand(h, tt, w)).mul_(in_band[:, :w][None])
+                sc.view(kvh, grp * tt, cc).scatter_add_(
+                    -1, cix[:, :w].unsqueeze(0).unsqueeze(0).expand(kvh, grp, tt, w).reshape(kvh, grp * tt, w),
+                    bias.view(kvh, grp * tt, w))
+                sc.masked_fill_(~causal.view(1, 1, tt, cc), float("-inf"))
+                m_new = torch.maximum(m, sc.amax(dim = -1))                # (kvh,grp,tt)
+                live = torch.isfinite(m_new)                               # sink-only rows stay finite
+                mm = torch.where(live, m_new, torch.zeros_like(m_new))     # !live: sc is all -inf,
+                # exp(-inf - 0) = 0 — the zeroing that _attend_one_keytile pays a full-plane where
+                # for happens here on the (kvh,grp,tt) scalars alone.
+                alpha = torch.where(live, torch.exp(m - m_new), torch.ones_like(m))
+                torch.sub(sc, mm.unsqueeze(-1), out = sc)                  # epilogue, in place
+                torch.exp(sc, out = sc)                                    # p aliases the scores plane
+                if single:
+                    # The only block: alpha is the sink's own denominator term and no earlier
+                    # partial needs rescaling, so dividing here bounds the value partial at O(|v|)
+                    # and the served arm's fp16 PV matmul stays safe (fp32 accumulation would cost
+                    # every decode step for a margin that cannot bite at one block).
+                    outs.append(torch.matmul(
+                        (sc / (alpha + sc.sum(dim = -1)).unsqueeze(-1))
+                        .reshape(kvh, grp * tt, cc).to(v.dtype),
+                        vx[:, ks:ke, :]).view(kvh, grp, tt, d))            # (kvh,grp,tt,d) fp16
+                    continue
+                l = l * alpha + sc.sum(dim = -1)
+                acc = acc * alpha.unsqueeze(-1) + torch.matmul(
+                    sc.reshape(kvh, grp * tt, cc), vx[:, ks:ke, :].float()
+                ).view(kvh, grp, tt, d)                                    # (kvh,grp,tt,d)
+                m = m_new
+            if not single:
+                outs.append((acc / l.clamp(min = 1e-30).unsqueeze(-1)).to(v.dtype))
+        attn = torch.cat(outs, dim = 2).reshape(h, T, d)
+        return attn
+
+    def _attend_fallback(self, q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid = None):
+        # The arm a declined flash-prefill pass falls back to: the shipped fuse when its own gate is
+        # on, otherwise the served body. Checked per call like every other seam here, so an
+        # INKLING-FLASHDECLINE line never leaves a round without an attention path.
+        ip = self.config.infer_params
+        attend = (self._attend_one_biasfuse if ip.inkling_attn_biasfuse
+                  else self._attend_one_keytile if ip.inkling_attn_keytile else self._attend_one)
+        return attend(q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid)
+
+    def _fa_decline(self, reason: str):
+        # Loud, once per layer: the marker line the fence and the field logs both look for.
+        if not self._fa_refused:
+            logger.warning(f"INKLING-FLASHDECLINE L{self.layer_idx:02d} {reason}: "
+                           f"the fused path serves this layer from now on")
+        self._fa_refused = True
+
+    def _fa_reason(self) -> str:
+        # Why the kernel said no, read from the extension. The lookup is TOLERANT on purpose: a
+        # decline is a soft landing, and asking for the reason must never be the thing that raises —
+        # an extension built without exl3_inkling_fa_reason would then cost this round its attention
+        # path instead of falling back. The fence pins the binding as required in bindings.cpp, so
+        # this is defence in depth, not a substitute for the binding.
+        try:
+            return str(ext.exl3_inkling_fa_reason())
+        except Exception as err:
+            return f"reason unavailable ({type(err).__name__}: {err})"
+
+    @staticmethod
+    def _fa_audit_class(T: int, S: int):
+        # Shape class of a pass: rows and cache width bucketed by bit length, so 64 rows over a 2k
+        # cache and 8k rows over a 63k cache are DIFFERENT classes and each gets its own bound.
+        return (int(T).bit_length(), int(S).bit_length())
+
+    def _attend_one_flashprefill(self, q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid = None):
+        # Hand-written sm_89 flash-prefill attention for the global cache path, behind
+        # infer_params.inkling_attn_flashprefill (default False: the seam never resolves this method,
+        # so the gate OFF path issues no query, no allocation and no kernel — byte-identical served
+        # behaviour). Same signature and return shape as _attend_one, so the switch is a checked
+        # per-call method choice exactly as inkling_attn_biasfuse and inkling_attn_l2win are.
+        #
+        # What the kernel does differently: the whole softmax lives in tensor-core accumulators and
+        # registers (no (kvh, grp*rows, cols) scores plane in memory), the relative-bias band is
+        # folded inside its key-tile loop and only for tiles that can overlap a row's band, and the
+        # online softmax is sink-seeded (m = sink*log2e, l = 1, O = 0) as _attend_one_biasfuse seeds
+        # it. Numerics: fp16 Q K^T with fp32 accumulate, fp16 P V bounded to one key tile (FA_BN = 32 keys,
+        # FA_PV_FP16_KEYS in fa_prefill.cuh) and
+        # promoted to fp32 — the bound that keeps the estate's fp16-PV overflow (65504 at ~63k keys,
+        # fixed by 4cb7529a) out of the arm. Equivalent, not bit-identical: the accumulation order
+        # differs from torch's, which the per-layer audit below measures instead of assuming.
+        h, T, d = q.shape
+        S = k.shape[0]
+        if self._fa_refused:
+            return self._attend_fallback(q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid)
+        if kv_valid is not None:
+            # The ring path (sliding layers, padded buckets) carries a per-column validity mask; the
+            # kernel serves the contiguous global cache only. Declining here is a scope statement,
+            # and the sliding seam resolves to this method only when the gate is on.
+            self._fa_decline(f"pass carries a ring-validity mask (T={T}, S={S}): kernel serves the "
+                             f"global cache path only")
+            return self._attend_fallback(q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid)
+        if T < _FA_MIN_ROWS:
+            # A pass shorter than one query tile is not what this kernel is for. Ask nothing: the
+            # extension would decline it the same way, and a short pass must not strand the layer.
+            return self._attend_fallback(q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid)
+        if (q.dtype is not torch.half or k.dtype is not torch.half or v.dtype is not torch.half
+                or rel_small.dtype is not torch.float32 or sink.dtype is not torch.float32
+                or q_pos.dtype is not torch.long or kv_pos.dtype is not torch.long
+                or d != self.head_dim or h != self.num_q_heads):
+            self._fa_decline(f"tensor contract off the kernel's (q {q.dtype}, rel "
+                             f"{rel_small.dtype}, pos {q_pos.dtype}, d={d}, h={h})")
+            return self._attend_fallback(q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid)
+
+        o = torch.empty_like(q)                                       # (h, T, d) fp16
+        nfin = torch.zeros(1, dtype = torch.int32, device = q.device)  # the kernel's own census
+        try:
+            rc = ext.exl3_inkling_fa_prefill(q, k, v, rel_small, sink, q_pos, kv_pos, o, nfin,
+                                             float(self.scaling), self.rel_extent, _FA_SMEM_BUDGET)
+        except Exception as err:            # an extension built without the kernel, or a binding miss
+            self._fa_decline(f"extension call failed: {type(err).__name__}: {err}")
+            return self._attend_fallback(q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid)
+        if not rc:
+            self._fa_decline(f"kernel declined the pass (T={T}, S={S}): {self._fa_reason()}")
+            return self._attend_fallback(q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid)
+
+        nf = int(nfin.item())
+        if nf:
+            # Non-finite output is a correctness signal, not a perf footnote: this round is served by
+            # the fused path and the arm is taken out of service with its number printed.
+            self._fa_decline(f"INKLING-FLASHNONFINITE {nf} non-finite outputs at T={T}/S={S}")
+            return self._attend_fallback(q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid)
+
+        cls = self._fa_audit_class(T, S)
+        if cls not in self._fa_audited and len(self._fa_audited) < _FA_AUDIT_CLASSES:
+            # Numerical honesty, measured on the real served input once per SHAPE CLASS: the same
+            # tensors through the fused path, and a bounded diff on the outputs. Bucketing by
+            # _fa_audit_class means the first 8k-row/63k-cache pass pays its own audit rather than
+            # inheriting a bound measured at 64 rows over a 2k cache, and the cap keeps the audit to
+            # a bounded number of duplicate attentions per layer (each one is a full fused pass).
+            self._fa_audited.add(cls)
+            ref = self._attend_fallback(q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid)
+            diff = float((o.float() - ref.float()).abs().max())
+            logger.warning(f"INKLING-FLASHAUDIT L{self.layer_idx:02d} T={T} S={S} heads={h} "
+                           f"class={cls} audited={len(self._fa_audited)} "
+                           f"maxdiff={diff:.3e} bound={_FA_AUDIT_BOUND:g} nonfinite={nf}")
+            if diff > _FA_AUDIT_BOUND:
+                self._fa_decline(f"audit diff {diff:.3e} above the {_FA_AUDIT_BOUND:g} bound")
+                return ref
+        elif cls not in self._fa_audited and not self._fa_audit_capped:
+            # The budget is spent and this pass is a shape class nobody has bounded. Say it ONCE:
+            # a log that simply stops printing INKLING-FLASHAUDIT lines reads as "still covered",
+            # which is the false reassurance this line exists to prevent.
+            self._fa_audit_capped = True
+            logger.warning(f"INKLING-FLASHAUDITCAP L{self.layer_idx:02d} class={cls} T={T} S={S}: "
+                           f"the {_FA_AUDIT_CLASSES}-class audit budget is spent, further shape "
+                           f"classes run without a measured bound")
+        return o
 
     def _attend_one_keytile(self, q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid = None):
         # Key-tiled online-softmax sibling of _attend_one, behind infer_params.inkling_attn_keytile.
@@ -1221,9 +1562,12 @@ class InklingAttention(Module):
             cache.update_layer_direct(self.layer_idx, cache_seqlens, block_table, kh, vh, t, inst)
             kv_cat_k, kv_cat_v, kv_lens = self._gather_global(
                 cache, cache_seqlens, block_table, inst, kh, vh, t, params)
-            # Checked per call: keytile swaps the attend method, the OFF arm is the served body
-            attend = (self._attend_one_keytile
-                      if self.config.infer_params.inkling_attn_keytile else self._attend_one)
+            # Checked per call: the fuse arms swap the attend method, the OFF arm is the served body
+            ip = self.config.infer_params
+            attend = (self._attend_one_flashprefill if ip.inkling_attn_flashprefill
+                      else self._attend_one_biasfuse if ip.inkling_attn_biasfuse
+                      else self._attend_one_keytile if ip.inkling_attn_keytile else self._attend_one)
+            self._l2win_round(q, b)                 # gate off: returns without touching the extension
             outs = []
             for bi in range(b):
                 S = kv_lens[bi]
@@ -1367,8 +1711,15 @@ class InklingAttention(Module):
         kv_k = torch.cat([kr, inp["kh"]], dim = 1).to(torch.half)
         kv_v = torch.cat([vr, inp["vh"]], dim = 1).to(torch.half)
         # Checked per call, matching the global arm and inkling_attn_graph's seam style
-        attend = (self._attend_one_keytile
-                  if self.config.infer_params.inkling_attn_keytile else self._attend_one)
+        ip = self.config.infer_params
+        # STRUCTURAL SCOPE, not a runtime decline: the flash-prefill kernel serves the contiguous
+        # global cache only, and every pass here carries a ring-validity mask, so the kernel is not
+        # in this chain at all. Listing it here made each of the 20 local layers print one
+        # INKLING-FLASHDECLINE and set _fa_refused for a path it could never take (routing to the
+        # kernel is decided once, statically, by `if self.sliding:` in forward_attn).
+        attend = (self._attend_one_biasfuse if ip.inkling_attn_biasfuse
+                  else self._attend_one_keytile if ip.inkling_attn_keytile else self._attend_one)
+        self._l2win_round(inp["q"], rb)             # the padded rows the round really runs
         outs = []
         for bi in range(rb):
             if extents is None:

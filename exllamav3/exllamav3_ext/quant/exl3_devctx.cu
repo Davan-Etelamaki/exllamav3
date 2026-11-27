@@ -4,6 +4,7 @@
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 #include "exl3_devctx.cuh"
+#include "exl3_l2win.cuh"
 #include "../util.h"
 #include "../util.cuh"
 
@@ -74,6 +75,17 @@ int DevCtx::get_smem_request(int device)
     return MIN(get_smem_max(device), EXL3_SMEM_MAX_DEFAULT);
 }
 
+size_t DevCtx::get_l2win_carve(int device)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    // One owner for the carve. The l2win state memoizes a single SetLimit per device and clears that
+    // memo when a genuine re-arm changes the shapes; caching a second copy here let layer 2's re-arm
+    // zero the live carve while this cache kept answering "carved", so every decode round on the card
+    // declined (dot26 boot 190495, 2026-11-27: 24 armed lines, zero windows). Read from the owner.
+    l2win_carve[device] = exl3_l2win_ctx_carve(device);
+    return l2win_carve[device];
+}
+
 void* DevCtx::get_ws(int device)
 {
     std::lock_guard<std::mutex> lock(mtx);
@@ -120,10 +132,20 @@ int g_get_smem_max(int device)
     return DevCtx::instance().get_smem_max(device);
 }
 
+size_t g_get_l2win_carve(int device)
+{
+    return DevCtx::instance().get_l2win_carve(device);
+}
+
 void prepare_ctx(int device)
 {
     DevCtx::instance().get_num_sms(device);
     DevCtx::instance().get_cc(device);
     DevCtx::instance().get_smem_max(device);
     DevCtx::instance().get_locks(device);
+    // Site 1 of the persisting-L2 window: the carve is a per-device limit taken against this
+    // context, so it belongs beside the buffers it protects. While inkling_attn_l2win is off the
+    // policy is unarmed and exl3_l2win_ctx_carve returns before its first CUDA call — no attribute
+    // query, no SetLimit, no served-path delta.
+    DevCtx::instance().get_l2win_carve(device);
 }

@@ -82,6 +82,61 @@ class InferParams:
     # test_keytile_online_softmax_fence.py pins the equivalence, the byte bound, and the rescale)
     inkling_attn_keytile: bool = False
 
+    # Fused score+bias+mask+softmax epilogue of _attend_one (Inkling 2 global attention). Two
+    # full-width fp32 planes disappear: the (h, tt, S) RELATIVE BIAS — only a rel_extent-wide band
+    # is ever non-zero, because the served path zeroes everything the dist < rel_extent mask
+    # rejects, so the band is now gathered per (query tile, key block) at the point of consumption
+    # and scatter-added into the scores — and the (h, tt, S) SCORES plane, bounded to
+    # (kvh, grp*tt, cols) by the key block, with mask/exp/max/sum applied IN PLACE on it (no -inf
+    # copy, no (S+1) sink concat, no softmax output plane, no fp16 weight copy). Softmax is the
+    # sink-seeded online form; the PV accumulation stays fp32 until after /l, because the
+    # un-normalised partial overflows fp16 (65504) at ~63k keys (fixed for the keytile arm by
+    # 4cb7529a). False (default) is the served body, byte-identical; True is numerically equivalent
+    # (<=1e-4 abs), NOT bit-identical — rescaling reorders the exp summation. Checked per call at
+    # both attend seams, so both arms run in one process without a reload.
+    # tests/cpu/inkling_attn_biasfuse_fence.py pins the equivalence, the band identity, the op/byte
+    # census and the fp16-PV regression.
+    inkling_attn_biasfuse: bool = False
+
+    # Persisting-L2 window over the decode row span (Inkling 2): carve a slice of the GPU's L2 with
+    # cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize) — once per device, at context creation —
+    # and steer one CUDA stream's accesses inside a computed VA range onto that slice with
+    # cudaStreamSetAttribute(accessPolicyWindow): hitProp=Persisting for the rows a decode step
+    # revisits (q/k/v/o projections, its norm/router/PLE rows and the relative-bias band, sized from
+    # the served h/kvh/d/rel_extent, never a remembered constant) and missProp=Streaming, which is
+    # evict-first, for everything else — so the ~32 MB of routed-expert weight reads per decode token
+    # stream through L2 instead of evicting the rows that stay hot. Split by reuse class, as the
+    # same-card Xolotl comparator does; the experts ride the default stream and lose by omission.
+    # The window is a hint, so a card or an address that cannot honour it is refused with an
+    # INKLING-L2WIN DECLINED line and the round runs with ordinary L2 behaviour — never a crash.
+    # False (default) is the served path byte-for-byte: the policy stays unarmed, so neither CUDA
+    # call is issued and no attribute is even queried. Arm per layer at load, apply per decode round
+    # on whatever stream the attention runs on (torch owns stream creation; the current stream is the
+    # handle). tests/cpu/inkling_l2win_fence.py executes the CUDA translation unit against a
+    # recording shim: it pins the call order, the carve clamp, the shape-derived window length and
+    # both refusal paths. The throughput claim is on-card pending.
+    inkling_attn_l2win: bool = False
+
+    # sm_89 flash-prefill attention kernel for Inkling 2 global attention: one hand-written kernel
+    # streams K/V tiles through shared memory (cp.async, 2 pipeline stages when the SM affords them)
+    # and keeps the whole softmax inside tensor-core accumulators, folding the rel_extent-wide
+    # relative-bias band INSIDE its key-tile loop — so the (h, rows, S) fp32 bias plane the shipped
+    # fuse eliminated stays eliminated — and seeding the online softmax from the sink, exactly as
+    # inkling_attn_biasfuse does. P V accumulates in fp16 only within one key tile (FA_BN = 32 keys,
+    # named FA_PV_FP16_KEYS in fa_prefill.cuh) and is then
+    # promoted to the fp32 output partial, which is the bound that keeps the fp16-PV overflow
+    # (65504 at ~63k keys, fixed by 4cb7529a) out of the arm. Tile sizes, stage count and shared
+    # memory are derived from the served shapes and the device's own limits, never a remembered card
+    # figure, and any budget the derivation cannot honour prints INKLING-FLASHDECLINE and lets the
+    # fused path serve the round — refuse, never crash. False (default) is the served path
+    # byte-for-byte: the seam never resolves the arm, so no query, no allocation and no kernel.
+    # True is numerically equivalent, NOT bit-identical (reordered accumulation, fp16 P), and is
+    # gated at runtime by a once-per-layer bounded-diff audit against the fused path
+    # (INKLING-FLASHAUDIT). tests/cpu/inkling_fa_prefill_fence.py compiles and RUNS the production
+    # kernel, launcher and tensor layer against a CPU shim: it pins the derivation, the refusals and
+    # the band-fold numerics, and says plainly that on-card rate is pending.
+    inkling_attn_flashprefill: bool = False
+
     # Routed-expert WEIGHT RESIDENCE ledger for the Inkling 2 MoE block: True makes
     # InklingMoE.forward census, every _MOE_EXPERTX_RECENSUS forwards, which device each routed
     # expert's weight tensors (trellis/suh/svh) live on and whether their addresses moved without
