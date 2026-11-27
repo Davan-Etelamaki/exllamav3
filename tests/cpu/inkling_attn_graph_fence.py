@@ -34,6 +34,7 @@ import pathlib
 import re
 import sys
 import types
+from collections import OrderedDict
 
 import torch
 
@@ -90,12 +91,13 @@ plan = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(plan)
 
 BASE_NS = {"torch": torch, "torch.nn.functional": torch.nn.functional,
-           "F": torch.nn.functional, "_os": os, "moe_coop_plan": plan}
+           "F": torch.nn.functional, "_os": os, "moe_coop_plan": plan,
+           "OrderedDict": OrderedDict}
 CONSTS = [n for n in TREE.body if isinstance(n, ast.Assign)
-          and getattr(n.targets[0], "id", "").startswith("_ATTEND")]
+          and getattr(n.targets[0], "id", "").startswith(("_ATTEND", "_ATTN_"))]
 NS_GEOM = run_src(CONSTS + [TOP_FN["ring_geometry"], TOP_FN["attn_extent_bucket"],
-                            TOP_FN["attn_capture_key"], METHODS["InklingConvs"]["ring_read"]],
-                  dict(BASE_NS))
+                            TOP_FN["attn_capture_key"], CLS["AttnGraphLedger"],
+                            METHODS["InklingConvs"]["ring_read"]], dict(BASE_NS))
 
 # ---------------------------------------------------------------------------
 # [1] the base scalar path, verbatim from f02a7468 (git show), as the oracle
@@ -261,17 +263,24 @@ check("rows leg == moe_coop_plan.padded_bucket_rows over a sweep",
           for r in range(1, 70)))
 check("pool identity joins the key (a moved pool cannot replay the old graph)",
       NS_GEOM["attn_capture_key"](1, 8, 1) != NS_GEOM["attn_capture_key"](1, 8, 2))
+FLOOR = NS_GEOM["_ATTN_EXTENT_FLOOR"]
 buckets_ok = True
 for need in list(range(1, 40)) + [255, 256, 257, 4095, 4096, 4097]:
     ceil = 4096 + 1
     got = NS_GEOM["attn_extent_bucket"](need, ceil)
-    if not (got >= need and got <= ceil and (got & (got - 1)) == 0 or got == ceil):
+    if not (got >= min(need, ceil) and got <= ceil and ((got & (got - 1)) == 0 or got == ceil)
+            and got >= min(FLOOR, ceil)):
         buckets_ok = False
-check("ctx bucket: never below need, never above the ceiling, power of two (or the ceiling)",
-      buckets_ok)
+check(f"ctx bucket: never below need, never above the ceiling, power of two floored at {FLOOR} "
+      f"(or the ceiling)", buckets_ok)
 check("ctx bucket is monotone and collapses ragged needs into one bucket",
       NS_GEOM["attn_extent_bucket"](3000, 4097) == NS_GEOM["attn_extent_bucket"](4096, 4097) == 4096
-      and NS_GEOM["attn_extent_bucket"](1, 4097) == 1)
+      and NS_GEOM["attn_extent_bucket"](1, 4097) == FLOOR)
+card = sorted({NS_GEOM["attn_extent_bucket"](need, 4097) for need in range(1, 4097)})
+check(f"ctx cardinality collapsed for the ledger to hold: {card}", len(card) <= 4, str(card))
+check("a window below the floor still gets an extent >= need (the cap wins, never overspends)",
+      NS_GEOM["attn_extent_bucket"](7, 8) == 8
+      and NS_GEOM["attn_extent_bucket"](2000, 4096) == 2048)
 cap_src = ast.unparse(TOP_FN["attn_capture_key"])
 check("key builder calls the shared rule, not its own ladder",
       "moe_coop_plan.padded_bucket_rows(rows)" in cap_src,
@@ -398,14 +407,142 @@ check("InferParams declares inkling_attn_graph, default OFF",
       re.search(r"inkling_attn_graph:\s*bool\s*=\s*False", param_src) is not None)
 check("the switch is read per call (both arms live in one process)",
       "self.config.infer_params.inkling_attn_graph" in off_src)
-unload_src = ast.unparse(METHODS["InklingAttention"]["unload"])
+unload_src = flat(METHODS["InklingAttention"]["unload"])
 check("unload drops the captured graphs (pool addresses die with the cache layers)",
-      "self._attn_graphs = {}" in unload_src and "cl.free()" in unload_src)
-planted_unload = unload_src.replace("self._attn_graphs = {}", "pass")
+      "self._attn_ledger.clear_resident()" in unload_src and "cl.free()" in unload_src)
+planted_unload = unload_src.replace("self._attn_ledger.clear_resident()", "pass")
 check("CONTROL: an unload that keeps the graphs trips the arm",
-      planted_unload != unload_src and "_attn_graphs" not in planted_unload)
+      planted_unload != unload_src and "clear_resident" not in planted_unload)
 check("stats are exposed for the A/B (a zero delta must be explainable)",
-      "runner" in ast.unparse(METHODS["InklingAttention"]["attn_graph_stats"]))
+      "runner" in flat(METHODS["InklingAttention"]["attn_graph_stats"]))
+
+print("[8] admission: frequency filter + LRU eviction, executed on the served ledger")
+Ledger = NS_GEOM["AttnGraphLedger"]
+HOT, COLD_A, COLD_B, COLD_C = (1, 1024, 0x10), (4, 4096, 0x10), (8, 2048, 0x10), (2, 1024, 0x10)
+
+
+def mkslot(replay):
+    return {"in": {}, "runner": types.SimpleNamespace(
+        stats = {"capture": 1, "replay": replay, "eager": 0}, disabled_reason = None)}
+
+
+led = Ledger(cap = 2, min_hits = 3)
+led.note(COLD_A)
+check("a key on its first request is NOT eligible (the frequency filter is real)",
+      not led.eligible(COLD_A) and led.hit(COLD_A) is None)
+for _ in range(3):
+    led.note(HOT)
+check("the hot key qualifies at the threshold and is admitted",
+      led.eligible(HOT) and led.admit(HOT, mkslot(1)) is None and list(led.resident) == [HOT])
+for _ in range(3):
+    led.note(COLD_A)
+led.admit(COLD_A, mkslot(2))
+led.hit(HOT)                                       # HOT is now the most-recently-used resident
+for _ in range(3):
+    led.note(COLD_B)
+evicted = led.admit(COLD_B, mkslot(3))
+check("over cap: the LEAST recently used key is evicted, the hot key survives",
+      evicted == COLD_A and list(led.resident) == [HOT, COLD_B] and led.evictions == 1,
+      f"evicted={evicted} resident={list(led.resident)}")
+tal = led.tally()
+check("evicted tallies fold into the ledger, so the log still counts every capture and replay",
+      tal["captures"] == 3 and tal["replays"] == 6 and tal["resident"] == 2, str(tal))
+check("an evicted key re-admits immediately — eviction is not the ban that killed the pilot",
+      led.eligible(COLD_A) and led.admit(COLD_A, mkslot(4)) == HOT
+      and set(led.resident) == {COLD_B, COLD_A})
+led.note(COLD_C)                                   # a key that is still below threshold
+tal2 = led.tally()
+check("request counts never reset, and a below-threshold key shows up as `waiting`",
+      led.requests[COLD_A] == 4 and tal2["waiting"] == 1 and COLD_C not in led.resident,
+      f"requests={led.requests[COLD_A]} waiting={tal2['waiting']}")
+
+
+def scenario(cls):
+    """The 2026-11-27 field sequence: cold fleet corners occupy the cap first, then a stable
+    single-row lane starts decoding. Returns whether that hot lane ever got its graph."""
+    hot, cold1, cold2 = (1, 1024, 0x10), (4, 4096, 0x10), (8, 2048, 0x10)
+    led = cls(cap = 2, min_hits = 2)
+    for key in (cold1, cold2):
+        led.note(key)
+        led.note(key)
+        led.admit(key, mkslot(1))
+    for _ in range(4):
+        led.note(hot)
+    if led.eligible(hot):
+        led.admit(hot, mkslot(1))
+    return {"hot_resident": hot in led.resident, "evictions": led.evictions,
+            "waiting": led.tally()["waiting"]}
+
+
+real = scenario(Ledger)
+check("the field sequence ends with the hot lane resident and exactly one cold key evicted",
+      real["hot_resident"] and real["evictions"] == 1, str(real))
+
+
+def ledger_variant(mut):
+    text = mut(ast.unparse(CLS["AttnGraphLedger"]))
+    ns = dict(BASE_NS)
+    exec(compile(ast.parse(text), "<ledger>", "exec"), ns)
+    return ns["AttnGraphLedger"]
+
+
+no_evict = ledger_variant(lambda s: s.replace(
+    "while len(self.resident) >= max(0, int(self.cap)):",
+    "if False:").replace(
+    "self.resident[key] = slot\n        self.resident.move_to_end(key)",
+    "if len(self.resident) < max(0, int(self.cap)):\n"
+    "            self.resident[key] = slot\n"
+    "            self.resident.move_to_end(key)"))
+broken = scenario(no_evict)
+check("CONTROL: the old refuse-forever semantics reproduce the field failure (hot key locked "
+      "out, zero evictions) and the arms catch it",
+      not broken["hot_resident"] and broken["evictions"] == 0, str(broken))
+no_filter = ledger_variant(lambda s: s.replace(
+    "return self.requests.get(key, 0) >= max(1, int(self.min_hits))", "return True"))
+nf = no_filter(cap = 2, min_hits = 5)
+nf.note((1, 1024, 0x7))
+check("CONTROL: with the frequency filter removed a one-shot key is admitted at once",
+      not led.eligible((1, 1024, 0x7)) and nf.eligible((1, 1024, 0x7)))
+check("cap and threshold are read live from infer_params (a yaml flip needs no reload)",
+      "led.cap = ip.inkling_attn_graph_max_graphs"
+      in flat(METHODS["InklingAttention"]["_sliding_capture"])
+      and "led.min_hits = ip.inkling_attn_graph_min_hits"
+      in flat(METHODS["InklingAttention"]["_sliding_capture"]))
+check("the two dials are declared with sane defaults",
+      re.search(r"inkling_attn_graph_max_graphs:\s*int\s*=\s*[1-9]", param_src) is not None
+      and re.search(r"inkling_attn_graph_min_hits:\s*int\s*=\s*[1-9]", param_src) is not None)
+
+print("[9] telemetry: engagement is readable from the log alone, no py-spy")
+SUM_NS = run_src([METHODS["InklingAttention"]["_attn_summary_line"]], dict(BASE_NS))
+shown = Ledger(cap = 4, min_hits = 32)
+for key, hits in ((HOT, 40), (COLD_B, 5)):
+    for _ in range(hits):
+        shown.note(key)
+shown.admit(HOT, mkslot(1200))
+shown.refuse("above-ladder")
+shown.refuse("above-ladder")
+shown.evictions = 1
+stub_self = types.SimpleNamespace(layer_idx = 4, _attn_ledger = shown, _attn_graph_failed = None)
+line = SUM_NS["_attn_summary_line"](stub_self)
+FIELDS = ("resident=", "cap=", "min_hits=", "waiting=", "captures=", "replays=", "eager=",
+          "evictions=", "declines=", "requests=")
+check(f"summary line carries every field the A/B greps {FIELDS}",
+      line.startswith("ATTN-GRAPH summary L04 ") and all(f in line for f in FIELDS), line)
+check("the summary reports a real replay count, not a plumbing 'ran' flag",
+      "replays=1200" in line and "declines=above-ladder:2" in line, line)
+parked = SUM_NS["_attn_summary_line"](types.SimpleNamespace(
+    layer_idx = 4, _attn_ledger = shown, _attn_graph_failed = "OutOfMemoryError"))
+check("a parked layer says why in the same line", parked.endswith("failed=OutOfMemoryError"),
+      parked[-40:])
+svc = src(LOOP)
+for marker in ("ATTN-GRAPH capture L", "ATTN-GRAPH capture-failed L", "ATTN-GRAPH summary L",
+               "sliding-graph arm off —"):
+    check(f"marker present in the served source: {marker}", marker in svc)
+check("the summary is not printed per step", NS_GEOM["_ATTN_GRAPH_LOG_EVERY"] >= 1024,
+      str(NS_GEOM["_ATTN_GRAPH_LOG_EVERY"]))
+planted_line = line.replace("replays=1200", "replays=0")
+check("CONTROL: a summary that reports zero replays would fail the field check it exists for",
+      planted_line != line and "replays=1200" not in planted_line)
 
 print()
 if fails:
@@ -414,4 +551,5 @@ if fails:
         print("  - " + f)
     sys.exit(1)
 print("VERDICT: inkling sliding-graph pilot fence GREEN "
-      f"(index identity + numerics worst maxabs {maxabs_worst:.3e}; key + seams intact)")
+      f"(index identity + numerics worst maxabs {maxabs_worst:.3e}; key, admission, eviction, "
+      f"telemetry and seams intact)")
