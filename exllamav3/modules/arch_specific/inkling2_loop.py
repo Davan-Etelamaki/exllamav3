@@ -1067,9 +1067,11 @@ class InklingMoE(Module):
         route_scale: float,
         gate_softcap: float,
         up_softcap: float,
+        layer_idx: int,
     ):
         super().__init__(config, key, None)
         self.module_name = "InklingMoE"
+        self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
@@ -1294,9 +1296,9 @@ class InklingMoE(Module):
         # invisible (witness 2026-11-27: eager python dispatch at 6.2 tok/s/lane with no
         # log naming why the grouped tier declined this pack)
         if self._coop_refuse_reason is not None and not getattr(
-            Inkling2LoopSparseMoeBlock, "_coop_decline_logged", False
+            type(self), "_coop_decline_logged", False
         ):
-            Inkling2LoopSparseMoeBlock._coop_decline_logged = True
+            type(self)._coop_decline_logged = True
             print(
                 f" !! moe coop decode DECLINED: {self._coop_refuse_reason} "
                 f"(layer {self.layer_idx}); decode runs python-dispatch"
@@ -1474,6 +1476,7 @@ class InklingLayer(Module):
         self.moe = InklingMoE(
             config, p + "mlp", hidden_size, intermediate_size, num_experts,
             num_experts_per_tok, route_scale, gate_softcap, up_softcap,
+            layer_idx = layer_idx,
         )
         self.register_submodule(self.moe)
 

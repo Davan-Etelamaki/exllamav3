@@ -166,11 +166,28 @@ check("rewind: stale stash resets replay_from to 0 with a fresh state",
       and "replay_from = 0" in rewind.group(0)
       and "self.recurrent_state = self.generator.new_recurrent_state()" in rewind.group(0))
 
-print("== [5] moe coop decline reasons are recorded ==")
+print("== [5] moe coop decline reasons are recorded and printable ==")
 lsrc = src(LOOP)
 check("refusal() branch records its reason before returning None",
       re.search(r"reason = moe_coop_plan\.refusal\(.*?if reason is not None:\s*self\._coop_refuse_reason = reason\s*return None",
                 lsrc, re.S) is not None)
+ltree = ast.parse(lsrc)
+moe_cls = next(n for n in ast.walk(ltree)
+               if isinstance(n, ast.ClassDef) and n.name == "InklingMoE")
+fns = [n for n in ast.walk(moe_cls) if isinstance(n, ast.FunctionDef)]
+init_fn = next(n for n in fns if n.name == "__init__")
+check("InklingMoE stores layer_idx (DECLINED print dereferences it)",
+      "self.layer_idx = layer_idx" in ast.unparse(init_fn)
+      and "layer_idx" in [a.arg for a in init_fn.args.args])
+decline_fn = next(n for n in fns
+                  if "_coop_decline_logged" in ast.unparse(n))
+dbg = ast.unparse(decline_fn)
+check("decline print flags use type(self), not a bare class identifier",
+      "type(self)" in dbg and "Inkling2LoopSparseMoeBlock" not in dbg)
+# CONTROL 5: reintroducing the phantom name (the 2026-11-27 boot-death NameError) trips the arm
+mut5 = dbg.replace("type(self)", "Inkling2LoopSparseMoeBlock")
+check("CONTROL: planting the phantom class name trips the type(self) arm",
+      "Inkling2LoopSparseMoeBlock" not in dbg and "Inkling2LoopSparseMoeBlock" in mut5)
 
 print()
 if fails:
