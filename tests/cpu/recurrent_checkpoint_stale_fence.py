@@ -90,12 +90,19 @@ print("== [1b] slot quarantine on failed restore ==")
 cac = src(CAC)
 _quar = re.compile(
     r"except BaseException:\s+(?:#[^\n]*\n\s+)*self\.clear_slot\(handle\)\s*"
-    r"self\.free_list\.appendleft\(handle\)\s+raise")
+    r"(?:print\([^\n]*\)\s+)?self\.free_list\.appendleft\(handle\)\s+"
+    r"(?:print\([^\n]*\)\s+)?raise")
 check("new_from_stashed clears the slot before returning it to free_list",
       _quar.search(cac) is not None)
 mut_q = cac.replace("self.clear_slot(handle)\n", "", 1)
 check("CONTROL: excising the clear call trips the quarantine arm",
       _quar.search(cac) is not None and _quar.search(mut_q) is None)
+_clr = re.compile(r"self\.clear_slot\(handle\)\s+print\(\"\[REC_EMIT\] cleared slot=")
+check("clear execution is announced by [REC_EMIT] cleared print (freeze-enumerated x1)",
+      _clr.search(cac) is not None and cac.count('[REC_EMIT] cleared ') == 1)
+mut_p = cac.replace('            print("[REC_EMIT] cleared slot=%s pos=%s" % (handle, position), flush=True)\n', "", 1)
+check("CONTROL: excising the cleared print trips the announcement arm",
+      _clr.search(cac) is not None and _clr.search(mut_p) is None)
 check("clear_slot covers non-TP and TP paths",
       "def clear_slot" in cac and "mp_cache_recurrent_clear" in cac and "l.clear(slot)" in cac)
 

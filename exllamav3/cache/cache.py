@@ -406,6 +406,7 @@ class Cache:
             # Quarantine before recycle: the failed constructor may have written the slot
             # halfway; an uncleared slot re-entering free_list carries foreign state.
             self.clear_slot(handle)
+            print("[REC_EMIT] cleared slot=%s pos=%s" % (handle, position), flush=True)
             self.free_list.appendleft(handle)
             raise
 
