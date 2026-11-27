@@ -118,12 +118,15 @@ def build(source_text, capturing = False):
         config = types.SimpleNamespace(infer_params = types.SimpleNamespace(
             inkling_moe_expert_residency_ledger = False, moe_coop_decode = True)),
         layer_idx = 7, top_k = PACK_TOPK, route_scale = 2.5, gate_softcap = 4.0,
-        up_softcap = 25.0, hidden_size = H, num_routed_experts = PACK_EXPERTS,
+        up_softcap = 25.0, hidden_size = H, num_experts = PACK_EXPERTS,
         router_w = torch.randn(PACK_EXPERTS, H, generator = torch.Generator().manual_seed(3)),
         router_bias = torch.randn(PACK_EXPERTS, generator = torch.Generator().manual_seed(4)),
         experts_g = experts_g, experts_u = experts_u, experts_d = experts_d,
         _coop_refuse_reason = "census: coop tier not exercised here",
         _coop_decode = lambda flat_, sel_, w_: None,
+        # The real InklingMoE always carries the grouped tier; this census measures the eager
+        # dispatch chain, so the grouped arm DECLINES here (mirrors _coop_decode)
+        _grouped_moe = lambda f_, s_, w_, p_, t_: None, _grouped_refuse_reason = None,
         _expertx = None, _expertx_note = lambda: None)
     return ns["forward"], stub, calls
 
@@ -210,7 +213,7 @@ def dispatch(stub, x, fused = False, window = 0):
     w_flat = w.reshape(-1)
     out = torch.zeros((b * t, h), dtype = torch.float, device = x.device)
     order_all = torch.argsort(sel_flat, stable = True)
-    counts = torch.bincount(sel_flat, minlength = stub.num_routed_experts)
+    counts = torch.bincount(sel_flat, minlength = stub.num_experts)
     chosen = torch.nonzero(counts).flatten()
     ends = torch.cumsum(counts[chosen], 0)
     bounds = torch.stack([chosen, ends], 0)

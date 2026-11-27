@@ -216,4 +216,9 @@ void exl3_device_banner(void)
 
     printf("INKLING-DEVICEPROP l2CacheSize=%lld persistingMax=%lld accessPolicyWindowMax=%lld sm=%d%d sharedMemPerBlockOptin=%lld regsPerBlock=%lld\n",
            l2_bytes, persisting_max, policy_window_max, major, minor, smem_optin, regs_per_block);
+    // The banner's whole purpose is boot-time grounding in the journal. stdout is fully
+    // buffered when the engine runs under systemd (not a tty), so without this flush the
+    // line sat in the C-runtime buffer and NEVER surfaced (measured: INKLING-DEVICEPROP
+    // 0 lines since boot on pid 394346 while the .so provably carries the printf).
+    fflush(stdout);
 }

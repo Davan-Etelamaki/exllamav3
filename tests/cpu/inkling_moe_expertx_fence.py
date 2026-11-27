@@ -315,7 +315,7 @@ def world(flag, source = None):
         config = types.SimpleNamespace(infer_params = types.SimpleNamespace(
             inkling_moe_expert_residency_ledger = flag, moe_coop_decode = True)),
         layer_idx = 3, top_k = TOPK, route_scale = 2.5, gate_softcap = 4.0, up_softcap = 25.0,
-        hidden_size = H, num_routed_experts = NE,
+        hidden_size = H, num_experts = NE,
         router_w = torch.randn(NE, H, generator = torch.Generator().manual_seed(11)),
         router_bias = torch.randn(NE, generator = torch.Generator().manual_seed(12)),
         experts_g = [Lin(H, I, 100 + e) for e in range(NE)],
@@ -323,6 +323,9 @@ def world(flag, source = None):
         experts_d = [Lin(I, H, 700 + e) for e in range(NE)],
         _coop_refuse_reason = None,
         _coop_decode = lambda flat_, sel_, w_: calls.append("coop") or None,
+        # The real InklingMoE always carries the grouped tier; this fence prices the
+        # residence ledger, so the grouped arm DECLINES here (mirrors _coop_decode)
+        _grouped_moe = lambda f_, s_, w_, p_, t_: None, _grouped_refuse_reason = None,
         _expertx = {"forwards": 3, "censuses": 1, "moves": 0, "fingerprint": (), "census": {}},
         _expertx_note = lambda: calls.append("expertx"))
     return stub, ns["forward"], calls

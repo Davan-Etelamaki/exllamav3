@@ -2042,12 +2042,6 @@ class InklingMoE(Module):
     (n_shared_experts = 0). Accumulation in fp32.
     """
 
-    # DOCUMENTED CPU-FENCE SEAM (never a config knob): tests/cpu/moe_fused_dispatch_repro.py
-    # executes the grouped tier's served body on CPU with recording ext shims standing in for
-    # the two launches; the shim arm sets this on its stub so the CUDA precondition is met by
-    # the emulator, not by weakening the served check. No served config touches it.
-    _grouped_emulate_cpu = False
-
     def __init__(
         self,
         config: Config,
@@ -2100,6 +2094,12 @@ class InklingMoE(Module):
         # Grouped multi-token tier: last decline reason only (the workspace lives in params,
         # keyed per device+generation, never on the module); cleared by every grouped call
         self._grouped_refuse_reason = None
+        # DOCUMENTED CPU-FENCE SEAM (never a config knob): tests/cpu/
+        # moe_fused_dispatch_repro.py + inkling_moe_grouped_fence.py execute the grouped
+        # tier's served body on CPU with recording ext shims standing in for the two
+        # launches; the fence arms set this on their stubs so the CUDA precondition is met
+        # by the emulator, not by weakening the served check. No served path sets it.
+        self._grouped_emulate_cpu = False
         # Residence ledger for the routed-expert weights; never touched while
         # infer_params.inkling_moe_expert_residency_ledger is False (the served default)
         self._expertx = _fresh_expertx_ledger()
@@ -2539,7 +2539,7 @@ class InklingMoE(Module):
         #     layer, then Python sorting chunk_size × top_k entries before the next launch.
         #     argsort(stable=True) is the SAME total order the host sort below produces (Python's
         #     sorted is stable and keyed on the expert id), bincount+cumsum are the group
-        #     boundaries, and the host reads only the ≤2 × num_routed_experts boundary pair
+        #     boundaries, and the host reads only the ≤2 × num_experts boundary pair
         #     instead of top_k × rows values plus a Python sort plus an order upload. Measured on
         #     CPU at rows 2048 (n = 16,384): 2.696 ms of host work per MoE layer (tolist 0.044 +
         #     sort 1.493 + upload 0.654 + group scan 0.505) → 0.448 ms including the read-back;
@@ -2557,7 +2557,7 @@ class InklingMoE(Module):
         if t > 1 and not _capturing():
             device_grouped = True
             order_all = torch.argsort(sel_flat, stable = True)
-            counts = torch.bincount(sel_flat, minlength = self.num_routed_experts)
+            counts = torch.bincount(sel_flat, minlength = self.num_experts)
             chosen = torch.nonzero(counts).flatten()
             ends = torch.cumsum(counts[chosen], 0)
             bounds = host_values(torch.stack([chosen, ends], 0), ("inkling2", "moe_bounds"))

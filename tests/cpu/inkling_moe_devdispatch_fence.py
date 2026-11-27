@@ -11,7 +11,7 @@ arms of the served source on mock experts:
   [1] EQUIVALENCE — for the same routing, the device arm and the host arm hand the SAME tokens
       to the SAME experts in the SAME group order, and their outputs are BIT-IDENTICAL (the
       per-token index_add_ sequence is unchanged, so fp32 accumulation cannot drift).
-  [2] PAYLOAD — the device arm reads ≤2 × num_routed_experts values back and uploads no order
+  [2] PAYLOAD — the device arm reads ≤2 × num_experts values back and uploads no order
       tensor at all; the host arm still reads top_k × rows values and uploads the whole order.
   [3] REGIME SEAM — t == 1 and a capturing stream take the host arm verbatim (a capture must
       keep baking the routing it recorded: frozen boundaries meeting a fresh argsort on replay
@@ -63,6 +63,37 @@ CLS = {n.name: n for n in TREE.body if isinstance(n, ast.ClassDef)}
 MOE = CLS["InklingMoE"]
 METHODS = {n.name: n for n in MOE.body if isinstance(n, ast.FunctionDef)}
 FORWARD_SRC = flat(METHODS["forward"])
+
+# ------------------------------------------------------------------ [A] phantom-attr guard
+# Installed wheel 1.6.7-07deb31a0c835 crash-looped dot26 (NRestarts=12, every boot dying in
+# the _load_autosplit dummy forward): the device arm read self.num_routed_experts, an
+# attribute ONLY these test stubs ever had. All four fences stayed GREEN because each one
+# hands the extracted forward a SimpleNamespace that CARRIES the phantom name. This arm
+# grades the real class instead of the stub: every self.<attr> InklingMoE READS must be
+# stored by InklingMoE or by its base Module (setattr(self, "...") forms audited absent).
+def self_attrs(class_node, ctx):
+    return {n.attr for n in ast.walk(class_node)
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+            and n.value.id == "self" and type(n.ctx) is ctx}
+
+def class_attrs(class_node):
+    return (self_attrs(class_node, ast.Store)
+            | {n.name for n in class_node.body
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))})
+
+BASE = ROOT / "exllamav3/modules/module.py"
+base_cls = next(n for n in ast.parse(BASE.read_text(encoding = "utf8")).body
+                if isinstance(n, ast.ClassDef) and n.name == "Module")
+phantom = sorted(self_attrs(MOE, ast.Load) - class_attrs(MOE) - class_attrs(base_cls))
+print("[A] every self.<attr> InklingMoE reads exists on the real class (phantom-crash guard)")
+check("no phantom attributes: " + (", ".join(phantom) if phantom else "none"), not phantom)
+_sab = copy.deepcopy(MOE)
+_fwd = next(n for n in _sab.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
+_fwd.body.insert(0, ast.Expr(ast.Attribute(value = ast.Name(id = "self", ctx = ast.Load()),
+                                           attr = "phantom_ctrl_zz", ctx = ast.Load())))
+check("CONTROL: planting self.phantom_ctrl_zz in forward trips this arm",
+      "phantom_ctrl_zz" in sorted(self_attrs(_sab, ast.Load) - class_attrs(_sab)
+                                  - class_attrs(base_cls)))
 
 H, I, E, TOPK = 12, 16, 8, 3
 
@@ -129,11 +160,14 @@ def build(source_text, capture = False):
         config = types.SimpleNamespace(infer_params = types.SimpleNamespace(
             inkling_moe_expert_residency_ledger = False, moe_coop_decode = True)),
         layer_idx = 5, top_k = TOPK, route_scale = 2.5, gate_softcap = 4.0, up_softcap = 25.0,
-        hidden_size = H, num_routed_experts = E, num_experts_per_tok = TOPK,
+        hidden_size = H, num_experts = E, num_experts_per_tok = TOPK,
         # Identity router: scores[r, e] == x[r, e], so a case's routing IS its first E channels
         router_w = torch.eye(E, H), router_bias = torch.zeros(E),
         experts_g = experts_g, experts_u = experts_u, experts_d = experts_d,
         _coop_refuse_reason = None, _coop_decode = lambda f, s, w: None,
+        # The real InklingMoE always carries the grouped tier; this fence prices the
+        # device-grouping chain, so the grouped arm DECLINES here (mirrors _coop_decode)
+        _grouped_moe = lambda f, s, w, p, t: None, _grouped_refuse_reason = None,
         _expertx = None, _expertx_note = lambda: None)
     return ns["forward"], stub, spy, calls
 
@@ -163,7 +197,7 @@ check("the device arm derives the order with a STABLE argsort (ties by entry ind
       "torch.argsort(sel_flat, stable=True)" in FORWARD_SRC)
 check("the device arm's boundaries are bincount over the expert id + cumsum over the CHOSEN "
       "experts only",
-      "torch.bincount(sel_flat, minlength=self.num_routed_experts)" in FORWARD_SRC
+      "torch.bincount(sel_flat, minlength=self.num_experts)" in FORWARD_SRC
       and "torch.cumsum(counts[chosen], 0)" in FORWARD_SRC)
 check("one shared group loop consumes both arms' (expert, end) pairs",
       "for e, end in groups:" in FORWARD_SRC and "entries = order_all[start:end]" in FORWARD_SRC)
