@@ -113,6 +113,22 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (scene == "default_stream")
+    {
+        // Handle 0 is cudaStreamLegacy — the stream torch actually runs the served decode on. Every
+        // other scenario here passes a fake non-zero handle, which is exactly the blind spot that let
+        // a "missing stream handle" refusal ship while the card set zero windows (dot26 boot 199198).
+        exl3_l2win_arm(0, shapes);
+        size_t carve = exl3_l2win_ctx_carve(0);
+        shim_register(g_base, g_span);
+        int64_t rc = exl3_l2win_stream(0, (uintptr_t) 0, g_base, g_rows);
+        std::printf("RESULT carve=%zu stream_rc=%lld setattr=%d refusal=%s\n",
+                    carve, (long long) rc, shim_call_count("cudaStreamSetAttribute"),
+                    exl3_l2win_refusal(0));
+        std::printf("RESULT last_window=%s\n", shim_last_call("cudaStreamSetAttribute"));
+        return 0;
+    }
+
     if (scene == "va_crossing")
     {
         // The window's tail walks past the end of the live allocation: the span is registered only

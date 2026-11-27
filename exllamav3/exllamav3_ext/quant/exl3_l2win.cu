@@ -139,9 +139,15 @@ int64_t exl3_l2win_stream(int device, uintptr_t stream, uintptr_t hot_base, int 
         set_refusal(st, st.armed ? "device carve declined" : "policy not armed");
         return -1;
     }
-    if (!stream || !hot_base || rows <= 0)
+    if (!hot_base || rows <= 0)
     {
-        set_refusal(st, "missing stream handle, hot base or rows");
+        // A zero STREAM HANDLE IS NOT A MISSING HANDLE: torch runs the served decode on the legacy
+        // default stream, whose cudaStream_t is exactly 0 (cudaStreamLegacy). Treating it as absent
+        // refused every round on the card — dot26 boot 199198, 2026-11-27: 24 layers armed at
+        // carve=49.5 MiB, then 24 x "INKLING-L2WIN DECLINED L## stream window: missing stream handle,
+        // hot base or rows" and zero cudaStreamSetAttribute calls. What a round genuinely lacks is a
+        // hot base or a row count; the binding always supplies a real current stream.
+        set_refusal(st, "missing hot base or rows");
         printf("INKLING-L2WIN DECLINED device=%d: %s\n", device, st.refusal);
         return -1;
     }

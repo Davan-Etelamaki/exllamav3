@@ -232,6 +232,21 @@ try:
           int(rres["carve_rearm"]) == CEILING and rres.get("setlimit") == "2",
           f"carve_rearm={rres.get('carve_rearm')} setlimit={rres.get('setlimit')}")
 
+    # ---- the stream handle the SERVED decode really carries: torch's default stream is handle 0.
+    #      Every other scenario passes a fake non-zero handle, so this is the one that could have
+    #      caught the on-card refusal (dot26 boot 199198: 24 armed, 24 "missing stream handle …").
+    dres, dcalls, _, _ = run_scenario(binary, "default_stream")
+    check("[1af] handle 0 (cudaStreamLegacy, what torch runs decode on) gets its window",
+          dres.get("setattr") == "1" and int(dres["stream_rc"]) >= 0
+          and dres.get("refusal", "") == "",
+          f"rc={dres.get('stream_rc')} setattr={dres.get('setattr')} "
+          f"refusal={dres.get('refusal')!r}")
+    check("[1ag] the window set on handle 0 carries the derived bytes and the reuse split",
+          (lambda w: "stream=(nil)" in w and f"num_bytes={row_b * 4}" in w
+                     and "hitProp=2" in w and "missProp=1" in w)(
+              next((c for c in dcalls if c.startswith("cudaStreamSetAttribute")), "")),
+          next((c for c in dcalls if c.startswith("cudaStreamSetAttribute")), "no window"))
+
     # ---- a smaller card: clamp through the real call site
     sres2, scalls2, _, _ = run_scenario(binary, "arm_ok", f"l2={32 << 20}")
     check("[1u] on a 32 MiB-L2 card the carve clamps to the card, SetLimit still succeeds",
@@ -610,6 +625,27 @@ tripped("per-layer re-arm drops the carve again (the dot26 fault returns)",
         (("    if (st.armed && st.shapes.h == shapes.h && st.shapes.kvh == shapes.kvh &&",
           "    if (false && st.armed && st.shapes.h == shapes.h && st.shapes.kvh == shapes.kvh &&"),),
         rearm_drops_carve)
+
+
+def zero_handle_refused(muts):
+    """Restore the bug that treated handle 0 as a missing stream: the served decode must then lose
+    its window, which is what the card showed. Proves [1af] is the check that guards the default
+    stream, rather than a check that passes because no scenario ever passed handle 0."""
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix = "l2win-mut-"))
+    try:
+        src = prepare_tree(tmp, muts)
+        binp = tmp / "probe"
+        if build(src, binp).returncode != 0:
+            return True
+        res, _, _, _ = run_scenario(binp, "default_stream")
+        return res.get("setattr") == "0" or int(res.get("stream_rc", 0)) < 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors = True)
+
+
+tripped("legacy default stream (handle 0) refused again — the dot26 fault returns",
+        (("    if (!hot_base || rows <= 0)", "    if (!stream || !hot_base || rows <= 0)"),),
+        zero_handle_refused)
 
 
 tripped("carve call dropped from prepare_ctx",
