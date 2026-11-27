@@ -88,16 +88,28 @@ def _host_lens(params: dict, seqlens) -> torch.Tensor:
 # (bucket rows R, extent C) costs about
 #   3 · R · C · kv_heads · head_dim · 2 B   (padded K, padded V, the gather output)
 #   + 2 · h · R · C · 4 B                   (relative bias + companion softmax logits, fp32)
-# → at R=1, C=1024, kvh=8, hd=128, h=24: ~65 MB; at R=8: ~520 MB. The 4090 has ONE virtual
-# address space shared by every layer's pools, which is exactly how the MoE routegraph capture
-# died (dot26: VA exhaustion while physical memory looked fine). So the per-layer cap is a
-# declared dial (config.infer_params.inkling_attn_graph_max_graphs), not a baked constant, and
-# admission is FREQUENCY-FILTERED with LRU eviction: field result 2026-11-27, dot26 pid 3970261 —
-# a hard cap of 8 filled with cold (rows-bucket × extent-bucket) corners within a minute of boot
-# and then refused the hot key FOREVER, so the capture arm engaged on zero requests.
+# → at R=1, C=1024, kvh=8, hd=128, h=24: 6.5 MB; at R=1, C=4096: 26 MB; at R=8, C=4096: 210 MB.
+# The 4090 has ONE virtual address space shared by every layer's pools, which is exactly how the
+# MoE routegraph capture died (dot26: VA exhaustion while physical memory looked fine), and the
+# served card runs at 23.47/23.59 GiB with ~13 MiB free under fleet load — measured 2026-11-28,
+# when cap=4 across ~20 sliding layers reserved ~2.1 GiB and the capture's own 20 MiB fp32
+# allocation OOMed mid-capture. So: a declared cap dial (infer_params.inkling_attn_graph_max_-
+# graphs, default 1), a PRE-CAPTURE MARGIN GATE asking 2x the estimate (attn_vram_margin_ok) that
+# refuses with decline="vram-margin" instead of fighting the allocator, and FREQUENCY-FILTERED
+# admission with LRU eviction: field result 2026-11-27, dot26 pid 3970261 — a hard cap of 8
+# filled with cold (rows-bucket × extent-bucket) corners within a minute of boot and then refused
+# the hot key FOREVER, so the capture arm engaged on zero requests.
 _ATTN_EXTENT_FLOOR = 1024      # smallest padded extent; collapses the CHEAP low end of the
                                # context axis into one key instead of one key per doubling
 _ATTN_GRAPH_LOG_EVERY = 8192   # visits per layer before an ATTN-GRAPH summary line
+_ATTN_GRAPH_MARGIN_FACTOR = 2  # free VRAM required per byte of estimated pool, before capturing
+_ATTN_GRAPH_CAPTURE_SLACK = 32 * 1024 * 1024   # plus this much for the capture forward's OWN
+                                               # temporaries: dot26 2026-11-28 died on a 20 MiB
+                                               # fp32 matmul alloc inside _attend_one at 13 MiB
+                                               # free, which the pool estimate does not cover
+_ATTN_GRAPH_WARMUPS = 2        # side-stream warmups before capture (the estate runner's number)
+_ATTN_GRAPH_MARGIN_COOLDOWN = 64   # rounds a layer waits after a vram-margin refusal, so the
+                                   # driver round-trip is not paid every step on a full card
 
 
 def attn_extent_bucket(need: int, ceiling: int, floor: int = _ATTN_EXTENT_FLOOR) -> int:
@@ -183,20 +195,23 @@ class AttnGraphLedger:
     def refuse(self, token):
         self.declines[token] = self.declines.get(token, 0) + 1
 
-    def _runner_stats(self, slot):
-        runner = slot.get("runner") if isinstance(slot, dict) else None
-        return getattr(runner, "stats", None) or {}
+    def _slot_stats(self, slot):
+        """A slot carries its own counters ({"capture", "replay", "eager"}): the layer runs its
+        own capture, so the tallies live with the graph, not on a shared runner object."""
+        if not isinstance(slot, dict):
+            return {}
+        return slot.get("stats") or getattr(slot.get("runner"), "stats", None) or {}
 
     def _fold(self, slot):
-        st = self._runner_stats(slot)
+        st = self._slot_stats(slot)
         self.folded["capture"] += st.get("capture", 0)
         self.folded["replay"] += st.get("replay", 0)
 
     def tally(self):
-        """Live totals: runner stats of resident graphs plus what eviction folded away."""
+        """Live totals: the counters of resident graphs plus what eviction folded away."""
         live = {"capture": 0, "replay": 0, "eager": 0}
         for slot in self.resident.values():
-            st = self._runner_stats(slot)
+            st = self._slot_stats(slot)
             for name in live:
                 live[name] += st.get(name, 0)
         waiting = sum(1 for key, n in self.requests.items()
@@ -223,6 +238,50 @@ def attn_capture_key(rows: int, extent: int, state_ptr: int) -> tuple | None:
     if bucket is None:
         return None
     return bucket, int(extent), int(state_ptr)
+
+
+def attn_pool_bytes(rows: int, cols: int, kv_heads: int, head_dim: int, q_heads: int) -> int:
+    """Estimated private-pool cost of ONE captured sliding-attention graph — the formula written
+    in config.py: padded K, padded V and the ring-gather output (3 · rows · cols · kv_heads ·
+    head_dim · 2 B, fp16) plus the fp32 relative-bias and companion softmax logits
+    (2 · q_heads · rows · cols · 4 B).
+
+    It deliberately does NOT include the capture forward's own fp32 temporaries: on dot26
+    2026-11-28 the allocation that actually failed was a 20 MiB fp32 matmul inside _attend_one
+    at 13 MiB of free memory, so the gate below asks for a MARGIN over this estimate, not the
+    estimate itself."""
+    return 3 * int(rows) * int(cols) * int(kv_heads) * int(head_dim) * 2 \
+        + 2 * int(q_heads) * int(rows) * int(cols) * 4
+
+
+def attn_vram_margin_ok(device, need_bytes: int, factor = _ATTN_GRAPH_MARGIN_FACTOR,
+                        slack = _ATTN_GRAPH_CAPTURE_SLACK):
+    """Pre-capture margin gate: allow a capture only when the device reports at least
+    FACTOR × need_bytes + SLACK free. Returns (ok, free_bytes, reserved_bytes).
+
+    The served 4090 runs at 23.47/23.59 GiB with ~13 MiB free under fleet load, and a capture
+    that dies halfway reserves its pool anyway (the routegraph lesson: one VA space per card).
+    The estimate passed in covers the pool, so SLACK covers what the capture forward itself
+    allocates on top of it — a 20 MiB fp32 matmul was the allocation that actually failed on
+    dot26 2026-11-28 — and FACTOR leaves room for the other layers still serving. Asking for a
+    margin turns a probable-OOM capture into a logged refusal that keeps the eager path.
+    A non-CUDA device reports ok: the graph arm is a CUDA path and a CPU probe would be a false
+    refusal."""
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    if dev.type != "cuda":
+        return True, -1, 0
+    free, _total = torch.cuda.mem_get_info(dev)
+    reserve = int(factor) * int(need_bytes) + int(slack)
+    return int(free) >= reserve, int(free), reserve
+
+
+def is_oom_error(err: BaseException) -> bool:
+    """torch raises torch.cuda.OutOfMemoryError, or a RuntimeError whose text says 'out of
+    memory' when the allocator itself fails inside a capture. Both mean the same thing here."""
+    oom = getattr(torch.cuda, "OutOfMemoryError", None)
+    if oom is not None and isinstance(err, oom):
+        return True
+    return "out of memory" in str(err).lower()
 
 
 def ring_geometry(
@@ -842,6 +901,7 @@ class InklingAttention(Module):
                                             config.infer_params.inkling_attn_graph_min_hits)
         self._attn_graph_failed = None
         self._attn_graph_logged = set()
+        self._attn_margin_wait = 0      # rounds to skip the VRAM probe after a margin refusal
 
     @override
     def optimizer_targets(self):
@@ -866,6 +926,7 @@ class InklingAttention(Module):
         # the graphs read the pool addresses cl.free() releases: drop them, never replay dead VA
         self._attn_ledger.clear_resident()
         self._attn_graph_failed = None
+        self._attn_margin_wait = 0
         super().unload()
 
     @override
@@ -1244,6 +1305,22 @@ class InklingAttention(Module):
         if slot is None:
             if not led.eligible(key):
                 return None                    # frequency filter: this key is still too young
+            if self._attn_margin_wait:
+                self._attn_margin_wait -= 1    # a full card stays full; skip the driver call
+                return None
+            need = attn_pool_bytes(key[0], key[1], self.num_kv_heads, self.head_dim,
+                                   self.num_q_heads)
+            ok, free, reserve = attn_vram_margin_ok(self.device, need)
+            if not ok:
+                # the card is where serving happens: a capture that cannot fit is a refusal, not
+                # an experiment. Dot26 2026-11-28 captured four graphs on a card with ~13 MiB
+                # free, reserved ~2.1 GiB of pools, then OOMed mid-capture and spent 640 s.
+                self._attn_margin_wait = _ATTN_GRAPH_MARGIN_COOLDOWN
+                self._record_decline(
+                    "vram-margin",
+                    f"free {free / 2 ** 20:.0f} MiB < {reserve / 2 ** 20:.0f} MiB "
+                    f"(margin for a {need / 2 ** 20:.0f} MiB pool at rows{key[0]}/cols{key[1]})")
+                return None
             slot = self._new_graph_slot(key[0], inp)
             evicted = led.admit(key, slot)
             logger.warning(f"ATTN-GRAPH capture L{self.layer_idx:02d} "
@@ -1257,22 +1334,14 @@ class InklingAttention(Module):
         rin["slots"][:b].copy_(get_for_device(params, "recurrent_slots", self.device))
         rin["slots"][b:].zero_()                                   # padded rows: slot 0, zeros
         ring_cols = extent - t
-        runner = slot["runner"]
 
         def body(params):
-            # takes params so the runner can drop params["dev_cache"] around the capture: without
-            # that, the upload the graph records is the warmup's cached device copy and every
-            # replay re-reads the warmup's positions and slots forever
+            # params is a parameter, not a closure, so the capture can drop params["dev_cache"]
+            # around itself: otherwise the upload the graph records is the warmup's cached device
+            # copy and every replay re-reads the warmup's positions and slots forever
             return self._sliding_body(rin, params, rb, t, ring_cols)
 
-        out = runner.run(key, {"params": params}, body)
-        if runner.disabled_reason is not None and self._attn_graph_failed is None:
-            # a capture that raised here will raise here again: park this layer's arm instead of
-            # paying two warmups plus a failed capture on every round, and drop the worthless slot
-            self._attn_graph_failed = runner.disabled_reason
-            led.drop(key)
-            logger.warning(f"ATTN-GRAPH capture-failed L{self.layer_idx:02d} "
-                           f"key=rows{key[0]}/cols{key[1]} — {self._attn_graph_failed}")
+        out = self._attn_round(slot, key, body, params)
         led.visits_since_log += 1
         if led.visits_since_log >= _ATTN_GRAPH_LOG_EVERY:
             led.visits_since_log = 0
@@ -1305,18 +1374,71 @@ class InklingAttention(Module):
                 pos, valid).transpose(0, 1))                             # (T,h,d)
         return torch.stack(outs).reshape(rb, t, -1).contiguous()
 
+    def _attn_round(self, slot, key, body, params):
+        """Run one round of a captured key, owning the capture HERE.
+
+        The layer deliberately does not delegate to generator.fwd_graph.ForwardGraphRunner: its
+        blanket except prints "Whole-forward CUDA graph disabled for this process", and on
+        2026-11-28 that sentence attributed a per-layer OOM to the whole-forward runner. Owning
+        the capture keeps the failure local and the log honest — an out-of-memory here degrades
+        THIS layer (park it, drop its slot, free the partial pool) and never reaches that
+        runner's process-wide disable (fwd_graph.py:131 stays what it always was: the whole
+        forward's own capture failure path).
+
+        Sequence matches the estate runner: warm up on a side stream so the allocator and
+        autotuning settle, drop params["dev_cache"] so the capture records the pinned H2D copies
+        from the staging addresses (not the warmup's cached device copies), capture, then run
+        eager once so the static buffers are re-populated before the first replay."""
+        if slot["failed"] is not None:
+            slot["stats"]["eager"] += 1
+            return body(params)                          # parked: eager only, never retry
+        if slot["graph"] is None:
+            try:
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    for _ in range(_ATTN_GRAPH_WARMUPS):
+                        body(params)
+                torch.cuda.current_stream().wait_stream(stream)
+                params.pop("dev_cache", None)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, capture_error_mode = "relaxed"):
+                    static_out = body(params)
+                params.pop("dev_cache", None)
+                slot["graph"] = graph
+                slot["out"] = static_out
+                slot["stats"]["capture"] += 1
+            except Exception as err:                     # including OutOfMemoryError
+                reason = f"{'capture out of memory' if is_oom_error(err) else type(err).__name__}" \
+                         f": {err}"
+                slot["failed"] = reason
+                self._attn_graph_failed = reason
+                self._attn_ledger.drop(key)              # returns the statics and the pool
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()             # a half-built pool is not left reserved
+                self._record_decline("capture-oom" if is_oom_error(err) else "capture-failed", reason)
+                logger.warning(
+                    f"{'ATTN-GRAPH capture-oom' if is_oom_error(err) else 'ATTN-GRAPH capture-failed'} "
+                    f"L{self.layer_idx:02d} key=rows{key[0]}/cols{key[1]} — {reason}")
+                slot["stats"]["eager"] += 1
+                return body(params)
+            slot["stats"]["eager"] += 1
+            return body(params)                          # first round after capture: eager
+        slot["graph"].replay()
+        slot["stats"]["replay"] += 1
+        return slot["out"].clone()
+
     def _new_graph_slot(self, rb, inp):
         """Static input buffers for one bucket (row count rb, everything else this round's
-        shapes) plus the runner that owns the graph. Allocated outside any capture — the first
-        round for a key is always eager (warmups)."""
-        from ...generator.fwd_graph import ForwardGraphRunner
-        # local import: exllamav3.generator's package __init__ pulls model machinery that must
-        # not be reached while the arch modules are still importing
+        shapes) plus the graph's own counters. Allocated outside any capture — the first round
+        for a key always runs the warmups eager."""
         rin = {name: torch.zeros((rb,) + tuple(src.shape[1:]), dtype = src.dtype,
                                  device = src.device)
                for name, src in inp.items()}
         rin["slots"] = torch.zeros((rb,), dtype = torch.int64, device = self.device)
-        return {"in": rin, "runner": ForwardGraphRunner()}
+        return {"in": rin, "graph": None, "out": None, "failed": None,
+                "stats": {"capture": 0, "replay": 0, "eager": 0}}
 
     def _record_decline(self, token, detail = ""):
         """Counts a decline for the telemetry line and logs it once per token — a reason that
@@ -1330,9 +1452,14 @@ class InklingAttention(Module):
     def _attn_summary_line(self):
         """The engagement evidence line. Markers, stable across releases:
           ATTN-GRAPH capture …        one per newly admitted key (with what it evicted)
-          ATTN-GRAPH capture-failed … one per layer whose capture raised
+          ATTN-GRAPH capture-oom …    one per layer whose capture ran out of memory on a
+                                      nearly-full card; that layer stands down, the process
+                                      keeps its other graphs
+          ATTN-GRAPH capture-failed … one per layer whose capture raised for another reason
           ATTN-GRAPH summary …        every _ATTN_GRAPH_LOG_EVERY visits on this layer
-          sliding-graph arm off — <token>   first occurrence of each decline reason
+          sliding-graph arm off — <token>   first occurrence of each decline reason; tokens:
+                                      above-ladder, pool-noncontiguous, cap, vram-margin,
+                                      capture-oom, capture-failed, failed
         Fields on the summary: resident, cap, min_hits, waiting, captures, replays, eager,
         evictions, declines=<token:count>, requests=<rows/cols:count for the busiest keys>,
         failed=<reason when parked>. Grepping `ATTN-GRAPH` alone answers the only question that
@@ -1352,7 +1479,7 @@ class InklingAttention(Module):
         that decides whether this ships. Off the hot path: called by the operator, not by a step."""
         led = self._attn_ledger
         tal = led.tally()
-        tal["keys"] = {f"rows{key[0]}/cols{key[1]}/pool{key[2]:x}": dict(led._runner_stats(slot))
+        tal["keys"] = {f"rows{key[0]}/cols{key[1]}/pool{key[2]:x}": dict(led._slot_stats(slot))
                        for key, slot in led.resident.items()}
         tal["failed"] = self._attn_graph_failed
         return tal
