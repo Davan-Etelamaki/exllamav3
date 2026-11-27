@@ -46,6 +46,25 @@ class InferParams:
     # the card before True means anything (tests/cpu/inkling_attn_graph_fence.py pins the seams)
     inkling_attn_graph: bool = False
 
+    # Resident captured graphs per sliding attention layer while inkling_attn_graph is on. Each
+    # graph keeps its private pool alive between rounds (the padded K/V assembly and the fp32
+    # relative-bias temporaries never return to the allocator), costing roughly
+    # 3·rows·cols·kv_heads·head_dim·2 B + 2·heads·rows·cols·4 B per graph — on the served pack
+    # about 65 MB at rows=1/cols=1024 and about 520 MB at rows=8 — and the 4090 has ONE virtual
+    # address space shared by every layer's pools, which is what the MoE routegraph capture
+    # exhausted on dot26. Admission is frequency-filtered (below) and the resident set is
+    # LRU-evicted at this cap, because a hard cap that fills with cold fleet (rows × context)
+    # corners refuses the hot key forever: the 2026-11-27 field failure where the arm engaged on
+    # zero requests. 0 disables capture even with the switch on.
+    inkling_attn_graph_max_graphs: int = 4
+
+    # Requests a (rows bucket, context bucket, pool identity) key must accumulate since boot
+    # before it qualifies for capture. Decode accrues one request per step per sliding layer, so
+    # 32 is a fraction of a second on a live lane, while a one-off joined batch or a single
+    # context crossing never parks a pool. Re-admission after an eviction is immediate: the
+    # counter never resets.
+    inkling_attn_graph_min_hits: int = 32
+
     def __init__(self):
         # With the int8 GEMV mode (on by default), separate int8 GEMV calls beat the fused MGEMM
         # only when a single matrix is wide enough to fill the GPU on its own (and K is within the
