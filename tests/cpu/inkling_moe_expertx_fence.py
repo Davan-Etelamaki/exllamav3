@@ -315,7 +315,7 @@ def world(flag, source = None):
         config = types.SimpleNamespace(infer_params = types.SimpleNamespace(
             inkling_moe_expert_residency_ledger = flag, moe_coop_decode = True)),
         layer_idx = 3, top_k = TOPK, route_scale = 2.5, gate_softcap = 4.0, up_softcap = 25.0,
-        hidden_size = H, num_routed_experts = NE,
+        hidden_size = H, num_experts = NE,
         router_w = torch.randn(NE, H, generator = torch.Generator().manual_seed(11)),
         router_bias = torch.randn(NE, generator = torch.Generator().manual_seed(12)),
         experts_g = [Lin(H, I, 100 + e) for e in range(NE)],

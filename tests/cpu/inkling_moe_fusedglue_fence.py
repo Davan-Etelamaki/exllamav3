@@ -125,7 +125,7 @@ def world(source_text, capture = False, window = 4096):
     stub = Stub(config = types.SimpleNamespace(infer_params = types.SimpleNamespace(
         inkling_moe_expert_residency_ledger = False, moe_coop_decode = True)),
         layer_idx = 9, top_k = TOPK, route_scale = 2.5, gate_softcap = 4.0, up_softcap = 25.0,
-        hidden_size = H, num_routed_experts = E,
+        hidden_size = H, num_experts = E,
         router_w = torch.eye(E, H), router_bias = torch.zeros(E),
         experts_g = experts_g, experts_u = experts_u, experts_d = experts_d,
         _coop_refuse_reason = None, _coop_decode = lambda f, s, w: None,

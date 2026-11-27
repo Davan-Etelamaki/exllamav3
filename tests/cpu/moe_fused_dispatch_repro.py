@@ -195,7 +195,7 @@ def make_stub(rec):
     return Stub(config = types.SimpleNamespace(infer_params = types.SimpleNamespace(
         inkling_moe_expert_residency_ledger = False, moe_coop_decode = True)),
         layer_idx = 7, top_k = PACK_TOPK, route_scale = 2.5, gate_softcap = 4.0,
-        up_softcap = 25.0, hidden_size = H, num_routed_experts = PACK_E,
+        up_softcap = 25.0, hidden_size = H, num_experts = PACK_E,
         router_w = torch.randn(PACK_E, H, generator = torch.Generator().manual_seed(3)),
         router_bias = torch.randn(PACK_E, generator = torch.Generator().manual_seed(4)),
         experts_g = eg, experts_u = eu, experts_d = ed,
@@ -218,7 +218,7 @@ def router(stub, flat):
 
 def grouping(sel_flat, stub):
     order_all = torch.argsort(sel_flat, stable = True)
-    counts = torch.bincount(sel_flat, minlength = stub.num_routed_experts)
+    counts = torch.bincount(sel_flat, minlength = stub.num_experts)
     chosen = torch.nonzero(counts).flatten()
     ends = torch.cumsum(counts[chosen], 0)
     bounds = torch.stack([chosen, ends], 0)
