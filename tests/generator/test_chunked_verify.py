@@ -456,3 +456,52 @@ def test_wide_chunked_round_leaves_no_page_drift_for_next_round():
         seq = job.sequences[0]
         assert sum(p.kv_position for p in seq.allocated_pages) == seq.kv_position
         assert len(seq.sequence_ids) == seq.kv_position + 1
+
+
+def test_missing_export_states_skips_drafter_update():
+    # dot26 2026-11-27 02:38, TypeError 'NoneType' object is not iterable ×46: the chunked
+    # path called update_kv_from_target with target_hidden=None when no sub-round exported
+    # hidden states, aborting every wide round while the sibling mtp branch (:2193) already
+    # honors that degradation. Absent exports must skip the dflash update outright.
+    W = 40
+    job_c, g_c, dt = _world(W, None, CAP)
+    calls = []
+    g_c.dflash_draft = True
+    g_c.draft_model = types.SimpleNamespace(
+        update_kv_from_target = lambda **kw: calls.append(kw["target_hidden"]))
+    g_c.iterate_gen([], dt)
+    assert calls == [], f"drafter update fired despite missing export states: {calls}"
+    # positive control: with export states present in every sub-round, exactly one
+    # concatenated update runs (the glue's designed single-per-round shape)
+    job2, g2, dt2 = _world(W, None, CAP)
+    calls2 = []
+    g2.dflash_draft = True
+    g2.draft_model = types.SimpleNamespace(
+        update_kv_from_target = lambda **kw: calls2.append(kw["target_hidden"]))
+    orig = g2.model.forward
+    def fwd(input_ids = None, params = None):
+        out = orig(input_ids = input_ids, params = params)
+        params["export_states"] = [torch.zeros(input_ids.shape[0], input_ids.shape[1], 4)]
+        return out
+    g2.model.forward = fwd
+    g2.iterate_gen([], dt2)
+    assert len(calls2) == 1 and isinstance(calls2[0], list) and len(calls2[0]) == 1, \
+        f"export-present chunked round must update once with the tap list, got {calls2}"
+    assert calls2[0][0].shape[1] >= W, \
+        f"concatenated tap must cover the round columns, got {calls2[0][0].shape}"
+
+
+if __name__ == "__main__":
+    tests = sorted((k, v) for k, v in globals().items()
+                   if k.startswith("test_") and callable(v))
+    assert len(tests) >= 10, f"inline collector found only {len(tests)} tests"
+    failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"PASS {name}")
+        except Exception as exc:
+            failed += 1
+            print(f"FAIL {name}: {exc}")
+    print(f"{len(tests) - failed}/{len(tests)} passed")
+    raise SystemExit(1 if failed else 0)

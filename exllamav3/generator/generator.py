@@ -2170,10 +2170,27 @@ class Generator:
             batch_ids_cat = torch.cat(win_ids, dim = 1) if len(win_ids) > 1 else win_ids[0]
             p_export_states = None
             if win_hidden[0] is not None and all(h is not None for h in win_hidden):
-                p_export_states = torch.cat(win_hidden, dim = 1) if len(win_hidden) > 1 else win_hidden[0]
+                # Each sub-round exports a TAP LIST (params["export_states"]); the concatenated
+                # column layout is per-tap, so concat tap-wise across sub-rounds and keep the
+                # list structure — update_kv_from_target asserts len(target_hidden) == n_taps
+                # (inkling2_mtp.py:257). A flat torch.cat over the list-of-lists raises
+                # "expected Tensor as element 0" — this glue line never ran green before
+                # tests/generator/test_chunked_verify.py::test_missing_export_states... proved
+                # both halves dead (dot26 2026-11-27).
+                if len(win_hidden) > 1:
+                    p_export_states = [torch.cat([w[i] for w in win_hidden], dim = 1)
+                                       for i in range(len(win_hidden[0]))]
+                else:
+                    p_export_states = win_hidden[0]
             block_index = last_block_index
             p_cache_seqlens = round_cache_seqlens
-            if self.dflash_draft:
+            if self.dflash_draft and p_export_states is not None:
+                # Same degradation the mtp branch below already honors: when a sub-round's
+                # forward exported no hidden states, win_hidden forces p_export_states None
+                # (glue rule :2171) and the drafter's ring keeps last round's context —
+                # skipping the update. Ungated, update_kv_from_target sliced None at
+                # inkling2_mtp.py:254 and aborted every chunked round (dot26 2026-11-27
+                # 02:38, TypeError 'NoneType' object is not iterable ×46).
                 update_params = {
                     "block_table": block_index,
                     "cache_seqlens": p_cache_seqlens,

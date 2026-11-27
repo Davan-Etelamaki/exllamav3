@@ -29,11 +29,17 @@ class CheckpointStale(RuntimeError):
 
 def checkpoint_is_compatible(stashed: dict, registry_keys) -> bool:
     """
-    Whether a stash was written by this exact recurrent-layer registry. Blobs without
-    registry_keys (written before this fingerprint existed) are stale by design, so the
-    disk pool self-heals on first touch.
+    Whether a stash carries a payload for THIS exact recurrent-layer registry. Blobs without
+    registry_keys (written before this fingerprint existed) are stale by design, and so are
+    blobs whose payload keys were rewritten by a serializer (the persistent tier spells tuple
+    layer keys as strings while list VALUES like registry_keys survive intact — a matching
+    fingerprint with a missing layer payload is exactly the KeyError(6,0) signature seen live
+    on dot26 2026-11-27 02:38 x16), so the disk pool self-heals on first touch.
     """
-    return stashed.get("registry_keys") == sorted(registry_keys)
+    keys = sorted(registry_keys)
+    if stashed.get("registry_keys") != keys:
+        return False
+    return all(k in stashed for k in keys)
 
 
 def mp_cache_short_conv_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):

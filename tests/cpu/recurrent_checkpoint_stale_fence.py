@@ -43,7 +43,15 @@ ssc = src(SC)
 check("CheckpointStale defined as RuntimeError",
       "class CheckpointStale(RuntimeError):" in ssc)
 check("checkpoint_is_compatible compares against sorted(registry_keys)",
-      "stashed.get(\"registry_keys\") == sorted(registry_keys)" in ssc)
+      "stashed.get(\"registry_keys\") != sorted(registry_keys)" in ssc
+      .replace("!= keys", "!= sorted(registry_keys)")
+      or "if stashed.get(\"registry_keys\") != keys" in ssc)
+check("compatibility ALSO demands a payload for every live layer (disk-tier key rewriting)",
+      "all(k in stashed for k in keys)" in ssc)
+# CONTROL 0: a fingerprint-matching blob whose payloads were re-keyed must NOT be trusted
+from exllamav3.modules.short_conv import checkpoint_is_compatible as _c
+check("CONTROL: registry_keys match + stringified payloads => incompatible",
+      _c({"registry_keys": [(6, 0)], "6,0": "blob"}, {(6, 0): None}) is False)
 check("stash() stamps registry_keys on the non-TP path",
       'stashed["registry_keys"] = sorted(registry)' in ssc)
 sc_tree = ast.parse(ssc)
@@ -66,8 +74,8 @@ check("CONTROL: excising the validation node removes every CheckpointStale raise
 print("== [2] runtime semantics ==")
 from exllamav3.modules.short_conv import CheckpointStale, checkpoint_is_compatible, ShortConvState
 
-check("matching fingerprint is compatible",
-      checkpoint_is_compatible({"registry_keys": [(6, 0)]}, {(6, 0): None}) is True)
+check("matching fingerprint with full payload is compatible",
+      checkpoint_is_compatible({"registry_keys": [(6, 0)], (6, 0): "B"}, {(6, 0): None}) is True)
 check("legacy blob (no fingerprint) is stale -> self-heals on first touch",
       checkpoint_is_compatible({}, {(6, 0): None}) is False)
 check("foreign registry is stale",
