@@ -11,6 +11,7 @@ relative-position bias and per-token sinks are not expressible in the paged kern
 """
 from __future__ import annotations
 from typing_extensions import override
+import logging
 import math
 import os as _os
 import torch
@@ -26,6 +27,8 @@ from .. import Module, Linear, RMSNorm
 from . import moe_coop_plan
 
 KEY_FLOW = "inkling_flow"
+
+logger = logging.getLogger(__name__)
 
 # Per-call byte budget for the _attend_one relative-position temporaries. Derives the query
 # tile so the largest single allocation on the long-S path stays bounded; only multi-row
@@ -76,6 +79,74 @@ def _host_lens(params: dict, seqlens) -> torch.Tensor:
     if isinstance(seqlens, torch.Tensor):
         return seqlens.cpu()
     return torch.tensor(list(seqlens))
+
+
+# Captured-graph cap per sliding attention layer. Each key owns a graph plus its private pool
+# (the padded K/V assembly and the relative-bias temporaries stay resident, not transient as in
+# the eager path), so the resident set is bounded by construction: after this many distinct
+# (bucket, extent) signatures a layer stays eager and records why (the reason is the A/B
+# validity gate — a zero delta must be explainable, exllamav3/exllamav3_ext/moe_group/README.md).
+_ATTN_GRAPH_MAX_KEYS = 8
+
+
+def attn_extent_bucket(need: int, ceiling: int) -> int:
+    """CTX leg of a sliding-layer capture key: the KV extent a captured graph may replay for.
+
+    The next power of two at or above NEED, capped at CEILING (window + chunk, the most any row
+    can hold). Rounding up is safe because every column past a row's real length carries
+    kv_valid=False (ring_geometry) and is masked out of the softmax; it is what makes the extent
+    a BUCKET instead of one capture per context length. One implementation — the fence
+    (tests/cpu/inkling_attn_graph_fence.py) refuses a second."""
+    bucket = 1 << max(int(need) - 1, 0).bit_length()
+    return min(bucket, int(ceiling))
+
+
+def attn_capture_key(rows: int, extent: int, state_ptr: int) -> tuple | None:
+    """Signature one captured sliding-layer decode graph may be replayed for:
+    (shared decode bucket, padded KV extent, recurrent-pool identity).
+
+    The rows leg is the SHARED arena rule — moe_coop_plan.padded_bucket_rows — never a re-derived
+    bucket loop, so the graph lane and the coop arena agree on the padded row count (§U). The
+    pool identity joins the key because a captured gather bakes the pool's ADDRESS: free()/alloc()
+    moves it, and a replay against the old VA would read freed storage (law 33).
+    None: above the decode ladder (prefill/mixed rows) — keep the eager path."""
+    bucket = moe_coop_plan.padded_bucket_rows(rows)
+    if bucket is None:
+        return None
+    return bucket, int(extent), int(state_ptr)
+
+
+def ring_geometry(
+    pos_first: torch.Tensor,   # (B,) int64 DEVICE: position of the first token of this chunk
+    t: int,                    # tokens in this chunk
+    window: int,               # sliding attention window
+    n_ring: int,               # ring rows per slot (InklingLayerState.k_state dim 1)
+    ring_cols: int,            # padded column count (extent - t), fixed per capture bucket
+):
+    """Sliding-window read geometry as DEVICE tensors — no host scalar enters an index.
+
+    Returns (idx, kv_pos, kv_valid, cnt):
+      idx[b, j]      = (lo_b + j) % n_ring, lo_b = max(0, pos_b + t - window) — gather against the
+                       fixed-address ring at a DEVICE index (the old code built arange(lo, lo+cnt)
+                       from python ints, which a capture freezes);
+      kv_pos[b, :]   = cat([lo_b + j for j < ring_cols, pos_b + i for i < t]) — the position of
+                       every K/V column (ring columns, then this chunk's own rows);
+      kv_valid[b, :] = False where a padded ring column is stale (j >= cnt_b) — required, not
+                       cosmetic: lo_b + cnt_b == pos_b, so the first stale column sits at
+                       dist = 0 and the causal mask alone would admit it;
+      cnt[b]         = pos_b - lo_b = ring rows this sequence really has.
+    Values match the scalar path exactly for j < cnt (fence arm 1)."""
+    dev = pos_first.device
+    lo = (pos_first + t - window).clamp(min = 0)                        # (B,)
+    cnt = pos_first - lo                                                # (B,)
+    cols = torch.arange(ring_cols, device = dev)                        # (ring_cols,)
+    idx = (lo[:, None] + cols[None, :]) % n_ring                        # (B, ring_cols)
+    kv_pos = torch.cat([lo[:, None] + cols[None, :],
+                        pos_first[:, None] + torch.arange(t, device = dev)[None, :]], dim = 1)
+    kv_valid = torch.cat([cols[None, :] < cnt[:, None],
+                          torch.ones((pos_first.shape[0], t), dtype = torch.bool, device = dev)],
+                         dim = 1)
+    return idx, kv_pos, kv_valid, cnt
 
 
 def rmsnorm_f(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -525,46 +596,46 @@ class InklingConvs(Module):
             s[slot, idx] = k[b].to(s.dtype)
             st.v_state[slot, idx] = v[b].to(s.dtype)
 
-    def ring_read(self, params: dict, seqlen: int):
+    def ring_read(self, params: dict, seqlen: int, slots: torch.Tensor,
+                  pos_first: torch.Tensor, ring_cols: int):
         """
-        Rows [lo_b, pos_b) of the ring per sequence (strict history before this chunk),
-        lo_b = max(0, pos_b + seqlen - window). Returns (k, v) as (B, R, kvh, hd) with a
-        per-row valid-length tensor and per-row lo offsets.
+        Rows [lo_b, lo_b+ring_cols) of the ring per sequence, as DEVICE-indexed gathers, with the
+        column positions and validity the attention needs. lo_b = max(0, pos_b + seqlen - window);
+        columns past a row's real length (cnt_b) are stale ring cells carried at a fixed shape and
+        masked by kv_valid, so the read has one shape per capture bucket instead of one per step.
+
+        Returns (k, v) as (B, ring_cols, kvh, hd) plus (kv_pos, kv_valid, cnt) — see ring_geometry.
+        slots and pos_first are device tensors; no python scalar reaches an index, which is what
+        froze this read under capture (fwd_graph.unsafe_types names it).
         """
         st = self._state_slot(params)[0]
         s = st.k_state
         n = s.shape[1]
-        positions = self._positions(params)
-        slots = get_for_device(params, "recurrent_slots", "cpu").tolist()
-        ks, vs, los, lens = [], [], [], []
-        for b, slot in enumerate(slots):
-            pos = int(positions[b])
-            lo = max(0, pos + seqlen - self.sliding_window)
-            cnt = max(0, pos - lo)
-            if cnt > 0:
-                idx = (lo + torch.arange(cnt, device = s.device)) % n
-                ks.append(s[slot, idx])
-                vs.append(st.v_state[slot, idx])
-            else:
-                ks.append(s[slot, :0])
-                vs.append(st.v_state[slot, :0])
-            los.append(lo)
-            lens.append(cnt)
-        mlen = max(lens)
-        def pad(rows):
-            if all(r.shape[0] == mlen for r in rows):
-                return torch.stack(rows)
-            out = torch.zeros((len(rows), mlen) + tuple(rows[0].shape[1:]), dtype = s.dtype, device = s.device)
-            for i, r in enumerate(rows):
-                out[i, :r.shape[0]] = r
-            return out
-        return pad(ks), pad(vs), los, lens
+        idx, kv_pos, kv_valid, cnt = ring_geometry(
+            pos_first, seqlen, self.sliding_window, n, ring_cols)
+        flat_idx = slots.long()[:, None] * n + idx                       # (B, ring_cols)
+        tail = tuple(s.shape[2:])
+        k = s.reshape(-1, *tail)[flat_idx]
+        v = st.v_state.reshape(-1, *tail)[flat_idx]
+        # padded columns are ZERO, as the per-row pad() left them: multiplying a valid row by 1.0
+        # is exact, so the control arm keeps every bit the old gather produced, and a captured
+        # replay never reads a stale ring cell as context. Skipped at ring_cols == 0 (the first
+        # step after prefill), where -1 in a zero-width view is ambiguous.
+        if ring_cols:
+            colmask = kv_valid[:, :ring_cols].to(s.dtype).view(-1, ring_cols, 1, 1)
+            k, v = k * colmask, v * colmask
+        return k, v, kv_pos, kv_valid, cnt
 
     def _positions(self, params: dict) -> list:
         positions = params.get("positions")
         if positions is not None:
             if isinstance(positions, torch.Tensor):
-                return positions.cpu().tolist()
+                # host_values, not .cpu(): at decode `positions` IS the generator's pinned staging
+                # buffer (prepare_flash_attn aliases it to cache_seqlens), so this returns the host
+                # original for free; a genuinely device-resident tensor inside a capture would pay
+                # a blocking D2H (cuStreamSynchronize -> CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED 900)
+                # on the recording stream, which is how every capture of this model died.
+                return host_values(positions, ("inkling2", "positions")).tolist()
             return list(positions)
         return [params.get("position", 0)] * params.get("batch_size", 1)
 
@@ -653,6 +724,13 @@ class InklingAttention(Module):
             self.kv_head_dim = head_dim
             self.kv_heads = num_kv_heads
         self.cache_layers = []
+        # Piecewise-graph state (pilot, off unless config.infer_params.inkling_attn_graph):
+        # key -> {"in": static input buffers, "runner": ForwardGraphRunner}. Cleared by unload(),
+        # because a graph round bakes the recurrent pool's address (law 33: cached device
+        # addresses die with the tensors they pin).
+        self._attn_graphs = {}
+        self._attn_graph_declined = None
+        self._attn_graph_logged = set()
 
     @override
     def optimizer_targets(self):
@@ -674,6 +752,8 @@ class InklingAttention(Module):
         for cl in getattr(self, "cache_layers", []):
             cl.free()
         self.cache_layers = []
+        # the graphs read the pool addresses cl.free() releases: drop them, never replay dead VA
+        self._attn_graphs = {}
         super().unload()
 
     @override
@@ -760,9 +840,12 @@ class InklingAttention(Module):
             cap = max(cap, 32)
         return min(int(T), cap)
 
-    def _attend_one(self, q, k, v, rel_small, sink, q_pos, kv_pos):
+    def _attend_one(self, q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid = None):
         # single sequence: q (h,T,d) half; k/v (S_,kvh,d) half; rel_small (h,T,extent) fp32;
-        # sink (T,h) fp32; q_pos (T,), kv_pos (S_,) int on device
+        # sink (T,h) fp32; q_pos (T,), kv_pos (S_,) int on device;
+        # kv_valid (S_,) bool on device: False on columns padded past this row's real extent
+        # (None = every column of k is real, which is what the global path and the exact-fit
+        # sliding path pass, so their mask tensor is bit-for-bit the one before)
         h, T, d = q.shape
         S = k.shape[0]
         grp = self.num_kv_groups
@@ -784,6 +867,11 @@ class InklingAttention(Module):
             qe = min(qs + tile, T)
             dist = q_pos[qs:qe, None] - kv_pos[None, :]                   # (tt, S)
             causal = dist >= 0
+            if kv_valid is not None:
+                # padded ring columns join the causal refusal, so they leave the softmax exactly as
+                # the old per-row slice left it. With every column valid (global path, exact-fit
+                # sliding) this AND is with an all-True row and cannot change a bit.
+                causal = causal & kv_valid[None, :]
             bias = rel_small[:, qs:qe, :].gather(                         # (h, tt, S)
                 -1, dist.clamp(0, self.rel_extent - 1).unsqueeze(0).expand(h, qe - qs, S))
             bias = torch.where((causal & (dist < self.rel_extent)).unsqueeze(0),
@@ -844,11 +932,9 @@ class InklingAttention(Module):
         sink = torch.matmul(h_q.float(), self.sink_w.T)                   # (B,T,heads)
 
         if self.sliding:
-            kr, vr, los, lens = self.convs.ring_read(params, t)           # (B,R,kvh,hd)
-            self.convs.ring_write(kh, vh, params)
-            kv_cat_k = torch.cat([kr, kh], dim = 1).to(torch.half)
-            kv_cat_v = torch.cat([vr, vh], dim = 1).to(torch.half)
-            kv_lens = [lens[i] + t for i in range(b)]
+            attn = self._attend_sliding(
+                {"q": q, "kh": kh, "vh": vh, "rel_small": rel_small, "sink": sink,
+                 "pos_row": pos_row}, params, b, t)
         else:
             cache = params["cache"]
             cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
@@ -857,24 +943,142 @@ class InklingAttention(Module):
             cache.update_layer_direct(self.layer_idx, cache_seqlens, block_table, kh, vh, t, inst)
             kv_cat_k, kv_cat_v, kv_lens = self._gather_global(
                 cache, cache_seqlens, block_table, inst, kh, vh, t, params)
-
-        outs = []
-        for bi in range(b):
-            S = kv_lens[bi]
-            if self.sliding:
-                kv_pos = torch.arange(los[bi], los[bi] + S, device = q.device)
-            else:
+            outs = []
+            for bi in range(b):
+                S = kv_lens[bi]
                 kv_pos = torch.arange(S, device = q.device)
-            q_pos = pos_row[bi]
-            o = self._attend_one(
-                q[bi], kv_cat_k[bi][:S], kv_cat_v[bi][:S], rel_small[bi], sink[bi], q_pos, kv_pos)
-            outs.append(o.transpose(0, 1))                                # (T,h,d)
-        attn = torch.stack(outs).reshape(b, t, -1).contiguous()
+                o = self._attend_one(
+                    q[bi], kv_cat_k[bi][:S], kv_cat_v[bi][:S], rel_small[bi], sink[bi], pos_row[bi],
+                    kv_pos)
+                outs.append(o.transpose(0, 1))                            # (T,h,d)
+            attn = torch.stack(outs).reshape(b, t, -1).contiguous()
 
         gate = torch.sigmoid(self.gate.forward(h_q, params).float())
         attn = (attn.float() * gate).to(torch.half)
         out = self.wo.forward(attn, params)                               # (B,T,H) fp32
         return out
+
+    def _attend_sliding(self, inp, params, b, t):
+        """Sliding-window attention for one round: control arm (eager, per-row exact extents —
+        the slicing and shapes of the pre-capture path) or capture arm (padded to the bucket,
+        one graph per (shared decode bucket, padded extent, pool identity)). Both arms read the
+        ring through ring_geometry's DEVICE indices and append with ring_write AFTER the read,
+        so the chunk's own K/V stays out of what it attends (read-before-write)."""
+        window = self.convs.sliding_window
+        pos_host = self.convs._positions(params)[:b]
+        cnts = [min(max(int(p), 0), window) for p in pos_host]           # ring rows per sequence
+        if self.config.infer_params.inkling_attn_graph and t == 1:
+            # pilot scope: single-token decode only. The shared ladder counts ROWS, and at t == 1
+            # rows == batch, so padding the batch to the bucket is padding the rows; a verify
+            # window (t > 1) would need row-padding instead. Declining it costs nothing: the
+            # control arm below runs the same math at the live shapes.
+            out = self._sliding_capture(inp, params, b, t, cnts)
+            if out is not None:
+                self.convs.ring_write(inp["kh"], inp["vh"], params)
+                return out[:b]
+        inp = dict(inp, slots=get_for_device(params, "recurrent_slots", self.device))
+        ring_cols = max(cnts) if cnts else 0
+        kr, vr, kv_pos, kv_valid, _ = self.convs.ring_read(
+            params, t, inp["slots"], inp["pos_row"][:, 0], ring_cols)
+        self.convs.ring_write(inp["kh"], inp["vh"], params)
+        return self._sliding_attend(inp, kr, vr, kv_pos, kv_valid, b, t,
+                                    [cnts[bi] + t for bi in range(b)])
+
+    def _sliding_capture(self, inp, params, b, t, cnts):
+        """Capture arm: refill this round's inputs into the bucket's static buffers, then
+        replay (or capture) the ring-read + attend body. Returns None — keep the control arm —
+        when this round is not capturable; every refusal records its reason, so a zero A/B
+        delta on dot26 is explainable instead of mysterious.
+
+        ForwardGraphRunner runs the body twice before it captures and once after, so the buffers
+        the graph bakes are the static ones (live q/kh/vh come from the allocator and move every
+        step); the body itself is side-effect free — ring_write stays outside it, which is also
+        why no on_after_warmup rewind is needed (compare the whole-forward runner's recurrent
+        advance)."""
+        st = self.convs._state_slot(params)[0]
+        pool_k, pool_v = st.k_state, st.v_state
+        extent = attn_extent_bucket(max(cnts) + t, self.convs.sliding_window + t)
+        key = attn_capture_key(b, extent, pool_k.data_ptr())
+        if key is None:
+            self._record_decline(f"{b} rows above the decode ladder "
+                                 f"{moe_coop_plan.DECODE_BUCKETS} (prefill/mixed)")
+            return None
+        if not (pool_k.is_contiguous() and pool_v.is_contiguous()):
+            # the gather addresses the pool flat; a non-contiguous pool would make reshape COPY,
+            # and a graph that baked that copy's address would read dead storage on replay
+            self._record_decline("recurrent ring pool is not contiguous")
+            return None
+        slot = self._attn_graphs.get(key)
+        if slot is None:
+            if len(self._attn_graphs) >= _ATTN_GRAPH_MAX_KEYS:
+                self._record_decline(f"{_ATTN_GRAPH_MAX_KEYS} capture keys already resident on this "
+                                     f"layer (rows x extent spread); staying eager")
+                return None
+            slot = self._new_graph_slot(key[0], inp)
+            self._attn_graphs[key] = slot
+        rin = slot["in"]
+        rb = key[0]
+        for name in ("q", "kh", "vh", "rel_small", "sink", "pos_row"):
+            rin[name][:b].copy_(inp[name])
+        rin["slots"][:b].copy_(get_for_device(params, "recurrent_slots", self.device))
+        rin["slots"][b:].zero_()                                   # padded rows: slot 0, zeros
+        ring_cols = extent - t
+        runner = slot["runner"]
+
+        def body(params):
+            # takes params so the runner can drop params["dev_cache"] around the capture: without
+            # that, the upload the graph records is the warmup's cached device copy and every
+            # replay re-reads the warmup's positions and slots forever
+            return self._sliding_body(rin, params, rb, t, ring_cols)
+
+        return runner.run(key, {"params": params}, body)
+
+    def _sliding_body(self, inp, params, rb, t, ring_cols):
+        """The captured unit: device-indexed ring read + per-row attend at one fixed shape."""
+        kr, vr, kv_pos, kv_valid, _ = self.convs.ring_read(
+            params, t, inp["slots"], inp["pos_row"][:, 0], ring_cols)
+        return self._sliding_attend(inp, kr, vr, kv_pos, kv_valid, rb, t, None)
+
+    def _sliding_attend(self, inp, kr, vr, kv_pos, kv_valid, rb, t, extents):
+        kv_k = torch.cat([kr, inp["kh"]], dim = 1).to(torch.half)
+        kv_v = torch.cat([vr, inp["vh"]], dim = 1).to(torch.half)
+        outs = []
+        for bi in range(rb):
+            if extents is None:
+                k, v, pos, valid = kv_k[bi], kv_v[bi], kv_pos[bi], kv_valid[bi]
+            else:
+                # control arm: the exact per-row column count, so kv_valid[:S] is all True and the
+                # mask, the shapes and the bits are the pre-capture path's
+                S = extents[bi]
+                k, v, pos, valid = kv_k[bi][:S], kv_v[bi][:S], kv_pos[bi][:S], kv_valid[bi][:S]
+            outs.append(self._attend_one(
+                inp["q"][bi], k, v, inp["rel_small"][bi], inp["sink"][bi], inp["pos_row"][bi],
+                pos, valid).transpose(0, 1))                             # (T,h,d)
+        return torch.stack(outs).reshape(rb, t, -1).contiguous()
+
+    def _new_graph_slot(self, rb, inp):
+        """Static input buffers for one bucket (row count rb, everything else this round's
+        shapes) plus the runner that owns the graph. Allocated outside any capture — the first
+        round for a key is always eager (warmups)."""
+        from ...generator.fwd_graph import ForwardGraphRunner
+        # local import: exllamav3.generator's package __init__ pulls model machinery that must
+        # not be reached while the arch modules are still importing
+        rin = {name: torch.zeros((rb,) + tuple(src.shape[1:]), dtype = src.dtype,
+                                 device = src.device)
+               for name, src in inp.items()}
+        rin["slots"] = torch.zeros((rb,), dtype = torch.int64, device = self.device)
+        return {"in": rin, "runner": ForwardGraphRunner()}
+
+    def _record_decline(self, reason):
+        self._attn_graph_declined = reason
+        if reason not in self._attn_graph_logged:
+            self._attn_graph_logged.add(reason)
+            logger.warning(f"InklingAttention L{self.layer_idx:02d}: sliding-graph arm off — "
+                           f"{reason}")
+
+    def attn_graph_stats(self):
+        """Capture/replay/eager counts per key, for the A/B that decides whether this ships."""
+        return {key: dict(slot["runner"].stats) for key, slot in self._attn_graphs.items()}
 
     def _pos_row(self, params: dict, b: int, t: int) -> torch.Tensor:
         position_ids = get_for_device(params, "position_ids", self.device, None)
