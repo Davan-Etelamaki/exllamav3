@@ -63,7 +63,12 @@ L2WIN_CU = QUANT / "exl3_l2win.cu"
 L2WIN_CUH = QUANT / "exl3_l2win.cuh"
 
 CEILING = 99 * 1024 * 1024 // 2           # 49.5 MiB, the Xolotl same-card carve
-SERVED = dict(h=24, kvh=2, d=256, rel=1024)
+# The PACK's own numbers, read from /home/davan/models/inkling-2-mini-exl3/config.json on 2026-11-27
+# (text_config: num_attention_heads=24, num_key_value_heads=8, head_dim=128) and confirmed by the
+# on-card arm line `shapes=h24/kvh8/d128/rel1024`. The fixture earlier carried kvh=2/d=256, which no
+# served Inkling 2 pack has — sizing checks derive from this dict, so the fix keeps them honest
+# instead of merely re-numbering them.
+SERVED = dict(h=24, kvh=8, d=128, rel=1024)
 
 fails = []
 ran = 0
