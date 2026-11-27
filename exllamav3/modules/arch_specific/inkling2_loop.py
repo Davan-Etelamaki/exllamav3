@@ -1665,6 +1665,21 @@ class InklingOutputRead(InklingBlockRead):
         return self.read(flow["bank"], x)[0].to(x.dtype)
 
 
+# Routed-expert weight-residence ledger (InklingMoE; the config switch is
+# infer_params.inkling_moe_expert_residency_ledger, default OFF). These three dials are module
+# constants, not env flags: the switch is the interface, the cadence is a property of the log.
+_MOE_EXPERTX_RECENSUS = 64        # MoE forwards between full residence censuses
+_MOE_EXPERTX_LOG_EVERY = 2048     # MoE forwards between summary lines per layer
+_MOE_EXPERTX_TENSORS = ("trellis", "suh", "svh")   # what a routed expert's GEMMs read
+
+
+def _fresh_expertx_ledger() -> dict:
+    """Empty routed-expert residence ledger. One per load epoch: InklingMoE.unload resets it,
+    because a reload re-allocates every expert's tensors and the previous addresses are gone."""
+    return {"forwards": 0, "censuses": 0, "moves": 0, "fingerprint": (),
+            "census": {"experts": 0, "device": 0, "host": 0, "missing": 0, "first_offdevice": -1}}
+
+
 class InklingMoE(Module):
     """
     Inkling2LoopSparseMoeBlock: sigmoid router with additive selection correction
@@ -1722,6 +1737,9 @@ class InklingMoE(Module):
         self._coop_by_bucket: dict = {}
         self._coop_ptrs_cache: dict | None = None
         self._coop_refuse_reason = None
+        # Residence ledger for the routed-expert weights; never touched while
+        # infer_params.inkling_moe_expert_residency_ledger is False (the served default)
+        self._expertx = _fresh_expertx_ledger()
 
     @override
     def optimizer_targets(self):
@@ -1740,6 +1758,7 @@ class InklingMoE(Module):
         self._coop_by_bucket = {}  # pointer tables pin device addresses; they die with the weights
         self._coop_ptrs_cache = None
         self._coop_refuse_reason = None
+        self._expertx = _fresh_expertx_ledger()   # new load epoch: old addresses are dead
         super().unload()
 
     @override
@@ -1896,8 +1915,94 @@ class InklingMoE(Module):
         out = args["out"]
         return out[:rows]
 
+    def _expertx_census(self) -> tuple[dict, tuple]:
+        """Residence census of THIS layer's routed-expert weights: for every expert, the device
+        type and address of the three tensors its projections read (trellis/suh/svh — the same
+        quant tensors the coop pointer tables reference, reached the same way through
+        moe_coop_plan.unwrap_linear).
+
+        The census answers one question with a number instead of a reading of the loader: is
+        there any routed-expert weight movement left for a prefetch to hide? An expert whose
+        tensors sit outside the compute device is a page-in/HtoD/cache-fetch candidate; when every
+        expert of the layer is already on the compute device, and its addresses do not move
+        between censuses, the amount of transfer a side stream could overlap is zero. A missing
+        tensor counts as off-device: while a module is unloaded nothing of it is resident."""
+        un = moe_coop_plan.unwrap_linear
+        census = {"experts": 0, "device": 0, "host": 0, "missing": 0, "first_offdevice": -1}
+        fingerprint = []
+        for g, u, d in zip(self.experts_g, self.experts_u, self.experts_d):
+            off = 0
+            for lin in (g, u, d):
+                inner = un(lin)
+                for what in _MOE_EXPERTX_TENSORS:
+                    t = getattr(inner, what, None)
+                    if t is None:
+                        census["missing"] += 1
+                        off += 1
+                        fingerprint.append(0)
+                        continue
+                    fingerprint.append(int(t.data_ptr()))
+                    if torch.device(t.device).type != "cuda":
+                        off += 1
+            census["experts"] += 1
+            if off:
+                census["host"] += 1
+                if census["first_offdevice"] < 0:
+                    census["first_offdevice"] = census["experts"] - 1
+            else:
+                census["device"] += 1
+        return census, tuple(fingerprint)
+
+    def _expertx_verdict(self) -> str:
+        """One word for what the last census saw, so a boot log is read with grep instead of
+        interpreted. all_device_resident_at_load is the NEGATIVE result a routed-expert prefetch
+        needs: nothing to hide, so no side stream is worth its risk on this pack."""
+        led = self._expertx
+        cen = led["census"]
+        if led["moves"]:
+            return "weights_moved_without_unload"
+        if cen["missing"]:
+            return f"missing_tensors:{cen['missing']}"
+        if cen["host"]:
+            return f"offdevice_experts:{cen['host']}:first_e{cen['first_offdevice']}"
+        return "all_device_resident_at_load"
+
+    def _expertx_summary_line(self) -> str:
+        led = self._expertx
+        cen = led["census"]
+        return (f"INKLING-MOE-EXPERTX L{self.layer_idx:02d} "
+                f"device_resident={cen['device']}/{cen['experts']} offdevice={cen['host']} "
+                f"missing={cen['missing']} first_offdevice={cen['first_offdevice']} "
+                f"forwards={led['forwards']} censuses={led['censuses']} moves={led['moves']} "
+                f"recensus_every={_MOE_EXPERTX_RECENSUS} log_every={_MOE_EXPERTX_LOG_EVERY} "
+                f"verdict={self._expertx_verdict()}")
+
+    def _expertx_note(self):
+        """One forward's bookkeeping for the residence ledger. Sync-free and allocation-free by
+        requirement: the full census walks the layer's experts on the first forward (so a boot
+        reports residence immediately) and then every _MOE_EXPERTX_RECENSUS forwards, and a
+        summary line leaves the log every _MOE_EXPERTX_LOG_EVERY forwards. Reading data_ptr/device
+        never touches the stream, so arming the ledger cannot reorder work, cannot add a host
+        sync to the decode step, and leaves the coop arena's row-padding contract untouched
+        (tests/cpu/inkling_moe_expertx_fence.py arms all three)."""
+        led = self._expertx
+        led["forwards"] += 1
+        if led["censuses"] == 0 or led["forwards"] % _MOE_EXPERTX_RECENSUS == 0:
+            cen, fingerprint = self._expertx_census()
+            led["censuses"] += 1
+            if led["fingerprint"] and fingerprint != led["fingerprint"]:
+                # Addresses moved with no unload() between: the weights really did move, and a
+                # prefetch lane would have work to hide (the pointer tables also refill here).
+                led["moves"] += 1
+            led["census"] = cen
+            led["fingerprint"] = fingerprint
+        if led["forwards"] == 1 or led["forwards"] % _MOE_EXPERTX_LOG_EVERY == 0:
+            logger.warning(self._expertx_summary_line())
+
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype = None) -> torch.Tensor:
+        if self.config.infer_params.inkling_moe_expert_residency_ledger:
+            self._expertx_note()
         b, t, h = x.shape
         flat = x.reshape(-1, h)
         hs = flat.float()

@@ -82,6 +82,23 @@ class InferParams:
     # test_keytile_online_softmax_fence.py pins the equivalence, the byte bound, and the rescale)
     inkling_attn_keytile: bool = False
 
+    # Routed-expert WEIGHT RESIDENCE ledger for the Inkling 2 MoE block: True makes
+    # InklingMoE.forward census, every _MOE_EXPERTX_RECENSUS forwards, which device each routed
+    # expert's weight tensors (trellis/suh/svh) live on and whether their addresses moved without
+    # unload, and log INKLING-MOE-EXPERTX every _MOE_EXPERTX_LOG_EVERY forwards. It exists to size
+    # the thing a routed-expert prefetch would have to hide: if the routed weights are already on
+    # the compute device from load onwards, no page-in/HtoD/cache-fetch per selection exists and
+    # the overlap is zero by construction (the 2026-11-27 read found exactly that: the expert
+    # Linears load onto the device in InklingMoE.load, the coop tier references them by pinned
+    # device pointer, the engine's page tiers carry K/V pages not weights, and the only
+    # host-resident weight mode — pin_linears — is gated to the vision component, while the CPU
+    # expert offload lives in modules/block_sparse_mlp_cpu.py, which this arch does not use).
+    # False (default) is the served path: the ledger is never touched, so the block stays
+    # byte-identical. Checked per call, so both arms run in one process without a reload.
+    # tests/cpu/inkling_moe_expertx_fence.py pins the census, the movement counter, the cadence,
+    # the sync-free/no-alloc armed path and this default.
+    inkling_moe_expert_residency_ledger: bool = False
+
     def __init__(self):
         # With the int8 GEMV mode (on by default), separate int8 GEMV calls beat the fused MGEMM
         # only when a single matrix is wide enough to fill the GPU on its own (and K is within the
