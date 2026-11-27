@@ -547,7 +547,13 @@ class Generator:
         self.draft_calibrator = None
         self._draft_conf_round = None
         if self.dynamic_draft and self.draft_model is not None:
-            self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
+            # bin_width 1.0 (the class default, tuned for unbounded scores) cannot resolve the
+            # drafters' probability-scale confidences in (0,1]: every label lands in ONE bin, so
+            # the threshold only ever takes the values 0 (full windows) or +inf (starve) — the
+            # prose-vs-factual oscillation measured on dot26 2026-11-26/27 (57 % vs NO-TELEMETRY).
+            # 0.05 gives 20+ bins over the unit interval; sparse bins are still skipped by
+            # min_count, and the deepseek_v4_mtp:369 len-cap path is scale-independent.
+            self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence, bin_width = 0.05)
 
 
     def num_remaining_jobs(self):
