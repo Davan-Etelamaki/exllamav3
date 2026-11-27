@@ -11,6 +11,7 @@ relative-position bias and per-token sinks are not expressible in the paged kern
 """
 from __future__ import annotations
 from typing_extensions import override
+from collections import OrderedDict
 import logging
 import math
 import os as _os
@@ -81,24 +82,132 @@ def _host_lens(params: dict, seqlens) -> torch.Tensor:
     return torch.tensor(list(seqlens))
 
 
-# Captured-graph cap per sliding attention layer. Each key owns a graph plus its private pool
-# (the padded K/V assembly and the relative-bias temporaries stay resident, not transient as in
-# the eager path), so the resident set is bounded by construction: after this many distinct
-# (bucket, extent) signatures a layer stays eager and records why (the reason is the A/B
-# validity gate — a zero delta must be explainable, exllamav3/exllamav3_ext/moe_group/README.md).
-_ATTN_GRAPH_MAX_KEYS = 8
+# CAPTURED-GRAPH COST, ADMISSION AND EVICTION.
+# A captured graph keeps its private pool RESIDENT: the padded K/V assembly and the fp32
+# relative-bias temporaries do not return to the allocator between rounds. One graph at
+# (bucket rows R, extent C) costs about
+#   3 · R · C · kv_heads · head_dim · 2 B   (padded K, padded V, the gather output)
+#   + 2 · h · R · C · 4 B                   (relative bias + companion softmax logits, fp32)
+# → at R=1, C=1024, kvh=8, hd=128, h=24: ~65 MB; at R=8: ~520 MB. The 4090 has ONE virtual
+# address space shared by every layer's pools, which is exactly how the MoE routegraph capture
+# died (dot26: VA exhaustion while physical memory looked fine). So the per-layer cap is a
+# declared dial (config.infer_params.inkling_attn_graph_max_graphs), not a baked constant, and
+# admission is FREQUENCY-FILTERED with LRU eviction: field result 2026-11-27, dot26 pid 3970261 —
+# a hard cap of 8 filled with cold (rows-bucket × extent-bucket) corners within a minute of boot
+# and then refused the hot key FOREVER, so the capture arm engaged on zero requests.
+_ATTN_EXTENT_FLOOR = 1024      # smallest padded extent; collapses the CHEAP low end of the
+                               # context axis into one key instead of one key per doubling
+_ATTN_GRAPH_LOG_EVERY = 8192   # visits per layer before an ATTN-GRAPH summary line
 
 
-def attn_extent_bucket(need: int, ceiling: int) -> int:
+def attn_extent_bucket(need: int, ceiling: int, floor: int = _ATTN_EXTENT_FLOOR) -> int:
     """CTX leg of a sliding-layer capture key: the KV extent a captured graph may replay for.
 
-    The next power of two at or above NEED, capped at CEILING (window + chunk, the most any row
-    can hold). Rounding up is safe because every column past a row's real length carries
-    kv_valid=False (ring_geometry) and is masked out of the softmax; it is what makes the extent
-    a BUCKET instead of one capture per context length. One implementation — the fence
+    The next power of two at or above NEED, floored at FLOOR and capped at CEILING (window +
+    chunk, the most any row can hold). Rounding up is safe because every column past a row's
+    real length carries kv_valid=False (ring_geometry) and is masked out of the softmax; that
+    is what makes the extent a BUCKET instead of one capture per context length. The floor is
+    the deliberate widening the field result asked for: below it a doubling of context minted a
+    new graph while the columns it saved were nearly free, and the sparse high end (where
+    padding costs real bandwidth) stays tight. One implementation — the fence
     (tests/cpu/inkling_attn_graph_fence.py) refuses a second."""
     bucket = 1 << max(int(need) - 1, 0).bit_length()
-    return min(bucket, int(ceiling))
+    return min(max(bucket, int(floor)), int(ceiling))
+
+
+class AttnGraphLedger:
+    """Per-layer admission, eviction and telemetry for piecewise attention graphs. Pure python:
+    the fence drives it directly, no CUDA and no Config (tests/cpu/inkling_attn_graph_fence.py).
+
+    · frequency filter — a key is admitted only after it has been REQUESTED min_hits times
+      since boot, so a fleet corner visited once (a transient joined batch, a one-off context
+      crossing) never parks a pool that the hot single-lane key needs;
+    · LRU eviction — admitting past cap evicts the LEAST RECENTLY USED resident key and drops
+      its slot, which returns that graph's private pool (torch releases it when the CUDAGraph
+      object dies). A refused key is not banned: re-admission is one threshold away;
+    · counters ride the log so an A/B proves engagement without py-spy: see
+      InklingAttention._attn_summary_line for the marker and field names.
+    """
+
+    def __init__(self, cap: int, min_hits: int):
+        self.resident = OrderedDict()      # key -> slot, oldest first = eviction order
+        self.requests = {}                 # key -> requests since boot (never reset)
+        self.cap = int(cap)
+        self.min_hits = int(min_hits)
+        self.visits_since_log = 0
+        self.evictions = 0
+        self.declines = {}                 # short token -> count
+        self.folded = {"capture": 0, "replay": 0}   # runner tallies kept across eviction
+
+    def note(self, key):
+        """Record that this round asked for `key`, before any admission decision."""
+        self.requests[key] = self.requests.get(key, 0) + 1
+
+    def hit(self, key):
+        """Resident slot for `key`, marked most-recently-used; None when not resident."""
+        slot = self.resident.get(key)
+        if slot is None:
+            return None
+        self.resident.move_to_end(key)
+        return slot
+
+    def eligible(self, key) -> bool:
+        return self.requests.get(key, 0) >= max(1, int(self.min_hits))
+
+    def admit(self, key, slot):
+        """Install `slot` for `key`, evicting least-recently-used residents to honour cap.
+        Returns the evicted key (or None). The cap is read live so a yaml flip takes effect."""
+        evicted = None
+        while len(self.resident) >= max(0, int(self.cap)):
+            evicted, doomed = self.resident.popitem(last = False)
+            self._fold(doomed)
+            self.evictions += 1
+        self.resident[key] = slot
+        self.resident.move_to_end(key)
+        return evicted
+
+    def drop(self, key):
+        """Remove a resident key without counting an eviction (a graph that failed to capture
+        is worthless, not merely cold)."""
+        doomed = self.resident.pop(key, None)
+        if doomed is not None:
+            self._fold(doomed)
+
+    def clear_resident(self):
+        """Unload path: the pool addresses the graphs read die with the cache layers, so drop
+        the graphs but keep the request counts (hot keys re-admit without warming again)."""
+        for doomed in self.resident.values():
+            self._fold(doomed)
+        self.resident.clear()
+
+    def refuse(self, token):
+        self.declines[token] = self.declines.get(token, 0) + 1
+
+    def _runner_stats(self, slot):
+        runner = slot.get("runner") if isinstance(slot, dict) else None
+        return getattr(runner, "stats", None) or {}
+
+    def _fold(self, slot):
+        st = self._runner_stats(slot)
+        self.folded["capture"] += st.get("capture", 0)
+        self.folded["replay"] += st.get("replay", 0)
+
+    def tally(self):
+        """Live totals: runner stats of resident graphs plus what eviction folded away."""
+        live = {"capture": 0, "replay": 0, "eager": 0}
+        for slot in self.resident.values():
+            st = self._runner_stats(slot)
+            for name in live:
+                live[name] += st.get(name, 0)
+        waiting = sum(1 for key, n in self.requests.items()
+                      if key not in self.resident and n < max(1, int(self.min_hits)))
+        return {"resident": len(self.resident), "cap": int(self.cap),
+                "min_hits": int(self.min_hits), "waiting": waiting, "evictions": self.evictions,
+                "captures": self.folded["capture"] + live["capture"],
+                "replays": self.folded["replay"] + live["replay"],
+                "eager": self.folded.get("eager", 0) + live["eager"],
+                "declines": dict(self.declines),
+                "requests": {key: n for key, n in self.requests.items()}}
 
 
 def attn_capture_key(rows: int, extent: int, state_ptr: int) -> tuple | None:
@@ -724,12 +833,14 @@ class InklingAttention(Module):
             self.kv_head_dim = head_dim
             self.kv_heads = num_kv_heads
         self.cache_layers = []
-        # Piecewise-graph state (pilot, off unless config.infer_params.inkling_attn_graph):
-        # key -> {"in": static input buffers, "runner": ForwardGraphRunner}. Cleared by unload(),
-        # because a graph round bakes the recurrent pool's address (law 33: cached device
-        # addresses die with the tensors they pin).
-        self._attn_graphs = {}
-        self._attn_graph_declined = None
+        # Piecewise-graph state (off unless config.infer_params.inkling_attn_graph): admission,
+        # eviction and telemetry for this layer's captured graphs. unload() clears the residents
+        # because a graph round bakes the recurrent pool's ADDRESS (law 33: cached device
+        # addresses die with the tensors they pin); cap and min_hits are re-read from
+        # infer_params every round, so the yaml dials move without a reload.
+        self._attn_ledger = AttnGraphLedger(config.infer_params.inkling_attn_graph_max_graphs,
+                                            config.infer_params.inkling_attn_graph_min_hits)
+        self._attn_graph_failed = None
         self._attn_graph_logged = set()
 
     @override
@@ -753,7 +864,8 @@ class InklingAttention(Module):
             cl.free()
         self.cache_layers = []
         # the graphs read the pool addresses cl.free() releases: drop them, never replay dead VA
-        self._attn_graphs = {}
+        self._attn_ledger.clear_resident()
+        self._attn_graph_failed = None
         super().unload()
 
     @override
@@ -985,37 +1097,60 @@ class InklingAttention(Module):
                                     [cnts[bi] + t for bi in range(b)])
 
     def _sliding_capture(self, inp, params, b, t, cnts):
-        """Capture arm: refill this round's inputs into the bucket's static buffers, then
-        replay (or capture) the ring-read + attend body. Returns None — keep the control arm —
-        when this round is not capturable; every refusal records its reason, so a zero A/B
-        delta on dot26 is explainable instead of mysterious.
+        """Capture arm with HOT-KEY admission: refill this round's inputs into the bucket's
+        static buffers, then replay (or capture) the ring-read + attend body. Returns None —
+        keep the control arm — when this round may not run a graph; every refusal counts its
+        reason, so a zero A/B delta stays explainable from the log instead of mysterious.
+
+        Admission (field result 2026-11-27: a hard cap of 8, filled by cold fleet corners within
+        a minute of boot, then refused the hot key forever and the arm engaged on zero requests):
+        a key must first be requested inkling_attn_graph_min_hits times since boot, and the
+        resident set is an LRU of inkling_attn_graph_max_graphs graphs — admitting past the cap
+        evicts the least-recently-used key and drops its slot, freeing that graph's private pool
+        (the 4090 has one VA space for all of them; see the ledger's cost note).
 
         ForwardGraphRunner runs the body twice before it captures and once after, so the buffers
         the graph bakes are the static ones (live q/kh/vh come from the allocator and move every
         step); the body itself is side-effect free — ring_write stays outside it, which is also
         why no on_after_warmup rewind is needed (compare the whole-forward runner's recurrent
         advance)."""
+        led = self._attn_ledger
+        ip = self.config.infer_params
+        led.cap = ip.inkling_attn_graph_max_graphs        # the dials are live: no reload needed
+        led.min_hits = ip.inkling_attn_graph_min_hits
+        if led.cap <= 0:
+            self._record_decline("cap", "inkling_attn_graph_max_graphs is 0")
+            return None
+        if self._attn_graph_failed is not None:
+            self._record_decline("failed", f"capture already failed on this layer: "
+                                           f"{self._attn_graph_failed}")
+            return None
         st = self.convs._state_slot(params)[0]
         pool_k, pool_v = st.k_state, st.v_state
         extent = attn_extent_bucket(max(cnts) + t, self.convs.sliding_window + t)
         key = attn_capture_key(b, extent, pool_k.data_ptr())
         if key is None:
-            self._record_decline(f"{b} rows above the decode ladder "
+            self._record_decline("above-ladder",
+                                 f"{b} rows above the decode ladder "
                                  f"{moe_coop_plan.DECODE_BUCKETS} (prefill/mixed)")
             return None
+        led.note(key)                                     # counted before any admission decision
         if not (pool_k.is_contiguous() and pool_v.is_contiguous()):
             # the gather addresses the pool flat; a non-contiguous pool would make reshape COPY,
             # and a graph that baked that copy's address would read dead storage on replay
-            self._record_decline("recurrent ring pool is not contiguous")
+            self._record_decline("pool-noncontiguous",
+                                 "the flat gather would copy, freezing a dead address in the graph")
             return None
-        slot = self._attn_graphs.get(key)
+        slot = led.hit(key)
         if slot is None:
-            if len(self._attn_graphs) >= _ATTN_GRAPH_MAX_KEYS:
-                self._record_decline(f"{_ATTN_GRAPH_MAX_KEYS} capture keys already resident on this "
-                                     f"layer (rows x extent spread); staying eager")
-                return None
+            if not led.eligible(key):
+                return None                    # frequency filter: this key is still too young
             slot = self._new_graph_slot(key[0], inp)
-            self._attn_graphs[key] = slot
+            evicted = led.admit(key, slot)
+            logger.warning(f"ATTN-GRAPH capture L{self.layer_idx:02d} "
+                           f"key=rows{key[0]}/cols{key[1]}/pool{key[2]:x} "
+                           f"hits={led.requests[key]} resident={len(led.resident)} cap={led.cap}"
+                           + (f" evicted=rows{evicted[0]}/cols{evicted[1]}" if evicted else ""))
         rin = slot["in"]
         rb = key[0]
         for name in ("q", "kh", "vh", "rel_small", "sink", "pos_row"):
@@ -1031,7 +1166,19 @@ class InklingAttention(Module):
             # replay re-reads the warmup's positions and slots forever
             return self._sliding_body(rin, params, rb, t, ring_cols)
 
-        return runner.run(key, {"params": params}, body)
+        out = runner.run(key, {"params": params}, body)
+        if runner.disabled_reason is not None and self._attn_graph_failed is None:
+            # a capture that raised here will raise here again: park this layer's arm instead of
+            # paying two warmups plus a failed capture on every round, and drop the worthless slot
+            self._attn_graph_failed = runner.disabled_reason
+            led.drop(key)
+            logger.warning(f"ATTN-GRAPH capture-failed L{self.layer_idx:02d} "
+                           f"key=rows{key[0]}/cols{key[1]} — {self._attn_graph_failed}")
+        led.visits_since_log += 1
+        if led.visits_since_log >= _ATTN_GRAPH_LOG_EVERY:
+            led.visits_since_log = 0
+            logger.warning(self._attn_summary_line())
+        return out
 
     def _sliding_body(self, inp, params, rb, t, ring_cols):
         """The captured unit: device-indexed ring read + per-row attend at one fixed shape."""
@@ -1069,16 +1216,44 @@ class InklingAttention(Module):
         rin["slots"] = torch.zeros((rb,), dtype = torch.int64, device = self.device)
         return {"in": rin, "runner": ForwardGraphRunner()}
 
-    def _record_decline(self, reason):
-        self._attn_graph_declined = reason
-        if reason not in self._attn_graph_logged:
-            self._attn_graph_logged.add(reason)
+    def _record_decline(self, token, detail = ""):
+        """Counts a decline for the telemetry line and logs it once per token — a reason that
+        repeats every round is a fact about the traffic, already in the count, not a new event."""
+        self._attn_ledger.refuse(token)
+        if token not in self._attn_graph_logged:
+            self._attn_graph_logged.add(token)
             logger.warning(f"InklingAttention L{self.layer_idx:02d}: sliding-graph arm off — "
-                           f"{reason}")
+                           f"{token}: {detail}")
+
+    def _attn_summary_line(self):
+        """The engagement evidence line. Markers, stable across releases:
+          ATTN-GRAPH capture …        one per newly admitted key (with what it evicted)
+          ATTN-GRAPH capture-failed … one per layer whose capture raised
+          ATTN-GRAPH summary …        every _ATTN_GRAPH_LOG_EVERY visits on this layer
+          sliding-graph arm off — <token>   first occurrence of each decline reason
+        Fields on the summary: resident, cap, min_hits, waiting, captures, replays, eager,
+        evictions, declines=<token:count>, requests=<rows/cols:count for the busiest keys>,
+        failed=<reason when parked>. Grepping `ATTN-GRAPH` alone answers the only question that
+        mattered on 2026-11-27: did the arm ever engage — no py-spy needed."""
+        tal = self._attn_ledger.tally()
+        declines = "|".join(f"{k}:{v}" for k, v in sorted(tal["declines"].items())) or "-"
+        busy = sorted(tal["requests"].items(), key = lambda kv: (-kv[1], str(kv[0])))[:6]
+        requests = "|".join(f"rows{k[0]}/cols{k[1]}:{n}" for k, n in busy) or "-"
+        line = (f"ATTN-GRAPH summary L{self.layer_idx:02d} resident={tal['resident']} cap={tal['cap']} "
+                f"min_hits={tal['min_hits']} waiting={tal['waiting']} "
+                f"captures={tal['captures']} replays={tal['replays']} eager={tal['eager']} "
+                f"evictions={tal['evictions']} declines={declines} requests={requests}")
+        return line if self._attn_graph_failed is None else line + f" failed={self._attn_graph_failed}"
 
     def attn_graph_stats(self):
-        """Capture/replay/eager counts per key, for the A/B that decides whether this ships."""
-        return {key: dict(slot["runner"].stats) for key, slot in self._attn_graphs.items()}
+        """Capture/replay/eager totals, admission state and per-key runner stats, for the A/B
+        that decides whether this ships. Off the hot path: called by the operator, not by a step."""
+        led = self._attn_ledger
+        tal = led.tally()
+        tal["keys"] = {f"rows{key[0]}/cols{key[1]}/pool{key[2]:x}": dict(led._runner_stats(slot))
+                       for key, slot in led.resident.items()}
+        tal["failed"] = self._attn_graph_failed
+        return tal
 
     def _pos_row(self, params: dict, b: int, t: int) -> torch.Tensor:
         position_ids = get_for_device(params, "position_ids", self.device, None)
