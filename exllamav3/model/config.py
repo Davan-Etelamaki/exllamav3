@@ -82,6 +82,22 @@ class InferParams:
     # test_keytile_online_softmax_fence.py pins the equivalence, the byte bound, and the rescale)
     inkling_attn_keytile: bool = False
 
+    # Fused score+bias+mask+softmax epilogue of _attend_one (Inkling 2 global attention). Two
+    # full-width fp32 planes disappear: the (h, tt, S) RELATIVE BIAS — only a rel_extent-wide band
+    # is ever non-zero, because the served path zeroes everything the dist < rel_extent mask
+    # rejects, so the band is now gathered per (query tile, key block) at the point of consumption
+    # and scatter-added into the scores — and the (h, tt, S) SCORES plane, bounded to
+    # (kvh, grp*tt, cols) by the key block, with mask/exp/max/sum applied IN PLACE on it (no -inf
+    # copy, no (S+1) sink concat, no softmax output plane, no fp16 weight copy). Softmax is the
+    # sink-seeded online form; the PV accumulation stays fp32 until after /l, because the
+    # un-normalised partial overflows fp16 (65504) at ~63k keys (fixed for the keytile arm by
+    # 4cb7529a). False (default) is the served body, byte-identical; True is numerically equivalent
+    # (<=1e-4 abs), NOT bit-identical — rescaling reorders the exp summation. Checked per call at
+    # both attend seams, so both arms run in one process without a reload.
+    # tests/cpu/inkling_attn_biasfuse_fence.py pins the equivalence, the band identity, the op/byte
+    # census and the fp16-PV regression.
+    inkling_attn_biasfuse: bool = False
+
     # Routed-expert WEIGHT RESIDENCE ledger for the Inkling 2 MoE block: True makes
     # InklingMoE.forward census, every _MOE_EXPERTX_RECENSUS forwards, which device each routed
     # expert's weight tensors (trellis/suh/svh) live on and whether their addresses moved without

@@ -1044,6 +1044,32 @@ class InklingAttention(Module):
         cols = max(self.rel_extent, cols)                        # floor: one full relative window
         return min(S, max(1, cols))
 
+    def _attend_biasfuse_cols(self, S, rows, d, itemsize):
+        """Largest key block whose dominant fp32 temporaries fit the per-call byte budget.
+
+        The keytile budget (_attend_keytile_cols) charges TWO row-scaled planes per column — the
+        scores and the (h, rows, cols) relative bias. This arm never builds that bias plane: the
+        bias exists only as a rel_extent-wide band per row (h * rows * rel_extent * 4 bytes, a
+        column-independent reserve) and the softmax epilogue runs in place on the scores plane, so
+        the row-scaled cost per column is one plane, not two. Same budget, same rel_extent floor
+        and same S cap: a short cache stays one block (launch-neutral) while the served long-S
+        prefill buys a wider block out of the same ceiling."""
+        S = int(S)
+        rows = max(1, int(rows))
+        budget = getattr(self, "attend_tile_bytes", _ATTEND_TILE_BYTES)
+        if torch.cuda.is_available():
+            free = int(torch.cuda.mem_get_info()[0])
+            budget = min(budget, max(8 * 1024 * 1024, free // 2))
+        h = self.num_kv_heads * self.num_kv_groups
+        kvh = self.num_kv_heads
+        budget -= h * rows * self.rel_extent * itemsize          # the band reserve, once
+        per_col = h * rows * itemsize + 2 * kvh * d * itemsize   # scores plane + fp32 K and V casts
+        if per_col <= 0 or budget <= 0:
+            return min(S, max(1, self.rel_extent))
+        cols = budget // per_col
+        cols = max(self.rel_extent, cols)                        # floor: one full relative window
+        return min(S, max(1, cols))
+
     def _attend_one(self, q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid = None):
         # single sequence: q (h,T,d) half; k/v (S_,kvh,d) half; rel_small (h,T,extent) fp32;
         # sink (T,h) fp32; q_pos (T,), kv_pos (S_,) int on device;
@@ -1122,6 +1148,125 @@ class InklingAttention(Module):
             # (kvh,S,d) needs no expand; each row's weighted sum over S is unchanged.
             outs.append(torch.matmul(w.reshape(kvh, grp * (qe - qs), S), vx)
                         .view(kvh, grp, qe - qs, d))                      # (kvh,grp,tt,d)
+        attn = torch.cat(outs, dim = 2).reshape(h, T, d)
+        return attn
+
+    def _attend_one_biasfuse(self, q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid = None):
+        # Fused score+bias+mask+softmax epilogue of _attend_one, behind
+        # infer_params.inkling_attn_biasfuse. Same signature and shapes as _attend_one (each caller
+        # swaps only the method name), so the switch is a checked-per-call method choice exactly as
+        # inkling_attn_keytile and inkling_attn_graph select their arms. Two full-width fp32 planes
+        # of the served body disappear:
+        #   * the (h, tt, S) RELATIVE BIAS. The served path gathers it at full context width and
+        #     then zeroes every column its `dist < rel_extent` mask rejects, so only a rel_extent-
+        #     wide band per row is ever non-zero (12.7 GiB of mostly-zeros at S=23k, T=2048). Here
+        #     the band is gathered at the point of consumption — (h, tt, min(rel_extent, cols)) per
+        #     (query tile, key block) — and scatter-added into the scores over its own columns.
+        #     Band legs are COUNTED, not searched: kv_pos is strictly increasing across a row (the
+        #     global path passes arange(S), ring_geometry passes ring columns then chunk rows), so
+        #     dist decreases monotonically and the columns with 0 <= dist < rel_extent form one
+        #     contiguous run [lo, lo + width). Entries past the run are multiplied to zero before the
+        #     add; columns that kv_valid rejects are added anyway and then masked, exactly as the
+        #     served `where` leaves them at zero before its masked_fill.
+        #   * the (h, tt, S) fp32 SCORES plane: the key axis is blocked (cols from
+        #     _attend_biasfuse_cols), so the scores exist only as (kvh, grp*tt, cols), and the
+        #     epilogue runs IN PLACE on it — masked_fill_, then sub(out=) and exp(out=) — instead of
+        #     materialising a -inf copy, an (S+1) sink concat, a softmax output plane and an fp16
+        #     weight copy.
+        # The softmax is the online (rescaled) form, seeded by the sink (m = sink, l = 1, acc = 0):
+        # exp(sink - m) = 1 folds the sink into the denominator as one term and leaves the numerator
+        # untouched, so the (S+1) concat disappears and a row whose keys are all masked keeps
+        # m = sink, l = 1 and returns zeros, as _attend_one does. Division by l is DEFERRED, so the
+        # PV partial is un-normalised and scales with attention breadth × |v|: it accumulates in
+        # fp32 and takes its single .to(v.dtype) only after /l, because fp16 (max 65504) overflowed
+        # at ~63k keys and poisoned every logit (4cb7529a, dsh-keytile-merge). Rescaling reorders
+        # the exp summation, so this arm is numerically equivalent (<=1e-4 abs), NOT bit-identical;
+        # scaling rides on q4 rather than on the scores plane, one full-plane pass cheaper and of
+        # the same order as the rescaling itself. tests/cpu/inkling_attn_biasfuse_fence.py asserts
+        # the equivalence, the band identity, the traffic census and the fp32-accumulation law.
+        h, T, d = q.shape
+        S = k.shape[0]
+        grp = self.num_kv_groups
+        kvh = self.num_kv_heads
+        ext = self.rel_extent
+        dev = q.device
+        rows = self._attend_one_tile(S, T, 4)
+        cols = self._attend_biasfuse_cols(S, rows, d, 4)
+        if cols <= ext and not (cols >= S):
+            # The budget pins blocks at the rel_extent floor: the band machinery re-launches per
+            # block without buying any block widening, so fusion is pure overhead. Fall back to the
+            # served body BEFORE any materialisation — economics, not numerics; the arms agree
+            # wherever this fires, and the census must see zero fused-side residue at the gate.
+            return self._attend_one(q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid)
+        kxf = k.transpose(0, 1).transpose(1, 2)                            # (kvh,d,S) fp16 view, no cast
+        vx = v.transpose(0, 1)                                             # (kvh,S,d), NOT expanded
+        q4 = q.view(kvh, grp, T, d).float() * self.scaling                 # scaling folded onto q
+        single = cols >= S                                                 # one block = whole cache
+        band = min(ext, cols)                                              # per-block band width
+        legs = torch.arange(band, device = dev)                            # band-local column legs
+        outs = []
+        for qs in range(0, T, rows):
+            qe = min(qs + rows, T)
+            tt = qe - qs
+            qp = q_pos[qs:qe]                                              # (tt,)
+            rel = rel_small[:, qs:qe, :]                                   # (h,tt,ext) fp32
+            snk = sink[qs:qe].T.view(kvh, grp, tt).float()                 # (kvh,grp,tt)
+            m = snk.clone()                                                # running max, sink-seeded
+            # One block covering the whole cache needs no denominator carry and no fp32 accumulator:
+            # the division happens before the value matmul there, so the fp16 PV the served arm uses
+            # stays safe and single-token decode (T == 1, always one block) gains no launches at all.
+            l = None if single else torch.ones_like(m)                     # denominator carry, sink = 1
+            acc = None if single else torch.zeros(kvh, grp, tt, d, device = dev,
+                                                  dtype = torch.float32)
+            q4t = q4[:, :, qs:qe].reshape(kvh, grp * tt, d)
+            for ks in range(0, S, cols):
+                ke = min(ks + cols, S)
+                cc = ke - ks
+                kb = kv_pos[ks:ke]                                         # (cc,)
+                dist = qp[:, None] - kb[None, :]                           # (tt,cc)
+                causal = dist >= 0
+                if kv_valid is not None:
+                    # padded ring columns join the causal refusal; all-True when every column is
+                    # real (global path, exact-fit sliding), so it cannot change a value.
+                    causal = causal & kv_valid[None, ks:ke]
+                sc = torch.matmul(q4t, kxf[:, :, ks:ke].float()).view(kvh, grp, tt, cc)
+                lo = (dist >= ext).sum(dim = 1)                            # run start, per row (tt,)
+                width = ((dist >= 0) & (dist < ext)).sum(dim = 1)          # run length, per row (tt,)
+                col = lo[:, None] + legs[None, :]                          # (tt,band) block-local cols
+                in_band = legs[None, :] < width[:, None]                   # (tt,band) legs inside the run
+                cix = col.clamp(0, cc - 1)
+                bix = (qp[:, None] - kb[cix]).clamp(0, ext - 1)            # index into rel's ext axis
+                w = min(band, cc)                                          # columns of this block the band can touch
+                bias = rel.gather(-1, bix[:, :w].unsqueeze(0).expand(h, tt, w)).mul_(in_band[:, :w][None])
+                sc.view(kvh, grp * tt, cc).scatter_add_(
+                    -1, cix[:, :w].unsqueeze(0).unsqueeze(0).expand(kvh, grp, tt, w).reshape(kvh, grp * tt, w),
+                    bias.view(kvh, grp * tt, w))
+                sc.masked_fill_(~causal.view(1, 1, tt, cc), float("-inf"))
+                m_new = torch.maximum(m, sc.amax(dim = -1))                # (kvh,grp,tt)
+                live = torch.isfinite(m_new)                               # sink-only rows stay finite
+                mm = torch.where(live, m_new, torch.zeros_like(m_new))     # !live: sc is all -inf,
+                # exp(-inf - 0) = 0 — the zeroing that _attend_one_keytile pays a full-plane where
+                # for happens here on the (kvh,grp,tt) scalars alone.
+                alpha = torch.where(live, torch.exp(m - m_new), torch.ones_like(m))
+                torch.sub(sc, mm.unsqueeze(-1), out = sc)                  # epilogue, in place
+                torch.exp(sc, out = sc)                                    # p aliases the scores plane
+                if single:
+                    # The only block: alpha is the sink's own denominator term and no earlier
+                    # partial needs rescaling, so dividing here bounds the value partial at O(|v|)
+                    # and the served arm's fp16 PV matmul stays safe (fp32 accumulation would cost
+                    # every decode step for a margin that cannot bite at one block).
+                    outs.append(torch.matmul(
+                        (sc / (alpha + sc.sum(dim = -1)).unsqueeze(-1))
+                        .reshape(kvh, grp * tt, cc).to(v.dtype),
+                        vx[:, ks:ke, :]).view(kvh, grp, tt, d))            # (kvh,grp,tt,d) fp16
+                    continue
+                l = l * alpha + sc.sum(dim = -1)
+                acc = acc * alpha.unsqueeze(-1) + torch.matmul(
+                    sc.reshape(kvh, grp * tt, cc), vx[:, ks:ke, :].float()
+                ).view(kvh, grp, tt, d)                                    # (kvh,grp,tt,d)
+                m = m_new
+            if not single:
+                outs.append((acc / l.clamp(min = 1e-30).unsqueeze(-1)).to(v.dtype))
         attn = torch.cat(outs, dim = 2).reshape(h, T, d)
         return attn
 
@@ -1221,9 +1366,10 @@ class InklingAttention(Module):
             cache.update_layer_direct(self.layer_idx, cache_seqlens, block_table, kh, vh, t, inst)
             kv_cat_k, kv_cat_v, kv_lens = self._gather_global(
                 cache, cache_seqlens, block_table, inst, kh, vh, t, params)
-            # Checked per call: keytile swaps the attend method, the OFF arm is the served body
-            attend = (self._attend_one_keytile
-                      if self.config.infer_params.inkling_attn_keytile else self._attend_one)
+            # Checked per call: the fuse arms swap the attend method, the OFF arm is the served body
+            ip = self.config.infer_params
+            attend = (self._attend_one_biasfuse if ip.inkling_attn_biasfuse
+                      else self._attend_one_keytile if ip.inkling_attn_keytile else self._attend_one)
             outs = []
             for bi in range(b):
                 S = kv_lens[bi]
@@ -1367,8 +1513,9 @@ class InklingAttention(Module):
         kv_k = torch.cat([kr, inp["kh"]], dim = 1).to(torch.half)
         kv_v = torch.cat([vr, inp["vh"]], dim = 1).to(torch.half)
         # Checked per call, matching the global arm and inkling_attn_graph's seam style
-        attend = (self._attend_one_keytile
-                  if self.config.infer_params.inkling_attn_keytile else self._attend_one)
+        ip = self.config.infer_params
+        attend = (self._attend_one_biasfuse if ip.inkling_attn_biasfuse
+                  else self._attend_one_keytile if ip.inkling_attn_keytile else self._attend_one)
         outs = []
         for bi in range(rb):
             if extents is None:
