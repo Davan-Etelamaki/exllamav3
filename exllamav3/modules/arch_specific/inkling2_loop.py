@@ -56,7 +56,17 @@ _ATTEND_K_CHUNK_BYTES = int(_os.environ.get("INKLING_ATTEND_K_CHUNK_BYTES", 64 *
 # legitimately produce and far below anything that would move a logit.
 _FA_MIN_ROWS = 64
 _FA_AUDIT_BOUND = 2e-2
-_FA_AUDIT_CLASSES = 4          # per layer: one audit per (T,S) shape class, at most this many
+_FA_AUDIT_CLASSES = 8          # per layer: one audit per (T,S) shape class, at most this many.
+                               # Served-config arithmetic (window 262,144, chunk_size 2,048, global
+                               # layers 5/11/17/23): a 63,387-token prefill runs full chunks at
+                               # T=2,048 (bit_length 12) while the cache walks 2,048 → 61,440, whose
+                               # bit_lengths are 12,13,14,15,16 = 5 classes; the final partial chunk
+                               # (1,947 rows → 11) is a 6th; decode adds one more every time the cache
+                               # crosses a power of two (T=1 → bit_length 1), so 7 and 8 cover the
+                               # first two crossings. Cost stays bounded: one duplicate fused pass per
+                               # class per global layer = 8 × 4 = 32 extra passes per session. The
+                               # 4 this replaces was exceeded inside the ingest itself, silently —
+                               # reaching the cap now prints INKLING-FLASHAUDITCAP once per layer.
 _FA_SMEM_BUDGET = 0            # 0 = no caller cap: fa_prefill_plan sizes the block against the device
 
 
@@ -923,6 +933,7 @@ class InklingAttention(Module):
         self._l2win_dev_idx = 0
         self._fa_refused = False
         self._fa_audited = set()      # (T,S) shape classes already bounded, see _fa_audit_class
+        self._fa_audit_capped = False  # the cap-exhausted line is printed once per layer, not per pass
         # sm_89 flash-prefill kernel state (infer_params.inkling_attn_flashprefill, off by default):
         # refused means a pass was declined and this layer stops asking, so a card or a geometry the
         # kernel cannot serve pays one probe and one INKLING-FLASHDECLINE line, not one per round;
@@ -1382,7 +1393,8 @@ class InklingAttention(Module):
         # registers (no (kvh, grp*rows, cols) scores plane in memory), the relative-bias band is
         # folded inside its key-tile loop and only for tiles that can overlap a row's band, and the
         # online softmax is sink-seeded (m = sink*log2e, l = 1, O = 0) as _attend_one_biasfuse seeds
-        # it. Numerics: fp16 Q K^T with fp32 accumulate, fp16 P V bounded to one 16-key slice and
+        # it. Numerics: fp16 Q K^T with fp32 accumulate, fp16 P V bounded to one key tile (FA_BN = 32 keys,
+        # FA_PV_FP16_KEYS in fa_prefill.cuh) and
         # promoted to fp32 — the bound that keeps the estate's fp16-PV overflow (65504 at ~63k keys,
         # fixed by 4cb7529a) out of the arm. Equivalent, not bit-identical: the accumulation order
         # differs from torch's, which the per-layer audit below measures instead of assuming.
@@ -1444,6 +1456,14 @@ class InklingAttention(Module):
             if diff > _FA_AUDIT_BOUND:
                 self._fa_decline(f"audit diff {diff:.3e} above the {_FA_AUDIT_BOUND:g} bound")
                 return ref
+        elif cls not in self._fa_audited and not self._fa_audit_capped:
+            # The budget is spent and this pass is a shape class nobody has bounded. Say it ONCE:
+            # a log that simply stops printing INKLING-FLASHAUDIT lines reads as "still covered",
+            # which is the false reassurance this line exists to prevent.
+            self._fa_audit_capped = True
+            logger.warning(f"INKLING-FLASHAUDITCAP L{self.layer_idx:02d} class={cls} T={T} S={S}: "
+                           f"the {_FA_AUDIT_CLASSES}-class audit budget is spent, further shape "
+                           f"classes run without a measured bound")
         return o
 
     def _attend_one_keytile(self, q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid = None):
@@ -1692,8 +1712,12 @@ class InklingAttention(Module):
         kv_v = torch.cat([vr, inp["vh"]], dim = 1).to(torch.half)
         # Checked per call, matching the global arm and inkling_attn_graph's seam style
         ip = self.config.infer_params
-        attend = (self._attend_one_flashprefill if ip.inkling_attn_flashprefill
-                  else self._attend_one_biasfuse if ip.inkling_attn_biasfuse
+        # STRUCTURAL SCOPE, not a runtime decline: the flash-prefill kernel serves the contiguous
+        # global cache only, and every pass here carries a ring-validity mask, so the kernel is not
+        # in this chain at all. Listing it here made each of the 20 local layers print one
+        # INKLING-FLASHDECLINE and set _fa_refused for a path it could never take (routing to the
+        # kernel is decided once, statically, by `if self.sliding:` in forward_attn).
+        attend = (self._attend_one_biasfuse if ip.inkling_attn_biasfuse
                   else self._attend_one_keytile if ip.inkling_attn_keytile else self._attend_one)
         self._l2win_round(inp["q"], rb)             # the padded rows the round really runs
         outs = []

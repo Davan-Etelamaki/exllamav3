@@ -24,9 +24,10 @@
 //   * the softmax is the SINK-SEEDED online form the shipped arms use: m = sink * log2e, l = 1,
 //     O = 0, so the (S+1) sink concat stays gone and an all-masked row returns zeros, as
 //     _attend_one_biasfuse and _attend_one_keytile do.
-//   * P V accumulates in fp16 only across the 8-key mma k-steps of ONE key tile and is promoted to
-//     the fp32 O accumulators at the tile's end: p = exp2(s - m) <= 1, so a tile partial is bounded
-//     by BN * max|v|, two orders under fp16's 65504 for a normed V, and the un-normalised growth
+//   * P V accumulates in fp16 only across the FA_PV_FP16_KEYS/8 mma k-steps of ONE key tile (= one
+//     FA_BN-wide tile, 32 keys) and is promoted to the fp32 O accumulators at the tile's end:
+//     p = exp2(s - m) <= 1, so a tile partial is bounded by FA_PV_FP16_KEYS * max|v|, three orders
+//     under fp16's 65504 for a normed V, and the un-normalised growth
 //     (which overflowed at ~63k keys and poisoned every logit — 4cb7529a, dsh-keytile-merge) lives
 //     only in fp32. The 2x fp16-accumulate HMMA rate is kept.
 //   * K and V tiles stream through a cp.async pipeline (2 stages when the SM affords them, 1 when
@@ -383,12 +384,14 @@ inkling_fa_prefill_kernel(const FaPrefillArgs A)
             }
 
             // ---- O += P V. P comes straight out of the S accumulator (an m16n8 fp32 C fragment,
-            // repacked pairwise, IS an m16n8k8 A fragment); V is read transposed. The 8-key k-steps of
-            // one tile accumulate in fp16 and are promoted to the fp32 O at the tile's end — that
-            // promotion point is the bound on the un-normalised partial.
-            uint32_t pa[BN / 8][2];
+            // repacked pairwise, IS an m16n8k8 A fragment); V is read transposed. The
+            // FA_PV_FP16_KEYS/8 k-steps of one tile accumulate in fp16 and are promoted to the fp32
+            // O at the tile's end — that promotion point is the bound on the un-normalised partial
+            // (FA_PV_FP16_KEYS * max|v|), and the static_assert in fa_prefill.cuh pins the window to
+            // one key tile.
+            uint32_t pa[FA_PV_FP16_KEYS / 8][2];
             #pragma unroll
-            for (int j = 0; j < BN / 8; ++j)
+            for (int j = 0; j < FA_PV_FP16_KEYS / 8; ++j)
             {
                 pa[j][0] = fa_pack_h2(s[j][0], s[j][1]);
                 pa[j][1] = fa_pack_h2(s[j][2], s[j][3]);
@@ -400,7 +403,7 @@ inkling_fa_prefill_kernel(const FaPrefillArgs A)
                 #pragma unroll
                 for (int x = 0; x < 4; ++x) { t[x][0] = 0u; t[x][1] = 0u; }
                 #pragma unroll
-                for (int j = 0; j < BN / 8; ++j)
+                for (int j = 0; j < FA_PV_FP16_KEYS / 8; ++j)
                 {
                     uint32_t b[4];
                     fa_ldsm_x4_t(b, sV_u + swz(8 * j + lr, dn + lm, ROW_CHUNKS));

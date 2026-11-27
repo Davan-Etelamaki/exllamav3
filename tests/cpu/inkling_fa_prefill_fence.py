@@ -27,23 +27,33 @@ that is trustworthy from a compile alone, so the fence does two things:
         · NUMERICS: the kernel's fp16 outputs against an independent float64 oracle on five shapes
           (served geometry, partial query/key tiles, the single-stage pipeline, head-dim 256, a
           sink-heavy fixture), with the bias band, the score path and the sink each isolated, plus
-          the kernel's own non-finite census, which must read zero.
+          the kernel's own non-finite census, which must read zero;
+        · THE fp16 WINDOW, as a named constant: FA_PV_FP16_KEYS in fa_prefill.cuh, pinned to FA_BN
+          by static_assert, used by the kernel's own P·V loop, and quoted identically by every prose
+          site (header, config.py, the seam docstring). The float64 model of each graded arm reports
+          how far its one-tile partial sits below fp16's 65504, so the overflow claim is carried by
+          a fixture that CAN overflow rather than by prose.
   [2] IT EXECUTES THE PYTHON SEAM from the served source (inkling2_loop.py parsed by AST, never
       imported as exllamav3) against a recording extension mock: gate OFF resolves no new method and
       touches the extension zero times; a ring-validity mask, a too-short pass, a kernel refusal, a
       missing reason binding, a non-finite census and an audit diff each land on the fused path with
       the INKLING-FLASHDECLINE marker; the bound is measured once per (T,S) SHAPE CLASS rather than
-      once per layer lifetime; and the three bindings are pinned in bindings.cpp as required.
+      once per layer lifetime, and spending that budget prints INKLING-FLASHAUDITCAP once instead of
+      going silent; only the GLOBAL seam may dispatch the kernel (the sliding seam always carries a
+      mask, so naming it there is a scope error, not a decline); and the three bindings are pinned
+      in bindings.cpp as required.
 
 COMPILE-VERIFY ONLY / BOOT-PENDING, stated plainly: nvcc's acceptance of the PTX forms, the real
 register allocation and occupancy, and any rate on hardware are NOT established here — the wheel
 build and the dot26 A/B decide those. What this fence does prove is the arithmetic, the geometry,
 the refusals and the gate.
 
-Positive controls: eight planted defects, each a mutation of the shipped source, must trip the check
-that exists to catch it; the fence REDs on any survivor. Two of them are defects this kernel was
-actually born with and had to be fixed for the oracle to agree: a key tile that was never primed,
-and a sink term counted once per lane of the row-group.
+Positive controls: planted defects, each a mutation of the shipped source, must trip the check that
+exists to catch it; the fence REDs on any survivor. Three of them are defects this kernel was
+actually born with or was reviewed for: a key tile that was never primed, a sink term counted once
+per lane of the row-group, and the fp16 P·V partial left to carry across key tiles (the 65504
+regression 4cb7529a fixed) — the last one on a fixture whose float64 partial crosses 65504 while
+the promoted one-tile partial stays below it, so the trip cannot be anything but the overflow.
 
 Run:  cd <repo> && env -u PYTHONHOME -u PYTHONPATH -u LD_LIBRARY_PATH CUDA_VISIBLE_DEVICES= \
       PYTHONPATH=. ~/.venvs/tabby-exl3/bin/python tests/cpu/inkling_fa_prefill_fence.py
@@ -73,6 +83,16 @@ FU = ["fa_prefill.cu", "fa_prims.cuh", "fa_prefill.cuh", "fa_prefill_torch.cpp",
       "fa_prefill_torch.cuh"]
 SHIM_FILES = ["cuda_runtime.h", "shim.h", "fa_emu.cpp", "api_driver.cpp", "ATen/Tensor.h",
               "ATen/cuda/CUDAContext.h"]
+
+# The fp16 ceiling the arm's safety rests on, and the kernel's own window constants — read from the
+# shipped header, never remembered here. FA_PV_FP16_KEYS is the NAME the bound lives under: one
+# key tile of fp16 P·V before the kernel promotes to fp32.
+FP16_MAX = 65504.0
+LOG2E = 1.4426950408889634          # the kernel's softmax runs in the exp2 domain
+CUH_TXT = KERNEL_CUH.read_text(encoding = "utf8")
+CU_TXT = KERNEL_CU.read_text(encoding = "utf8")
+FA_BN = int(re.search(r"#define FA_BN\s+(\d+)", CUH_TXT).group(1))
+FA_PV_KEYS = int(re.search(r"constexpr int FA_PV_FP16_KEYS\s*=\s*(\d+)", CUH_TXT).group(1))
 
 # The served attention geometry, from the parent's read of the served pack's config.json
 # (24 q heads / 8 kv heads / head_dim 128 / rel_extent 1024 / 24 layers, 20-local + 4-global), and
@@ -299,13 +319,16 @@ def parse_dump(path):
                 QP = vec("QPOS").astype(np.int64), KP = vec("KPOS").astype(np.int64), O = vec("O"))
 
 
-def oracle_err(f, use_band = True, sink_mult = 1):
+def oracle_err(f, use_band = True, sink_mult = 1, relative = False):
     """Independent float64 attention: fp32 scores + band, exact mask, softmax over scores ++ sink.
 
     use_band and sink_mult bend the EXPECTATION, not the kernel: with the band removed, or the sink
     term removed (sink_mult=0) or counted per lane as it was before this kernel was fixed
     (sink_mult=4), the gap must open past tolerance. That is how these checks know they exercise the
     band and the sink denominator instead of agreeing with a degenerate answer.
+    relative=True reports the gap against the reference's own magnitude: fp16 STORAGE puts an
+    absolute error of half an ulp on every output, which at |O|~400 is 0.25 and says nothing about
+    the maths — only the overflow fixtures need this currency.
     """
     h, kvh, d, T, S, ext = f["h"], f["kvh"], f["d"], f["T"], f["S"], f["ext"]
     Q = f["Q"].reshape(h, T, d); K = f["K"].reshape(S, kvh, d); V = f["V"].reshape(S, kvh, d)
@@ -324,8 +347,55 @@ def oracle_err(f, use_band = True, sink_mult = 1):
         m = np.maximum(floor, SINK[:, hq]) if sink_mult else floor
         e = np.exp(sc - m[:, None])
         den = e.sum(axis = 1) + sink_mult * np.exp(SINK[:, hq] - m)
-        worst = max(worst, float(np.abs((e / den[:, None]) @ V[:, hk, :] - O[hq]).max()))
+        ref = (e / den[:, None]) @ V[:, hk, :]
+        gap = float(np.abs(ref - O[hq]).max())
+        worst = max(worst, gap / max(1.0, float(np.abs(ref).max())) if relative else gap)
     return worst
+
+
+def pv_peaks(f, bn):
+    """Float64 model of the kernel's fp16 P·V accumulator, per output element.
+
+    p = exp2(s2 - m) in the kernel's own domain (s2 = scores * scale * log2e + bias * log2e), with m
+    the running max INCLUDING the current key tile — the kernel computes m_new before it forms p
+    (fa_prefill.cu:361-368), which is what keeps p <= 1 and the fp16 window bounded. Two numbers
+    come out:
+      tile_peak  — max |sum of p*v inside ONE key tile|. This is what the SHIPPED kernel holds in
+                   fp16: FA_PV_FP16_KEYS = bn = one tile's keys, then promoted to fp32.
+      carry_peak — max |the same partial summed across the whole pass with no promotion and no
+                   alpha rescale|. This is what a defect that leaves the partial in fp16 across
+                   tiles holds, and the quantity that blew past 65504 at ~63k keys (4cb7529a).
+    """
+    h, kvh, d, T, S, ext = f["h"], f["kvh"], f["d"], f["T"], f["S"], f["ext"]
+    Q = f["Q"].reshape(h, T, d); K = f["K"].reshape(S, kvh, d); V = f["V"].reshape(S, kvh, d)
+    REL = f["REL"].reshape(h, T, ext); SINK = f["SINK"].reshape(T, h)
+    grp = h // kvh
+    n_t = (S + bn - 1) // bn
+    pad = n_t * bn - S
+    dist = f["QP"][:, None] - f["KP"][None, :]
+    vis = dist >= 0
+    tile_peak = carry_peak = 0.0
+    for hq in range(h):
+        hk = hq // grp
+        s2 = (Q[hq] @ K[:, hk, :].T) * f["scale"] * LOG2E
+        s2 = s2 + np.take_along_axis(REL[hq], np.clip(dist, 0, ext - 1), axis = 1) * (vis & (dist < ext)) * LOG2E
+        s2 = np.where(vis, s2, -1e30)                    # the kernel's own off-band sentinel
+        if pad:                                         # the last key tile is partial: pad to bn
+            s2 = np.pad(s2, ((0, 0), (0, pad)), constant_values = -1e30)
+        vp = np.pad(V[:, hk, :], ((0, pad), (0, 0))) if pad else V[:, hk, :]
+        m = SINK[:, hq] * LOG2E                          # sink-seeded, as the kernel seeds it
+        tiles = s2.reshape(T, n_t, bn)
+        vtiles = vp.reshape(n_t, bn, d)
+        carry = np.zeros((T, d))
+        for kt in range(n_t):
+            mk = np.maximum(m, tiles[:, kt, :].max(axis = 1))
+            p = np.exp2(tiles[:, kt, :] - mk[:, None])
+            partial = p @ vtiles[kt]                     # this tile's fp16 window, fp64 for truth
+            tile_peak = max(tile_peak, float(np.abs(partial).max()))
+            carry += partial
+            carry_peak = max(carry_peak, float(np.abs(carry).max()))
+            m = mk
+    return tile_peak, carry_peak
 
 
 ARMS = [
@@ -370,6 +440,21 @@ check("[2e] every graded arm reports a zero non-finite census",
           for l, v in NUM.items() if v is not None),
       f"{sum(1 for v in NUM.values() if v is not None)} arms, nonfinite=0 each")
 
+# The fp16 window, measured rather than asserted in prose: what the shipped one-tile partial and a
+# cross-tile carry actually reach on the graded shapes. This is the evidence for the claim that no
+# graded shape can overflow — 65504 is four orders above anything these fixtures produce.
+PEAKS = {label: pv_peaks(parse_dump(TMP / f"dump_{label.replace(' ', '_')}.txt"), FA_BN)
+         for label, over in ARMS if NUM[label] is not None}
+WORST_TILE = max(p[0] for p in PEAKS.values())
+WORST_CARRY = max(p[1] for p in PEAKS.values())
+check(f"[2f] the fp16 P·V window is FA_PV_FP16_KEYS={FA_PV_KEYS} keys (one FA_BN={FA_BN} tile) and "
+      f"no graded shape reaches the {FP16_MAX:g} ceiling",
+      FA_PV_KEYS == FA_BN and WORST_TILE < FP16_MAX,
+      f"peak one-tile partial over {len(PEAKS)} graded arms = {WORST_TILE:.4g} "
+      f"(FP16_MAX/WORST_TILE = {FP16_MAX / max(WORST_TILE, 1e-30):.3g}x of headroom); the same "
+      f"fixtures would reach {WORST_CARRY:.4g} if the partial carried across tiles — still under "
+      f"{FP16_MAX:g}, so overflow needs its own fixture, not a re-grade of these")
+
 print("")
 print("PART 3 — the Python seam, executed from the served source")
 TREE = ast.parse(LOOP.read_text(encoding = "utf8"))
@@ -394,10 +479,51 @@ for name in ("_attend_one_flashprefill", "_attend_fallback", "_fa_decline", "_fa
              "_fa_audit_class"):
     check(f"[3d] InklingAttention defines {name}", name in METH, "")
 seams = {m: ast.unparse(METH[m]) for m in ("forward_attn", "_sliding_attend") if m in METH}
-check("[3e] both seams resolve the arm behind its own gate, ahead of biasfuse/keytile",
-      len(seams) == 2 and all("self._attend_one_flashprefill if ip.inkling_attn_flashprefill" in s
-                              and s.index("inkling_attn_flashprefill") < s.index("inkling_attn_biasfuse")
-                              for s in seams.values()), f"{sorted(seams)}")
+GL, SL = seams["forward_attn"], seams["_sliding_attend"]
+check("[3e] the global seam resolves the kernel behind its own gate, ahead of biasfuse/keytile",
+      "self._attend_one_flashprefill if ip.inkling_attn_flashprefill" in GL
+      and GL.index("inkling_attn_flashprefill") < GL.index("inkling_attn_biasfuse"),
+      f"{sorted(seams)}; the kernel sits first in forward_attn's chain")
+
+
+def attend_call(site):
+    """The attend(...) call inside a seam method: its positional count and its last argument."""
+    for n in ast.walk(METH[site]):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "attend":
+            return len(n.args) + len(n.keywords), ast.unparse(n.args[-1])
+    raise AssertionError(f"no attend(...) call in {site}")
+
+
+GL_ARGS, GL_LAST = attend_call("forward_attn")
+SL_ARGS, SL_LAST = attend_call("_sliding_attend")
+check("[3v] the kernel's dispatch site hands it NO ring-validity mask; the sliding site always does",
+      GL_ARGS == 7 and SL_ARGS == 8 and SL_LAST == "valid",
+      f"forward_attn attend(...)={GL_ARGS} args, last={GL_LAST!r}, kv_valid defaults to None; "
+      f"_sliding_attend attend(...)={SL_ARGS} args, last={SL_LAST!r}")
+check("[3w] the sliding seam does not dispatch the kernel: structural scope, not a runtime decline",
+      "inkling_attn_flashprefill" not in SL and "_attend_one_biasfuse" in SL,
+      "the sliding path always carries kv_valid, so listing the kernel there made each of the 20 "
+      "local layers print INKLING-FLASHDECLINE and set _fa_refused for a path routing already "
+      "excluded (`if self.sliding:` in forward_attn)")
+BOUND_PROSE = {
+    "fa_prefill.cu header": CU_TXT,
+    "fa_prefill.cuh constants": CUH_TXT,
+    "exllamav3/model/config.py": PARAMS.read_text(encoding = "utf8"),
+    "inkling2_loop.py seam docstring": LOOP.read_text(encoding = "utf8")}
+stale = {f: [n for n in ("16-key slice", "8-key slice", "16-key tile") if n in t]
+         for f, t in BOUND_PROSE.items() if any(n in t for n in ("16-key slice", "8-key slice",
+                                                                 "16-key tile"))}
+named = [f for f, t in BOUND_PROSE.items() if "FA_PV_FP16_KEYS" in t]
+check("[3x] all three prose sites of the fp16 P·V bound agree with the code, by name",
+      FA_PV_KEYS == FA_BN and not stale and len(named) == len(BOUND_PROSE),
+      f"window = FA_PV_FP16_KEYS = FA_BN = {FA_PV_KEYS} keys = one key tile; stale sizes: "
+      f"{stale or 'none'}; sites naming the constant: {named}")
+check("[3y] the window is written THROUGH the constant and pinned to the tile at compile time",
+      "static_assert(FA_PV_FP16_KEYS == FA_BN" in CUH_TXT
+      and CU_TXT.count("for (int j = 0; j < FA_PV_FP16_KEYS / 8; ++j)") == 2
+      and "uint32_t pa[FA_PV_FP16_KEYS / 8][2]" in CU_TXT,
+      f"header static_assert present; P·V fragment pack + V k-step loop both use the constant "
+      f"({CU_TXT.count('FA_PV_FP16_KEYS')} uses in fa_prefill.cu)")
 
 exec("import torch", CONST)                    # CPU tensors only; exllamav3 is never imported
 CALLS: list = []
@@ -489,6 +615,7 @@ def make_attn(muts = ()):
     a.scaling, a.rel_extent = 2 ** -0.5, 8
     a._fa_refused = False
     a._fa_audited = set()
+    a._fa_audit_capped = False
     return a
 
 
@@ -583,6 +710,26 @@ check("[3r] an audit diff above the bound returns the fused answer, not the kern
       f"{next((l for l in Log.lines if 'above' in l), '-')[:110]}")
 REC.o_val = 0.5
 
+# The audit budget is a CAP, so the log has to say when it is spent: 10 distinct shape classes
+# through one layer, with the budget at _FA_AUDIT_CLASSES. A silent stop would read as "every shape
+# is still bounded" — the false reassurance INKLING-FLASHAUDITCAP exists to prevent.
+CAP_SHAPES = [(64, 256), (128, 256), (256, 512), (512, 512), (1024, 1024), (2048, 1024),
+              (4096, 2048), (8192, 2048), (16384, 4096), (32768, 8192)]
+attn = make_attn(); CALLS.clear(); Log.lines = []
+for t_cap, s_cap in CAP_SHAPES:
+    call(attn, T = t_cap, S = s_cap)
+cap_lines = [l for l in Log.lines if "INKLING-FLASHAUDITCAP" in l]
+audit_lines = [l for l in Log.lines if "INKLING-FLASHAUDIT L" in l]
+check(f"[3z] spending the {CONST['_FA_AUDIT_CLASSES']}-class audit budget prints one CAP line, "
+      f"not silence",
+      len(audit_lines) == CONST["_FA_AUDIT_CLASSES"] and len(cap_lines) == 1
+      and len(attn._fa_audited) == CONST["_FA_AUDIT_CLASSES"]
+      and {(t_cap.bit_length(), s_cap.bit_length()) for t_cap, s_cap in CAP_SHAPES} == {
+          (t_cap.bit_length(), s_cap.bit_length()) for t_cap, s_cap in CAP_SHAPES},
+      f"{len(CAP_SHAPES)} distinct classes, {len(audit_lines)} audits (= cap "
+      f"{CONST['_FA_AUDIT_CLASSES']}), {len(cap_lines)} cap line, audited set stays "
+      f"{len(attn._fa_audited)} — {(cap_lines or ['-'])[0][:120]}")
+
 cfg_txt = PARAMS.read_text(encoding = "utf8")
 cfg = ast.parse(cfg_txt)
 pc = next(n for n in cfg.body if isinstance(n, ast.ClassDef) and n.name == "InferParams")
@@ -666,6 +813,95 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors = True)
 tripped("pre-sm_80 gate deleted (cp.async issued on Pascal)", caught, why)
+
+# The bound itself, planted. fa_prefill.cu:416-419 promotes the fp16 P·V partial to the fp32 O at
+# the end of EVERY key tile, so the partial never covers more than FA_PV_FP16_KEYS = FA_BN = 32
+# keys. The defect that regression was (4cb7529a) is the opposite: leave the partial in fp16 across
+# key tiles. The fixture below is chosen so the two differ by storage precision ONLY — flat scores
+# (q=0, band=0) and a zero sink make every p exactly 1 and every alpha exactly 1 — so a trip here
+# cannot be a masking, band or rescale artefact.
+CARRY_MUTS = (
+    ("float oacc[D / 8][4];",
+     "float oacc[D / 8][4];\n    uint32_t pvc[D / 8][2];\n    #pragma unroll\n"
+     "    for (int dn = 0; dn < D / 8; ++dn) { pvc[dn][0] = 0u; pvc[dn][1] = 0u; }"),
+    ("""                #pragma unroll
+                for (int x = 0; x < 4; ++x)
+                {
+                    const float2 lo = fa_h2_to_f2(t[x][0]);
+                    const float2 hi = fa_h2_to_f2(t[x][1]);
+                    oacc[dn + x][0] += lo.x; oacc[dn + x][1] += lo.y;
+                    oacc[dn + x][2] += hi.x; oacc[dn + x][3] += hi.y;
+                }""",
+     """                #pragma unroll
+                for (int x = 0; x < 4; ++x)
+                {
+                    const float2 ca = fa_h2_to_f2(pvc[dn + x][0]);
+                    const float2 cb = fa_h2_to_f2(pvc[dn + x][1]);
+                    const float2 na = fa_h2_to_f2(t[x][0]);
+                    const float2 nb = fa_h2_to_f2(t[x][1]);
+                    pvc[dn + x][1] = fa_pack_h2(cb.x + nb.x, cb.y + nb.y);
+                    pvc[dn + x][0] = fa_pack_h2(ca.x + na.x, ca.y + na.y);
+                }"""),
+    ("    // ---- normalize, store (h, T, d) fp16, and count non-finite outputs for the caller",
+     "    #pragma unroll\n    for (int dn = 0; dn < D / 8; ++dn)\n    {\n"
+     "        const float2 ca = fa_h2_to_f2(pvc[dn][0]);\n"
+     "        const float2 cb = fa_h2_to_f2(pvc[dn][1]);\n"
+     "        oacc[dn][0] += ca.x; oacc[dn][1] += ca.y;\n"
+     "        oacc[dn][2] += cb.x; oacc[dn][3] += cb.y;\n    }\n\n"
+     "    // ---- normalize, store (h, T, d) fp16, and count non-finite outputs for the caller"),
+)
+OVERFLOW_SHAPE = ("h=4", "kvh=2", "d=128", "ext=32", "T=512", "S=512",
+                  "q0=1", "rel0=1", "sink0=1", "vabs=1", "vmag=1000000")   # V positive, x1000
+tmp = pathlib.Path(tempfile.mkdtemp(prefix = "fa-mut-"))
+try:
+    bb = build(prepare_tree(tmp, CARRY_MUTS), tmp / "probe")
+    if bb.returncode != 0:
+        caught, why = False, f"carry mutant would not compile: {(bb.stderr.strip().splitlines() or [''])[-1][:130]}"
+    else:
+        clean_dump, mut_dump = TMP / "dump_promo_clean.txt", tmp / "dump_promo_mut.txt"
+        run_probe(BIN, "run", f"dump={clean_dump}", *OVERFLOW_SHAPE)
+        run_probe(tmp / "probe", "run", f"dump={mut_dump}", *OVERFLOW_SHAPE)
+        fc, fm = parse_dump(clean_dump), parse_dump(mut_dump)
+        tile_peak, carry_peak = pv_peaks(fc, FA_PV_KEYS)
+        bad_c = int((~np.isfinite(fc["O"])).sum())
+        bad_m = int((~np.isfinite(fm["O"])).sum())
+        finite_m = float(np.abs(np.nan_to_num(fm["O"], nan = 0.0, posinf = 0.0, neginf = 0.0)).max())
+        caught = (bad_c == 0 and bad_m > 0 and fm["nfin"] > 0 and fc["nfin"] == 0
+                  and tile_peak < FP16_MAX < carry_peak
+                  and oracle_err(fc, relative = True) <= TOL)
+        why = (f"fp16 window = FA_PV_FP16_KEYS = FA_BN = {FA_PV_KEYS} keys. float64 model of THIS "
+               f"fixture: the partial that is promoted every tile peaks at {tile_peak:.4g} "
+               f"({FP16_MAX / tile_peak:.3g}x under the {FP16_MAX:g} ceiling), while the same "
+               f"partial left in fp16 across tiles reaches {carry_peak:.4g} "
+               f"({carry_peak / FP16_MAX:.3g}x the ceiling) — the fixture CAN overflow and the "
+               f"promoted window CANNOT. clean build: nfin={fc['nfin']}, non-finite outputs="
+               f"{bad_c}, max|O|={float(np.abs(fc['O']).max()):.4g}, rel-gap to the float64 oracle "
+               f"{oracle_err(fc, relative = True):.2e}. carry mutant: nfin={fm['nfin']}, "
+               f"non-finite outputs={bad_m} (fp16 inf once the accumulator passed {FP16_MAX:g}), "
+               f"largest finite |O|={finite_m:.4g}. The mutant differs from the clean build in the "
+               f"accumulator's STORAGE PRECISION only — q=0, band=0 and sink=0 make p=1 and alpha=1 "
+               f"on every tile, so no mask, band or rescale term can explain the trip: it is the "
+               f"overflow.")
+    tripped("fp16 P·V carry across key tiles (the 65504 regression 4cb7529a fixed)", caught, why)
+finally:
+    shutil.rmtree(tmp, ignore_errors = True)
+
+# Dispatch-scope controls: which seam is ALLOWED to name the kernel is a structural fact, and both
+# directions of getting it wrong must trip a check.
+sl_planted = SL.replace("attend = self._attend_one_biasfuse",
+                        "attend = (self._attend_one_flashprefill if ip.inkling_attn_flashprefill"
+                        " else self._attend_one_biasfuse)", 1)
+tripped("flash-prefill re-planted in the sliding dispatch (the 20 spurious declines)",
+        sl_planted != SL and "inkling_attn_flashprefill" in sl_planted,
+        f"gate terms in _sliding_attend: shipped {SL.count('inkling_attn_flashprefill')} → "
+        f"planted {sl_planted.count('inkling_attn_flashprefill')}; every local layer would decline "
+        f"on a mask it always carries and retire its own arm")
+gl_planted = GL.replace("self._attend_one_flashprefill if ip.inkling_attn_flashprefill",
+                        "self._attend_one_biasfuse if ip.inkling_attn_biasfuse", 1)
+tripped("kernel dropped from the global dispatch (the arm would never be reached)",
+        gl_planted != GL and "self._attend_one_flashprefill" not in gl_planted,
+        f"gate terms in forward_attn: shipped {GL.count('inkling_attn_flashprefill')} → "
+        f"planted {gl_planted.count('inkling_attn_flashprefill')}")
 
 
 def py_probe(muts, dial, action):

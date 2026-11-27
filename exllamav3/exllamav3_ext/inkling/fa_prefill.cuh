@@ -45,6 +45,17 @@
 // resident). Warps: 4, one 16-row band each.
 #define FA_BM 64
 #define FA_BN 32
+// Keys one fp16 P·V partial covers before the kernel promotes it into the fp32 O accumulator:
+// exactly ONE key tile. fa_prefill.cu's P·V loop runs FA_PV_FP16_KEYS/8 mma k-steps of 8 keys
+// against one fp16 accumulator and converts it to fp32 at fa_prefill.cu:416-419, at the tile's end.
+// For one output element p = exp2(s - m) <= 1 (m is the running max INCLUDING this tile), so the
+// fp16 partial is bounded by FA_PV_FP16_KEYS * max|v| — the ceiling that keeps the estate's fp16-PV
+// overflow (65504 at ~63k keys, 4cb7529a) out of this arm. Widening the window widens the bound
+// proportionally; the static_assert below pins it to the tile so the two cannot drift apart, and
+// tests/cpu/inkling_fa_prefill_fence.py pins every prose site of this number to this constant.
+constexpr int FA_PV_FP16_KEYS = 32;
+static_assert(FA_PV_FP16_KEYS == FA_BN,
+              "the fp16 P.V window is one key tile: change FA_BN and this bound together");
 #define FA_NWARPS 4
 #define FA_MIN_ROWS FA_BM            // a pass shorter than one query tile stays on the fused path
 #define FA_STAGES_PREFERRED 2        // cp.async double buffering of the K and V tiles
@@ -144,7 +155,9 @@ inline FaPrefillPlan fa_prefill_plan(const FaPrefillShapes& s, int T, int S,
     }
     if (S < FA_BN)
     {
-        fa_detail::set_reason(p.reason, sizeof(p.reason), "cache shorter than one 16-key tile");
+        // The threshold is FA_BN keys (32 at every instantiated head dim); the number is left out of
+        // the sentence on purpose, because this string must not disagree with the constant above.
+        fa_detail::set_reason(p.reason, sizeof(p.reason), "cache shorter than one key tile");
         return p;
     }
     if (s.rel_extent <= 0)

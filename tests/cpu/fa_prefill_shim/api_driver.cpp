@@ -9,6 +9,7 @@
 #include "../../../exllamav3/exllamav3_ext/inkling/fa_prefill_torch.cuh"
 #include "shim.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,9 @@
 
 cudaStream_t g_shim_stream = (cudaStream_t) 0x5eed;      // the handle the launch must carry
 bool g_q0 = false, g_rel0 = false, g_sink0 = false;       // fixture overrides (isolation arms)
+bool g_vabs = false;                                      // V <- |V|: makes the P·V partial coherent
+int64_t g_vmag_milli = 1000;                              // V <- V * vmag/1000: drives the fp16 P·V
+                                                          // partial across the 65504 ceiling
 
 uint16_t em_f32_to_f16(float f);
 float em_f16_to_f32(uint16_t h);
@@ -149,6 +153,8 @@ int main(int argc, char** argv)
         else if (key == "q0") g_q0 = true;            // fixture knobs for the fence's isolation arms
         else if (key == "rel0") g_rel0 = true;
         else if (key == "sink0") g_sink0 = true;
+        else if (key == "vabs") g_vabs = true;          // V positive: the P·V partial adds coherently
+        else if (key == "vmag") g_vmag_milli = kb(val.c_str());   // V scaled by N/1000
         else if (key == "smem_optin") shim_ctl().smem_optin = size_t(kb(val.c_str()));
         else if (key == "smem_per_sm") shim_ctl().smem_per_sm = size_t(kb(val.c_str()));
     }
@@ -156,6 +162,20 @@ int main(int argc, char** argv)
     if (g_q0) std::memset(fx.q.p(), 0, fx.q.size());
     if (g_rel0) std::memset(fx.rel.p(), 0, fx.rel.size());
     if (g_sink0) std::memset(fx.sink.p(), 0, fx.sink.size());
+    if (g_vabs || g_vmag_milli != 1000)                 // the fp16 P·V overflow fixture
+    {
+        // fx.tv aliases this buffer, so an in-place rewrite is what the kernel sees. Positive V
+        // makes the partial add coherently instead of cancelling, and the scale sets how far past
+        // the fp16 ceiling the whole-pass carry would go while one tile's partial stays under it.
+        uint16_t* vd = reinterpret_cast<uint16_t*>(fx.v.p());
+        const size_t n = size_t(fx.S) * fx.kvh * fx.d;
+        for (size_t i = 0; i < n; ++i)
+        {
+            float val = em_f16_to_f32(vd[i]);
+            if (g_vabs) val = std::fabs(val);
+            vd[i] = em_f32_to_f16(val * (float(g_vmag_milli) / 1000.0f));
+        }
+    }
 
     if (scene == "plan")
     {

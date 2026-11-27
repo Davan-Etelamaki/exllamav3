@@ -122,7 +122,8 @@ class InferParams:
     # and keeps the whole softmax inside tensor-core accumulators, folding the rel_extent-wide
     # relative-bias band INSIDE its key-tile loop — so the (h, rows, S) fp32 bias plane the shipped
     # fuse eliminated stays eliminated — and seeding the online softmax from the sink, exactly as
-    # inkling_attn_biasfuse does. P V accumulates in fp16 only within one 16-key slice and is then
+    # inkling_attn_biasfuse does. P V accumulates in fp16 only within one key tile (FA_BN = 32 keys,
+    # named FA_PV_FP16_KEYS in fa_prefill.cuh) and is then
     # promoted to the fp32 output partial, which is the bound that keeps the fp16-PV overflow
     # (65504 at ~63k keys, fixed by 4cb7529a) out of the arm. Tile sizes, stage count and shared
     # memory are derived from the served shapes and the device's own limits, never a remembered card
