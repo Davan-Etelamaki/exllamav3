@@ -158,6 +158,13 @@ check("markov Linears receive kHalf at the boundary (exl3.py:142 rejects fp32 x;
       "rnn.rnn_proj.forward(rnn_in.half()" in msrc
       and "latent.unsqueeze(1).half()" in msrc
       and "lm.prepare_for_device(h_eff, params).half()" in msrc)
+check("exit conditioning is batch-current (state seed row, not per-prefill stored taps; fault 13)",
+      "state[:, 0:1, :].half()" in msrc and "self._mix_taps(3, self._anchor_taps)" not in msrc)
+# CONTROL 6d: reading the stale per-prefill taps crashed joined batches (cat 2 vs 1)
+mut6d = msrc.replace("f_rnn = rnn.dflare_norm.forward(state[:, 0:1, :].half(), params, out_dtype = torch.float)",
+                     "f_rnn = rnn.dflare_norm.forward(self._mix_taps(3, self._anchor_taps), params, out_dtype = torch.float)")
+check("CONTROL: reverting exit to stored anchor taps trips the batch-currency arm",
+      "self._anchor_taps)" in mut6d and "state[:, 0:1, :].half()" not in mut6d)
 # CONTROL 6c: fp32 into bc.run_alloc reproduced fault 12 (A is incorrect datatype, kHalf)
 mut6c = msrc.replace("rnn_in.half()", "rnn_in").replace("latent.unsqueeze(1).half()", "latent.unsqueeze(1)")
 check("CONTROL: stripping head-boundary half casts trips the kHalf-input arm",

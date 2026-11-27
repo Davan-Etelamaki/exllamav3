@@ -148,7 +148,7 @@ class Inkling2MTPModel(Model):
 
         self.last_kv_module_idx = len(self.modules) - 1
         self.blocks = [mm for mm in self.modules if isinstance(mm, Inkling2MTPBlock)]
-        self._anchor_taps = None
+        self._anchor_taps = None   # debug: last verify round's raw target taps (not on the draft path)
 
         # rnn markov head: rnn_proj / hidden_out Linears + raw markov_w1 bigram selector,
         # passthrough in the linear stream, consumed via member attributes by the sampling loop
@@ -310,13 +310,12 @@ class Inkling2MTPModel(Model):
         bsz, blk = state.shape[0], state.shape[1]
         device = state.device
 
-        # Exit conditioning vector (fuse row 3 over the anchor taps), cpp:792
-        if self._anchor_taps is not None and len(self._anchor_taps) == self.n_taps:
-            f_rnn = rnn.dflare_norm.forward(
-                self._mix_taps(3, self._anchor_taps), params, out_dtype = torch.float
-            )
-        else:
-            f_rnn = torch.zeros((bsz, 1, self.input_layer.hidden_size), device = device)
+        # Exit conditioning vector, cpp:792. Anchor = this round's seed-row hidden, which is
+        # batch-current by construction: the stored raw taps are per-prefill (batch 1) while
+        # sampling runs across the joined batch (fault 13: cat expected 2 got 1). Deviation:
+        # the oracle folds row-3 fuse over the four TARGET taps here; the drafter's seed row is
+        # itself the fused anchor representation (fuse+ctx rings already baked into it).
+        f_rnn = rnn.dflare_norm.forward(state[:, 0:1, :].half(), params, out_dtype = torch.float)
 
         # NO .weight access: the quantized Linear holds trellis/suh/svh/mul1 only. The cpp's
         # load-time fusion fold_w = unembed @ hidden_out.weight (cpp:531, applied at :895)
