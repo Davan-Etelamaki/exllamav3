@@ -36,6 +36,16 @@ class InferParams:
     # run in one process without a reload
     moe_coop_decode: bool = True
 
+    # Piecewise CUDA-graph capture of the sliding-window attention body at decode (Inkling 2):
+    # the ring read + per-row attend loop replays from a graph captured per (shared decode
+    # bucket, padded KV extent, recurrent-pool identity) on static input buffers; the append and
+    # the projections stay eager. False (default) is the control arm — the eager python loop,
+    # bit-identical to the served path — and the switch the pilot's A/B turns on, the same seam
+    # moe_coop_decode is for the coop tier (exllamav3/exllamav3_ext/moe_group/README.md). Checked
+    # per call, so both arms run in one process without a reload; capture must still succeed on
+    # the card before True means anything (tests/cpu/inkling_attn_graph_fence.py pins the seams)
+    inkling_attn_graph: bool = False
+
     def __init__(self):
         # With the int8 GEMV mode (on by default), separate int8 GEMV calls beat the fused MGEMM
         # only when a single matrix is wide enough to fill the GPU on its own (and K is within the
