@@ -1289,6 +1289,17 @@ class InklingMoE(Module):
         coop = self._coop_decode(flat, sel, w)
         if coop is not None:
             return coop.view(b, t, h)
+        # One-shot surface of the grouped-decline reason: an inert coop tier is otherwise
+        # invisible (witness 2026-11-27: eager python dispatch at 6.2 tok/s/lane with no
+        # log naming why the grouped tier declined this pack)
+        if self._coop_refuse_reason is not None and not getattr(
+            Inkling2LoopSparseMoeBlock, "_coop_decline_logged", False
+        ):
+            Inkling2LoopSparseMoeBlock._coop_decline_logged = True
+            print(
+                f" !! moe coop decode DECLINED: {self._coop_refuse_reason} "
+                f"(layer {self.layer_idx}); decode runs python-dispatch"
+            )
 
         sel_flat = sel.reshape(-1)
         w_flat = w.reshape(-1)
