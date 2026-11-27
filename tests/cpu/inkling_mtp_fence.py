@@ -4,8 +4,8 @@
 Pins the contract the MTP wheel boots on:
   [1] Inkling2LoopConfig registers component "mtp" -> Inkling2MTPModel and keeps a
       pop-guard for packs without mtp.safetensors;
-  [2] the drafter declares dflash_draft caps + instance taps {(5,0),(11,1),(17,2)}
-      + export_state_norm_keys {"model.llm.norm"} via draft_verifier_params;
+  [2] the drafter declares dflash_draft caps + raw instance taps
+      {(5,0),(11,1),(17,2),(23,2)} via draft_verifier_params, and NO norm-key tap;
   [3] the loop-instance export APPEND in modules/arch_specific/inkling2_loop.py
       halves and clamps to the fp16 range like modules/transformer.py does;
   [4] markov fold keeps TORCH order (lm_head @ hidden_out), NO transpose — the
@@ -56,11 +56,15 @@ cls = next(n for n in ast.walk(tree)
 csrc = ast.unparse(cls).replace("'", '"')
 check("dflash_draft caps (not mtp_draft: recurrent assert generator.py:297)",
       '"dflash_draft": True' in csrc and '"mtp_draft": True' not in csrc)
-check("instance taps {(5,0),(11,1),(17,2)} (literal or MTP_TAP_TARGETS const)",
-      "{(5, 0), (11, 1), (17, 2)}" in csrc
-      or ("MTP_TAP_TARGETS" in msrc and "(5, 0), (11, 1), (17, 2)" in msrc))
-check("norm tap key model.llm.norm exported",
-      '"export_state_norm_keys": {"model.llm.norm"}' in csrc)
+check("instance taps {(5,0),(11,1),(17,2),(23,2)} (raw visits 5/23/41/48)",
+      "MTP_TAP_TARGETS = ((5, 0), (11, 1), (17, 2), (23, 2))" in msrc)
+check("no norm-key tap (dflash prefill never runs final RMSNorm)",
+      '"export_state_norm_keys"' not in csrc)
+# CONTROL 2b: a norm-key tap reintroduced would never fire -> silent 3-tap starvation
+mut2b = csrc.replace('"export_state_layer_instances"',
+                     '"export_state_norm_keys": {"model.llm.norm"}, "export_state_layer_instances"', 1)
+check("CONTROL: reintroducing export_state_norm_keys trips the no-norm-tap arm",
+      '"export_state_norm_keys"' in mut2b)
 check("draft_verifier_params carries export_state_layer_instances",
       '"export_state_layer_instances"' in csrc)
 check("block_size -> default_draft_size block_size-1",
