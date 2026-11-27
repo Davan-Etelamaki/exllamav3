@@ -408,7 +408,8 @@ class Rec:
     def __init__(self, biasfuse, keytile):
         self.seen = []
         self.config = types.SimpleNamespace(
-            infer_params = types.SimpleNamespace(inkling_attn_biasfuse = biasfuse,
+            infer_params = types.SimpleNamespace(inkling_attn_flashprefill = False,
+                                                 inkling_attn_biasfuse = biasfuse,
                                                  inkling_attn_keytile = keytile))
 
     def __getattr__(self, item):

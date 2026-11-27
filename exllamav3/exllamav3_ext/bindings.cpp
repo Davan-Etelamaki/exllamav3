@@ -35,6 +35,7 @@
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include "quant/exl3_l2win.cuh"
+#include "inkling/fa_prefill_torch.cuh"
 #include "quant/exl3_moe.cuh"
 #include "quant/exl3_moe_coop.cuh"
 
@@ -217,6 +218,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     {
         return std::string(exl3_l2win_refusal((int) device));
     }, "exl3_l2win_refusal", py::arg("device"));
+    // Inkling 2 sm_89 flash-prefill attention (infer_params.inkling_attn_flashprefill): ask for a
+    // pass's plan (every tile, stage and shared-memory number derived from the served shapes and
+    // the device's own limits), then launch it. The launch returns 0 instead of raising when the
+    // pass is not one the kernel serves, so the Python seam falls back to the fused path; the
+    // reason for the last decline is exl3_inkling_fa_reason().
+    m.def("exl3_inkling_fa_plan", &exl3_inkling_fa_plan, "exl3_inkling_fa_plan",
+          py::arg("h"), py::arg("kvh"), py::arg("d"), py::arg("rel_extent"), py::arg("T"),
+          py::arg("S"), py::arg("smem_budget") = 0, py::arg("device") = 0);
+    m.def("exl3_inkling_fa_prefill", &exl3_inkling_fa_prefill, "exl3_inkling_fa_prefill",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("rel"), py::arg("sink"),
+          py::arg("qpos"), py::arg("kpos"), py::arg("o"), py::arg("nfin"), py::arg("scale"),
+          py::arg("rel_extent"), py::arg("smem_budget") = 0);
+    m.def("exl3_inkling_fa_reason", &exl3_inkling_fa_reason, "exl3_inkling_fa_reason");
     m.def("g_get_l2win_carve", &g_get_l2win_carve, "g_get_l2win_carve");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
     m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
