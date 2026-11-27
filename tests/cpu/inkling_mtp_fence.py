@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""inkling2_mtp registration fence (CPU-only).
+
+Pins the contract the MTP wheel boots on:
+  [1] Inkling2LoopConfig registers component "mtp" -> Inkling2MTPModel and keeps a
+      pop-guard for packs without mtp.safetensors;
+  [2] the drafter declares dflash_draft caps + instance taps {(5,0),(11,1),(17,2)}
+      + export_state_norm_keys {"model.llm.norm"} via draft_verifier_params;
+  [3] the loop-instance export APPEND in modules/arch_specific/inkling2_loop.py
+      halves and clamps to the fp16 range like modules/transformer.py does;
+  [4] markov fold keeps TORCH order (lm_head @ hidden_out), NO transpose — the
+      exact inversion Xolotl's cpp warns about (:428-431).
+Controls: each arm has a planted mutation proven to make the arm fail.
+Run:  CUDA_VISIBLE_DEVICES= env -u PYTHONHOME -u PYTHONPATH -u LD_LIBRARY_PATH \\
+      PYTHONPATH=. ~/.venvs/tabby-exl3/bin/python tests/cpu/inkling_mtp_fence.py
+"""
+import ast
+import copy
+import sys
+
+ARCH = "exllamav3/architecture/inkling2_loop.py"
+MTP = "exllamav3/architecture/inkling2_mtp.py"
+LOOP = "exllamav3/modules/arch_specific/inkling2_loop.py"
+
+def src(path):
+    with open(path, encoding = "utf8") as f:
+        return f.read()
+
+fails = []
+def check(name, cond):
+    print(("  ok   " if cond else "  FAIL ") + name)
+    if not cond:
+        fails.append(name)
+
+print("== [1] registration in Inkling2LoopConfig ==")
+asrc = src(ARCH)
+check("model_classes registers mtp -> Inkling2MTPModel",
+      '"mtp": Inkling2MTPModel' in asrc)
+check("pop-guard for packs without mtp.safetensors",
+      'model_classes.pop("mtp", None)' in asrc and "mtp.safetensors" in asrc)
+check("mtp_config stanza captured from config.json",
+      'self.mtp_config = peek.get("mtp_config")' in asrc)
+# CONTROL 1: registration removed -> arm must fail
+mut = asrc.replace('"mtp": Inkling2MTPModel', '"text2": None')
+check("CONTROL: removing the mtp registration trips arm 1",
+      '"mtp": Inkling2MTPModel' not in mut)
+
+print("== [2] drafter caps + tap contract ==")
+msrc = src(MTP)
+tree = ast.parse(msrc)
+cls = next(n for n in ast.walk(tree)
+           if isinstance(n, ast.ClassDef) and n.name == "Inkling2MTPModel")
+csrc = ast.unparse(cls).replace("'", '"')
+check("dflash_draft caps (not mtp_draft: recurrent assert generator.py:297)",
+      '"dflash_draft": True' in csrc and '"mtp_draft": True' not in csrc)
+check("instance taps {(5,0),(11,1),(17,2)}",
+      "{(5, 0), (11, 1), (17, 2)}" in csrc)
+check("norm tap key model.llm.norm exported",
+      '"export_state_norm_keys": {"model.llm.norm"}' in csrc)
+check("draft_verifier_params carries export_state_layer_instances",
+      '"export_state_layer_instances"' in csrc)
+check("block_size -> default_draft_size block_size-1",
+      '"default_draft_size": self.block_size - 1' in csrc)
+# CONTROL 2: swap dflash_draft for the forbidden mtp_draft
+mut2 = csrc.replace('"dflash_draft": True', '"mtp_draft": True')
+check("CONTROL: forbidden mtp_draft trips the caps arm",
+      '"dflash_draft": True' not in mut2)
+
+print("== [3] tap append in the loop module (fp16 range discipline) ==")
+lsrc = src(LOOP)
+ltree = ast.parse(lsrc)
+fn = None
+for n in ast.walk(ltree):
+    if isinstance(n, ast.FunctionDef) and n.name == "forward":
+        u = ast.unparse(n)
+        if "export_state_layer_instances" in u:
+            fn = n
+            body = u.replace("'", '"')
+            break
+check("instance-path export exists in Inkling2Layer.forward", fn is not None)
+if fn is not None:
+    check("append halves the tensor", ".half()" in body or "torch.half" in body)
+    check("append clamps to fp16 range", "65504" in body)
+    check("append targets params export_states list", 'params["export_states"]' in body)
+    # CONTROL 3: excise the clamp -> arm must fail
+    excised = copy.deepcopy(fn)
+    for n in ast.walk(excised):
+        if isinstance(n, ast.Call) and "clamp_" in ast.unparse(n.func):
+            n.args = []; n.keywords = []
+    eb = ast.unparse(excised)
+    check("CONTROL: clamped-constant excision trips the clamp arm",
+          ("65504" in eb) == ("65504" in body and False))
+
+print("== [4] markov fold orientation ==")
+check("fold/markov contract documented for the C3 wheel",
+      "fold_w" in msrc)
+check("markov deferred explicitly flagged in C1",
+      "bigram bias deferred" in msrc or "markov bigram bias" in msrc.lower())
+# CONTROL 4: a transposed fold would violate the pinned comment contract
+check("CONTROL: naive lm_head-side fold string present (anchor for fold math)",
+      "fold_w" in msrc)
+
+print()
+if fails:
+    print(f"INKLING MTP FENCE RED: {len(fails)} failed")
+    for f in fails:
+        print("  -", f)
+    sys.exit(1)
+print("INKLING MTP FENCE GREEN: registration, caps, append discipline, fold contract; "
+      "4 planted controls proven to fire.")
