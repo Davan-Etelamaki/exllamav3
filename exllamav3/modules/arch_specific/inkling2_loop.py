@@ -2042,6 +2042,12 @@ class InklingMoE(Module):
     (n_shared_experts = 0). Accumulation in fp32.
     """
 
+    # DOCUMENTED CPU-FENCE SEAM (never a config knob): tests/cpu/moe_fused_dispatch_repro.py
+    # executes the grouped tier's served body on CPU with recording ext shims standing in for
+    # the two launches; the shim arm sets this on its stub so the CUDA precondition is met by
+    # the emulator, not by weakening the served check. No served config touches it.
+    _grouped_emulate_cpu = False
+
     def __init__(
         self,
         config: Config,
@@ -2091,6 +2097,9 @@ class InklingMoE(Module):
         self._coop_by_bucket: dict = {}
         self._coop_ptrs_cache: dict | None = None
         self._coop_refuse_reason = None
+        # Grouped multi-token tier: last decline reason only (the workspace lives in params,
+        # keyed per device+generation, never on the module); cleared by every grouped call
+        self._grouped_refuse_reason = None
         # Residence ledger for the routed-expert weights; never touched while
         # infer_params.inkling_moe_expert_residency_ledger is False (the served default)
         self._expertx = _fresh_expertx_ledger()
@@ -2112,6 +2121,7 @@ class InklingMoE(Module):
         self._coop_by_bucket = {}  # pointer tables pin device addresses; they die with the weights
         self._coop_ptrs_cache = None
         self._coop_refuse_reason = None
+        self._grouped_refuse_reason = None
         self._expertx = _fresh_expertx_ledger()   # new load epoch: old addresses are dead
         super().unload()
 
@@ -2269,6 +2279,120 @@ class InklingMoE(Module):
         out = args["out"]
         return out[:rows]
 
+    def _grouped_ws(self, params: dict, device, rows: int):
+        """Persistent workspace for the grouped multi-token tier, keyed by (device, this
+        generation's params dict): the padded bucket from moe_coop_plan.GROUPED_BUCKETS,
+        act [bucket*top_k, intermediate] fp16, y [bucket*top_k, hidden] fp16 and the stacked
+        int64 pointer table with its pinned staging buffer. Sized from the allocation site at
+        the deployed chunk, never a remembered constant (law 23): the tier only runs at
+        rows <= MOE_GROUPED_MAX_ROWS = the served chunk_size 2048, so at the top bucket act
+        is 16384 × 1152 × 2 B ≈ 37.7 MB and y 16384 × 2304 × 2 B ≈ 75.5 MB — ~113 MB held
+        ONCE per device per generation (MoE instances run sequentially on one stream, so
+        every layer reuses the buffers), not per layer. A bigger bucket rebuilds the pool
+        entry; the old buffers return to the allocator there."""
+        bucket = moe_coop_plan.grouped_padded_rows(rows)
+        if bucket is None:
+            return None
+        pool = params.setdefault("inkling2_moe_grouped_ws", {})
+        ws = pool.get(str(device))
+        if ws is not None and ws["bucket"] >= bucket:
+            return ws
+        names = moe_coop_plan.TABLE_ORDER
+        # Pinned staging exists to keep the table refill off pageable H2D (the capture-death
+        # class, dot26 journal 2026-11-24); on a non-CUDA device pinning has no meaning and
+        # the CUDA host allocator is absent, so it is conditional on the device type.
+        stage = torch.empty(len(names) * self.num_experts, dtype = torch.int64,
+                            pin_memory = device.type == "cuda")
+        ws = {
+            "bucket": bucket,
+            "act": torch.empty((bucket * self.top_k, self.intermediate_size),
+                               dtype = torch.half, device = device),
+            "y": torch.empty((bucket * self.top_k, self.hidden_size),
+                             dtype = torch.half, device = device),
+            "stage": stage, "stage_np": stage.numpy(), "tables": stage.to(device),
+            "names": list(names), "probe": None,
+        }
+        pool[str(device)] = ws
+        return ws
+
+    def _grouped_moe(self, flat, sel, w, params, t):
+        """Grouped expert tier for the eager MULTI-TOKEN regime (t > 1, not capturing) —
+        the §CJ absorption map, landed. Gather, gate/up + the fused softcap-swiglu chain and
+        down for every routed entry run inside TWO ext launches whose rows come straight
+        from order_all (the stable ascending-expert device order — the same total order the
+        python loop sorts into, so group membership and the per-token accumulation sequence
+        are unchanged); no host roundtrip, no per-group index_select/cat/activation fan-out.
+        The combine stays one full-order index_add_: processing the entries in order_all
+        order visits each token's contributions in exactly the per-group loop's sequence,
+        so the fp32 out is bit-identical (tests/cpu/inkling_moe_grouped_fence.py executes
+        both arms; the §CJ gate repeats it against the INSTALLED baseline).
+        Returns None to keep today's chain, with the reason recorded on
+        self._grouped_refuse_reason: knob off (the served default), the t == 1 / capture
+        regime seam (moe_coop_plan.grouped_refusal names both), rows above the grouped
+        ladder, an inhomogeneous pack (classify_experts) or a kernel-level refusal.
+        Emu seam: _grouped_emulate_cpu lets the CPU fence execute this body with the real
+        op sequence while the ext entries stand in as recorders (§CJ: a shim must carry
+        production values); no served config sets it."""
+        self._grouped_refuse_reason = None
+        if not self.config.infer_params.inkling_moe_grouped_ext:
+            return None
+        rows = flat.size(0)
+        reason = moe_coop_plan.grouped_refusal(
+            rows, self.top_k, t, flat.is_cuda or getattr(self, "_grouped_emulate_cpu", False),
+            flat.dtype == torch.half, _capturing(),
+            hasattr(ext, "exl3_moe_group_gu") and hasattr(ext, "exl3_moe_group_down"))
+        if reason is not None:
+            self._grouped_refuse_reason = reason
+            return None
+        desc, why = moe_coop_plan.classify_experts(
+            zip(self.experts_g, self.experts_u, self.experts_d))
+        if desc is None:
+            self._grouped_refuse_reason = why
+            return None
+        ws = self._grouped_ws(params, flat.device, rows)
+        if ws is None:
+            self._grouped_refuse_reason = "grouped workspace unavailable"
+            return None
+        probe = self._coop_ptrs_probe()
+        if ws["probe"] != probe:
+            # Doorbell rule the coop arena established: the tables pin device addresses, so
+            # they refill IN PLACE from the pinned staging buffer when the weights moved.
+            lists = self._coop_ptr_lists()
+            stage_np = ws["stage_np"]
+            pos = 0
+            for name in ws["names"]:
+                vals = lists[name]
+                stage_np[pos:pos + len(vals)] = vals
+                pos += len(vals)
+            ws["tables"].copy_(ws["stage"], non_blocking = True)
+            ws["probe"] = probe
+        sel_flat = sel.reshape(-1)
+        w_flat = w.reshape(-1)
+        out = torch.zeros((rows, flat.size(1)), dtype = torch.float, device = flat.device)
+        order_all = torch.argsort(sel_flat, stable = True)
+        counts = torch.bincount(sel_flat, minlength = self.num_experts)
+        tokens_all = torch.div(order_all, self.top_k, rounding_mode = "floor")
+        entries = rows * self.top_k
+        rc = ext.exl3_moe_group_gu(*moe_coop_plan.build_call_args(
+            dict(x = flat, order_all = order_all, counts = counts, tables = ws["tables"],
+                 K = desc["Kg"], mcg = desc["mcg"], mul1 = desc["mul1"], act = ws["act"],
+                 gate_cap = self.gate_softcap, up_cap = self.up_softcap),
+            moe_coop_plan.GU_CALL_ARGS))
+        if rc < 0:
+            self._grouped_refuse_reason = f"ext gu refused (rc {rc})"
+            return None
+        rc = ext.exl3_moe_group_down(*moe_coop_plan.build_call_args(
+            dict(act = ws["act"], entries = entries, order_all = order_all, counts = counts,
+                 tables = ws["tables"], K = desc["Kd"], mcg = desc["mcg"], mul1 = desc["mul1"],
+                 y = ws["y"]),
+            moe_coop_plan.DOWN_CALL_ARGS))
+        if rc < 0:
+            self._grouped_refuse_reason = f"ext down refused (rc {rc})"
+            return None
+        out.index_add_(0, tokens_all,
+                       ws["y"][:entries].float() * w_flat.index_select(0, order_all).unsqueeze(-1))
+        return out
+
     def _expertx_census(self) -> tuple[dict, tuple]:
         """Residence census of THIS layer's routed-expert weights: for every expert, the device
         type and address of the three tensors its projections read (trellis/suh/svh — the same
@@ -2386,6 +2510,17 @@ class InklingMoE(Module):
                     f"(layer {self.layer_idx})"
                     + ("" if expected_prefill else "; decode runs python-dispatch")
                 )
+
+        grouped = self._grouped_moe(flat, sel, w, params, t)
+        if grouped is not None:
+            return grouped.view(b, t, h)
+        if self._grouped_refuse_reason is not None and \
+                not getattr(type(self), "_grouped_decline_logged", False):
+            # One-shot surface of the grouped decline, the coop tier's witness rule: an inert
+            # grouped arm is otherwise invisible in the log (boot 2026-11-27 lesson, same class)
+            setattr(type(self), "_grouped_decline_logged", True)
+            print(f" !! moe grouped ext DECLINED: {self._grouped_refuse_reason} "
+                  f"(layer {self.layer_idx}); multi-token runs python-dispatch")
 
         sel_flat = sel.reshape(-1)
         w_flat = w.reshape(-1)

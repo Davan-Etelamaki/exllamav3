@@ -154,6 +154,15 @@ class InferParams:
     # the sync-free/no-alloc armed path and this default.
     inkling_moe_expert_residency_ledger: bool = False
 
+    # Grouped expert tier for the Inkling 2 MoE in the eager MULTI-TOKEN regime (t > 1, not
+    # capturing): gather, gate/up + softcap-swiglu and down for every routed entry run inside
+    # two ext launches whose rows come from the device order_all; the combine stays one
+    # full-order index_add_ (same per-token sequence as the per-group loop — bit-identical).
+    # False (default) keeps today's python dispatch verbatim; t == 1 and capture never take
+    # this arm (regime seam). Checked per forward call (exllamav3_ext/moe_group/README.md;
+    # fences: tests/cpu/inkling_moe_grouped_fence.py + tests/cpu/moe_fused_dispatch_repro.py)
+    inkling_moe_grouped_ext: bool = False
+
     def __init__(self):
         # With the int8 GEMV mode (on by default), separate int8 GEMV calls beat the fused MGEMM
         # only when a single matrix is wide enough to fill the GPU on its own (and K is within the
