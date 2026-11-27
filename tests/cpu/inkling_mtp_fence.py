@@ -53,8 +53,9 @@ cls = next(n for n in ast.walk(tree)
 csrc = ast.unparse(cls).replace("'", '"')
 check("dflash_draft caps (not mtp_draft: recurrent assert generator.py:297)",
       '"dflash_draft": True' in csrc and '"mtp_draft": True' not in csrc)
-check("instance taps {(5,0),(11,1),(17,2)}",
-      "{(5, 0), (11, 1), (17, 2)}" in csrc)
+check("instance taps {(5,0),(11,1),(17,2)} (literal or MTP_TAP_TARGETS const)",
+      "{(5, 0), (11, 1), (17, 2)}" in csrc
+      or ("MTP_TAP_TARGETS" in msrc and "(5, 0), (11, 1), (17, 2)" in msrc))
 check("norm tap key model.llm.norm exported",
       '"export_state_norm_keys": {"model.llm.norm"}' in csrc)
 check("draft_verifier_params carries export_state_layer_instances",
@@ -94,8 +95,10 @@ if fn is not None:
 print("== [4] markov fold orientation ==")
 check("fold/markov contract documented for the C3 wheel",
       "fold_w" in msrc)
-check("markov deferred explicitly flagged in C1",
-      "bigram bias deferred" in msrc or "markov bigram bias" in msrc.lower())
+check("markov head assembled into the drafter",
+      "Inkling2MTPMarkovHead" in csrc)
+check("flat draft-stack layer map override (boot-crash fix)",
+      "def prepare_layer_map" in csrc)
 # CONTROL 4: a transposed fold would violate the pinned comment contract
 check("CONTROL: naive lm_head-side fold string present (anchor for fold math)",
       "fold_w" in msrc)

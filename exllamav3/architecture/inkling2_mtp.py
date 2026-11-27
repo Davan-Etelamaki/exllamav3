@@ -1,49 +1,61 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-import torch.nn.functional as F
 import weakref
 
 from ..cache import Cache
 from ..model.config import Config
 from ..model.model import Model
-from ..modules import RMSNorm, TransformerBlock, Attention, GatedMLP, Module
-from ..util.rope import RopeSettings
+from ..modules import RMSNorm, TransformerBlock, Attention, GatedMLP, Module, Linear
+from ..modules.attn import prepare_for_attn
+from ..util.rope import RopeStyle
 from ..util.device_copy import to_device
 from ..util.tensor import get_for_device
 
-# Inkling-2-mini MTP drafter (component "mtp"), trained-contract decoded from the same-shape
-# oracle Indras-Mirror/Xolotl src/program/inkling_dspark.cpp and the pack header of
-# mtp.safetensors (141 root-namespace tensors). Registration: Inkling2LoopConfig declares this
-# class in model_classes["mtp"]; tabbyAPI draft_mode "mtp" loads it via
-# Model.from_config(main_config, component="mtp") over the SAME config and model dir.
+# Inkling-2-mini MTP drafter (component "mtp"), contract decoded from the same-shape oracle
+# Indras-Mirror/Xolotl src/program/inkling_dspark.cpp and the pack header of mtp.safetensors
+# (141 root-namespace tensors). Registration: Inkling2LoopConfig declares this class in
+# model_classes["mtp"] (popped when the pack lacks the drafter); tabbyAPI draft_mode "mtp"
+# loads it via Model.from_config(main_config, component="mtp") over the SAME config object and
+# model dir, so all keys are read at the pack ROOT (no prefix) and dimensions come from the
+# config.json top-level "mtp_config" stanza.
 #
-# Contract facts (verified):
+# Contract facts (parent-verified):
 #  - mtp_config: block_size 8, hidden 2304, heads 24 q / 8 kv, head_dim 128, rope_theta 1e6,
 #    sliding_window_size 1024 on local layers {0,2}, layer 1 global, rms_norm_eps 1e-6,
 #    markov_head_type rnn_hidden, markov_rank 256, target_layer_ids [5, 23, 41, 48].
+#    (The stanza carries no num_hidden_layers; the pack census fixes it at 3.)
 #  - target_layer_ids are LAYER-VISITS over the unrolled loop map (0..5, 6..17 x3, 18..23):
 #    visit 5 = (layer 5, instance 0), visit 23 = (layer 11, instance 1), visit 41 = (layer 17,
-#    instance 2), visit 48 = final-normed hidden. The instance taps fire through the
-#    export_state_layer_instances seam in modules/arch_specific/inkling2_loop.py; the norm tap
-#    through export_state_norm_keys on the RMSNorm export hook (modules/rmsnorm.py:169).
-#  - Per draft layer L: c = rms(sum_j softmax(fuse_weight)[L][j] * taps[j], dflare_norm_L) is
-#    injected as context (oracle :631-640). Block input: row 0 = rms(target embed(anchor),
-#    target embed_norm), rows 1..7 = mask_embed (oracle :777 + Xolotl spec). "norm.weight" in
-#    this pack is the DRAFTER'S FINAL norm before the shared LM head (oracle :363), NOT an
-#    embed norm.
-#  - CONTEXT rings: per-layer *_proj_ctx(+k_norm_ctx) projections of the target taps are
-#    written into the drafter cache as K/V rows (mirrors laguna update_kv_from_target shape).
+#    instance 2), visit 48 = final-normed hidden. Instance taps fire through the
+#    export_state_layer_instances seam in modules/arch_specific/inkling2_loop.py (append landed
+#    with this commit); the norm tap through the export_state_norm_keys hook on RMSNorm
+#    (modules/rmsnorm.py, exports y.half()). Execution order equals tap order.
+#  - Per draft layer L the block input mixes the taps: c_L = rms(sum_j softmax(fuse_weight)[L][j]
+#    * taps[j], layers.L.dflare_norm.weight) (cpp:631-640), feeding the block ahead of its
+#    input_layernorm. Block tokens: row 0 = the anchor (seed) token embedded through the TARGET's
+#    input module (its embed-side norm belongs to the main model, cpp:777/:1052-1069 - there is
+#    no embed norm in mtp.safetensors), rows 1..7 = mask_embed (cpp).
+#  - "norm.weight" in this pack is the DRAFTER'S FINAL norm before the borrowed lm_head
+#    (cpp:363 output_norm), NOT an embed norm.
+#  - Context rings (cross-round): per drafter layer L the target taps project through
+#    layers.L.self_attn.{q,k,v}_proj_ctx (+ k_norm_ctx) and the k/v rows are written into L's
+#    cache like dflash_laguna.update_kv_from_target (rope at cache_seqlens offset, k_norm_ctx).
+#  - Exit: fuse row 3 (+ markov_head.dflare_norm) feeds the rnn markov head (full-cat rnn_proj,
+#    gate/cand/latent thirds, state = gate*old + (1-gate)*cand); logits = 30*tanh((base_lm +
+#    markov fold)/30), fold in TORCH ORDER (no transpose), prev = argmax, tau 0.35 truncation.
 #
-# C1 SCOPE FLAGS (ships bootable, refine on next wheels):
-#  - dflare-mix is broadcast from the ANCHOR-position taps to every block row (oracle mixes
-#    per-position through ctx attention; broadcast is the faithful-enough boot path).
-#  - markov bigram bias not yet applied (plain LM argmax drafts); fuse row 3 / rnn_proj path
-#    lands with the acceptance-tuning wheel.
-#  - draft MLP assembled as plain SwiGLU GatedMLP: mtp_config carries no softcap dials.
+# REMAINING AFTER C1 (this commit): block-forward tap/dflare injection into the residual stream,
+# update_kv_from_target ctx-ring writes, the markov sampling loop + confidence truncation,
+# rnn_proj input width + Linear bias handling verified against the pack, embed-side norm
+# inclusion verified against Inkling2InputRead. C1 ships the module tree, caps and seams.
+
+MTP_NUM_LAYERS = 3
+MTP_TAP_TARGETS = ((5, 0), (11, 1), (17, 2))
 
 
 class Inkling2MTPModel(Model):
+    # config is the SHARED Inkling2LoopConfig (see header); no separate MTP config class
 
     def __init__(
         self,
@@ -51,120 +63,152 @@ class Inkling2MTPModel(Model):
         **kwargs
     ):
         super().__init__(config, **kwargs)
-        m = config.mtp_config
-        assert m, "Inkling2Loop MTP: config.json carries no mtp_config stanza"
+        m = config.config_dict.get("mtp_config")
+        assert m, "Inkling2MTPModel: config.json carries no mtp_config stanza"
         self.mtp_config = m
-        h = m["hidden_size"]
-        eps = m["rms_norm_eps"]
-        self.block_size = m["block_size"]
+        h = int(m["hidden_size"])
+        hd = int(m["head_dim"])
+        eps = float(m["rms_norm_eps"])
+        self.block_size = int(m["block_size"])
         self.n_taps = len(m["target_layer_ids"])
-        rope = RopeSettings(
-            head_dim = m["head_dim"],
-            rope_theta = m["rope_theta"],
-            max_position_embeddings = m["max_position_embeddings"],
+        self.markov_rank = int(m["markov_rank"])
+        # The drafter ropes with its own theta (1e6), not the target's
+        self.rope_settings = config.read_rope_settings_default(
+            RopeStyle.NEOX,
+            default_rope_theta = float(m.get("rope_theta", 1_000_000.0)),
+            override_head_dim = hd,
+            config_dict = m,
         )
 
         self.input_layer = Inkling2MTPInputLayer(
-            config = config, key = "mtp_block_input", hidden_size = h,
-            rms_norm_eps = eps, block_size = self.block_size,
-            key_mask_embedding = "mask_embed", qmap = "mtp.input",
+            config = config,
+            key = "mtp_block_input",
+            hidden_size = h,
+            rms_norm_eps = eps,
+            block_size = self.block_size,
+            key_mask_embedding = "mask_embed",
         )
         self.modules = [self.input_layer]
         self.first_block_idx = 1
         self.attn_modules = []
 
-        for idx in range(m["num_hidden_layers"]):
-            sliding = idx in m["local_layer_ids"]
+        for idx in range(MTP_NUM_LAYERS):
+            sliding = idx in set(m["local_layer_ids"])
+            p = f"layers.{idx}"
             attn = Attention(
                 config = config,
-                key = f"layers.{idx}.self_attn",
+                key = f"{p}.self_attn",
                 layer_idx = idx,
                 hidden_size = h,
-                head_dim = m["head_dim"],
-                num_q_heads = m["num_attention_heads"],
-                num_kv_heads = m["num_key_value_heads"],
-                rope_settings = rope,
-                key_q = "q_proj", key_k = "k_proj", key_v = "v_proj", key_o = "o_proj",
+                head_dim = hd,
+                num_q_heads = int(m["num_attention_heads"]),
+                num_kv_heads = int(m["num_key_value_heads"]),
+                rope_settings = self.rope_settings,
+                key_q = "q_proj",
+                key_k = "k_proj",
+                key_v = "v_proj",
+                key_o = "o_proj",
                 qmap = "block.attn",
-                sliding_window = m["sliding_window_size"] if sliding else -1,
-                q_norm = RMSNorm(config = config, key = f"layers.{idx}.self_attn.q_norm",
-                                 rms_norm_eps = eps),
-                k_norm = RMSNorm(config = config, key = f"layers.{idx}.self_attn.k_norm",
-                                 rms_norm_eps = eps),
+                sliding_window = int(m["sliding_window_size"]) if sliding else -1,
+                q_norm = RMSNorm(config = config, key = f"{p}.self_attn.q_norm", rms_norm_eps = eps),
+                k_norm = RMSNorm(config = config, key = f"{p}.self_attn.k_norm", rms_norm_eps = eps),
                 out_dtype = torch.float,
             )
             self.attn_modules.append(attn)
-            self.modules += [TransformerBlock(
+            self.modules += [Inkling2MTPBlock(
                 config = config,
-                key = f"layers.{idx}",
+                key = p,
                 layer_idx = idx,
-                attn_norm = RMSNorm(config = config, key = f"layers.{idx}.input_layernorm",
-                                    rms_norm_eps = eps),
+                hidden_size = h,
+                head_dim = hd,
+                attn_norm = RMSNorm(config = config, key = f"{p}.input_layernorm", rms_norm_eps = eps),
+                dflare_norm = RMSNorm(config = config, key = f"{p}.dflare_norm", rms_norm_eps = eps),
                 attn = attn,
-                mlp_norm = RMSNorm(config = config,
-                                   key = f"layers.{idx}.post_attention_layernorm",
-                                   rms_norm_eps = eps),
-                mlp = GatedMLP(config = config, key = f"layers.{idx}.mlp",
-                               hidden_size = h, intermediate_size = m["intermediate_size"],
-                               key_up = "up_proj", key_gate = "gate_proj", key_down = "down_proj",
-                               qmap = "block.mlp", interm_dtype = torch.half,
-                               out_dtype = torch.float),
+                mlp_norm = RMSNorm(config = config, key = f"{p}.post_attention_layernorm", rms_norm_eps = eps),
+                mlp = GatedMLP(
+                    config = config,
+                    key = f"{p}.mlp",
+                    hidden_size = h,
+                    intermediate_size = int(m["intermediate_size"]),
+                    key_up = "up_proj",
+                    key_gate = "gate_proj",
+                    key_down = "down_proj",
+                    qmap = "block.mlp",
+                    interm_dtype = torch.half,
+                    out_dtype = torch.float,
+                ),
+                rms_norm_eps = eps,
             )]
 
         self.last_kv_module_idx = len(self.modules) - 1
-        self.modules += [
-            RMSNorm(config = config, key = "norm", rms_norm_eps = eps, out_dtype = torch.half),
-        ]
-        self.logit_layer_idx = None
 
+        # rnn markov head: rnn_proj / hidden_out Linears + raw markov_w1 bigram selector,
+        # passthrough in the linear stream, consumed via member attributes by the sampling loop
+        self.markov_head = Inkling2MTPMarkovHead(
+            config = config,
+            key = "markov_head",
+            hidden_size = h,
+            markov_rank = self.markov_rank,
+            rms_norm_eps = eps,
+        )
+        self.modules += [self.markov_head]
+
+        # Drafter's final norm before the borrowed lm_head (pack key "norm" == cpp output_norm)
+        self.final_norm = RMSNorm(config = config, key = "norm", rms_norm_eps = eps, out_dtype = torch.half)
+        self.modules += [self.final_norm]
+
+        self.logit_layer_idx = None
         self.caps.update({
             "uncalibrated_quantize": True,
             "supports_tp": False,
             "attach_target": True,
             "dflash_draft": True,
-            "default_draft_size": self.block_size - 1,
+            "default_draft_size": self.block_size - 1,   # 7 drafts under the 8-row block
             "autosplit_load_fwd": False,
         })
 
         self.attached_model = None
+        # Target-side tap requests. The norm-key tap is the main model's final RMSNorm, fixed by
+        # the Inkling2Loop module layout (p + "norm", p = "model.llm.")
         self.draft_verifier_params.update({
-            "export_state_layer_instances": {(5, 0), (11, 1), (17, 2)},
+            "export_state_layer_instances": set(MTP_TAP_TARGETS),
             "export_state_norm_keys": {"model.llm.norm"},
         })
 
-        # raw tensors (no module key prefix matches): fuse_weight [+4×4], per-layer dflare gains
-        self.fuse_weight = None
-        self.dflare = [None] * m["num_hidden_layers"]
+
+    @override
+    def prepare_layer_map(self):
+        # The target's loop relayering (config.layer_map = "0..5,6..17 x3,18..23") belongs to
+        # the TARGET's module list; this drafter owns a flat 3-layer stack. Without this
+        # override, Model.prepare_layer_map indexes inner[] with text-map ids and raises
+        # IndexError at model.py:159 on boot (observed dot26 2026-11-26 21:04 EST).
+        self.fwd_modules = [(m, 0, idx) for idx, m in enumerate(self.modules)]
+        if self.last_kv_module_idx is not None:
+            self.last_kv_module_idx_instance = (self.last_kv_module_idx, 0)
 
 
-    # ---- protocol ------------------------------------------------------------------
-
+    @override
     def attach_to(self, target):
         self.attached_model = weakref.ref(target)
-        self.input_layer.attached_model = weakref.ref(target)
+        self.input_layer.attached_model = self.attached_model
 
 
     @override
-    def load(self, device, **kwargs):
-        super().load(device, **kwargs)
-        stc = self.config.stc
-        self.fuse_weight = stc.get_tensor("fuse_weight", device, allow_bf16 = True,
-                                          no_defer = True)
-        for i in range(self.mtp_config["num_hidden_layers"]):
-            self.dflare[i] = stc.get_tensor(f"layers.{i}.dflare_norm.weight", device,
-                                            allow_bf16 = True, no_defer = True)
+    def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        return prepare_for_attn(input_ids, params)
 
 
-    @override
-    def unload(self):
-        self.fuse_weight = None
-        self.dflare = [None] * self.mtp_config["num_hidden_layers"]
-        super().unload()
+    def default_load_shape_dtype(self, chunk_size):
+        return (1, 1), torch.long
+
+
+    def default_load_params(self, max_chunk_size):
+        return {}
 
 
     def _mix_taps(self, layer_idx: int, taps: list[torch.Tensor]) -> torch.Tensor:
-        # softmax(fuse_weight)[layer_idx] over the four taps, summed (oracle :631)
-        alpha = torch.softmax(self.fuse_weight.float(), dim = -1)[layer_idx]
+        # softmax(fuse_weight)[layer_idx] over the four taps (cpp:631); row 3 serves the exit
+        alpha = torch.softmax(self.input_layer.fuse_weight.float(), dim = -1)[layer_idx]
         acc = None
         for a, t in zip(alpha, taps):
             v = t * a.to(t.dtype)
@@ -179,112 +223,196 @@ class Inkling2MTPModel(Model):
         params: dict,
         lengths: list[int] = None,
     ):
-        if lengths is not None:
-            max_length = max(lengths)
-            target_hidden = [t[:, :max_length] for t in target_hidden]
-        device = self.input_layer.device
-        target_hidden = [to_device(t, device) for t in target_hidden]
-
-        # keep anchor-position taps for the block forward's dflare context injection (C1 flag)
-        self._anchor_taps = [t[:, -1:, :] for t in target_hidden]
-
-        for L, layer in enumerate(self.attn_modules):
-            mix = self._mix_taps(L, target_hidden)
-            mix = mix.half() if mix.dtype != torch.half else mix
-            sa = f"layers.{L}.self_attn"
-            k = layer.k_proj_ctx.forward(mix, params) if getattr(layer, "k_proj_ctx", None) \
-                else None
-            if k is None:
-                # ctx projections are plain Linear submodules the Attention class does not own;
-                # build them lazily on first use to keep __init__ free of stc reads
-                k, v = self._ctx_kv(sa, mix, params, L)
-            else:
-                v = layer.v_proj_ctx.forward(mix, params)
-                if getattr(layer, "k_norm_ctx", None) is not None:
-                    k = layer.k_norm_ctx.forward(k, params)
-            bsz, seqlen, _ = k.shape
-            k = k.view(bsz, seqlen, layer.num_kv_heads, layer.head_dim)
-            v = v.view(bsz, seqlen, layer.num_kv_heads, layer.head_dim)
-            block_table = get_for_device(params, "block_table", layer.device)
-            cache_seqlens = get_for_device(params, "cache_seqlens", layer.device)
-            k, _ = layer.rope.apply(
-                k, None, 0, cache_seqlens, None, True,
-                layer.k_norm_tensor, None, layer.norm_eps, layer.norm_constant_bias, None,
-            )
-            cache.update_layer_direct(layer.layer_idx, cache_seqlens, block_table, k, v,
-                                      seqlen, 0)
-
-    _ctx_mods = None
-    def _ctx_kv(self, sa: str, mix: torch.Tensor, params: dict, L: int):
-        if self._ctx_mods is None:
-            self._ctx_mods = {}
-            from ..modules import Linear
-            for li in range(self.mtp_config["num_hidden_layers"]):
-                p = f"layers.{li}.self_attn"
-                self._ctx_mods[li] = (
-                    Linear(self.config, key = f"{p}.k_proj_ctx",
-                           in_features = self.mtp_config["hidden_size"],
-                           out_features = self.mtp_config["num_key_value_heads"]
-                                         * self.mtp_config["head_dim"]),
-                    Linear(self.config, key = f"{p}.v_proj_ctx",
-                           in_features = self.mtp_config["hidden_size"],
-                           out_features = self.mtp_config["num_key_value_heads"]
-                                         * self.mtp_config["head_dim"]),
-                    RMSNorm(self.config, key = f"{p}.k_norm_ctx",
-                            rms_norm_eps = self.mtp_config["rms_norm_eps"]),
-                )
-                self._ctx_mods[li][0].load(self.input_layer.device)
-                self._ctx_mods[li][1].load(self.input_layer.device)
-                self._ctx_mods[li][2].load(self.input_layer.device)
-        k, v, kn = self._ctx_mods[L]
-        k = kn.forward(k.forward(mix, params), params)
-        return k, v.forward(mix, params)
-
-
-    def forward_block(self, x: torch.Tensor, params: dict, out_dtype = None):
-        # C1 context injection: per-layer rms(mix(anchor taps), dflare_L) added to the residual
-        # (broadcast flag). Blocks run causally through the standard TransformerBlock pipeline.
-        raise NotImplementedError  # replaced below; kept for readability of pipeline order
+        """
+        Fill each drafter layer's context ring from the target taps (laguna pattern: per-layer
+        attn_norm on the shared features, k/v ctx-project, rope at the cache_seqlens offset with
+        k_norm_ctx applied, cache.update_layer_direct rows).
+        TODO(C2): ctx projections live on Inkling2MTPBlock (k_proj_ctx/v_proj_ctx/k_norm_ctx);
+        fuse per tap-set then write; q_proj_ctx is projected for ring parity only if the oracle
+        consumes it - flag in the C2 commit.
+        """
+        raise NotImplementedError("Inkling2MTP: update_kv_from_target lands in C2")
 
 
     def sample_from_state(self, state: torch.Tensor, params: dict) -> torch.Tensor:
-        # C1: plain shared-head argmax; markov bigram bias (fuse row 3 -> f_rnn -> rnn_proj
-        # full-cat, logits 30*tanh((base + fold_w@latent)/30)) lands with the tuning wheel.
-        tail = self.modules[-1]  # final norm (pack key "norm" == drafter output_norm)
-        state = tail.forward(state, params, out_dtype = torch.half)
-        ids = self.attached_model().lm_head_argmax(state, params)
-        if "draft_conf" in params or True:
-            params["draft_conf"] = torch.ones(ids.shape[0], ids.shape[1] - 1,
-                                              device = ids.device)
-        return ids
-
-
-    @override
-    def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
-        from ..modules.attn import prepare_for_attn
-        return prepare_for_attn(input_ids, params)
+        """
+        TODO(C3): markov loop over the block - base logits from the target's lm_head (the final
+        norm already ran in the module stream), rnn_proj full-cat state update per slot, bias
+        fold_w @ latent + markov_w1[prev] with fold in TORCH ORDER (no transpose),
+        logits = 30*tanh((base + bias)/30), prev = argmax, tau 0.35 truncation writing
+        params["draft_conf"]; returns (b, block_size) with column 0 = the seed.
+        """
+        raise NotImplementedError("Inkling2MTP: markov sampling lands in C3")
 
 
     @staticmethod
     @override
     def get_additional_compiled_tensors(config: Config) -> dict:
-        # root-namespace raw tensors that no module key covers: fuse_weight (4x4 mixer) and the
-        # per-layer dflare gains consumed by the custom dflare-norm path.
-        t = {"fuse_weight": config.stc.get_tensor("fuse_weight")}
-        mc = config.mtp_config or {}
-        for i in range(int(mc.get("num_hidden_layers", 3))):
-            t[f"layers.{i}.dflare_norm"] = config.stc.get_tensor(
-                f"layers.{i}.dflare_norm.weight")
+        # Root tensors owned outside module key prefixes: the tap mixer and the block-mask rows
+        # (Inkling2MTPInputLayer loads them raw; listed here for the compile / load census)
+        tensors = {}
+        tensors.update(config.stc.list_tensors(prefix = "fuse_weight"))
+        tensors.update(config.stc.list_tensors(prefix = "mask_embed"))
+        return tensors
+
+
+class Inkling2MTPBlock(TransformerBlock):
+    """
+    One drafter block. Adds what TransformerBlock has no slot for: dflare_norm (the post tap-mix
+    norm feeding the block, cpp:631-640 - applied by the C2 block forward ahead of attn_norm) and
+    the context-ring projections q/k/v_proj_ctx (+ k_norm_ctx) owned by update_kv_from_target.
+    Registered as submodules so they load and compile with the block; the inherited forward is
+    the usual norm-attn-mlp residual over whatever input the mix hands it.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        key: str,
+        layer_idx: int,
+        hidden_size: int,
+        head_dim: int,
+        attn_norm: RMSNorm,
+        dflare_norm: RMSNorm,
+        attn: Attention,
+        mlp_norm: RMSNorm,
+        mlp: GatedMLP,
+        rms_norm_eps: float,
+        **kwargs,
+    ):
+        super().__init__(
+            config = config,
+            key = key,
+            layer_idx = layer_idx,
+            attn_norm = attn_norm,
+            attn = attn,
+            mlp_norm = mlp_norm,
+            mlp = mlp,
+            **kwargs,
+        )
+        self.dflare_norm = dflare_norm
+        self.register_submodule(self.dflare_norm)
+        q_dim = attn.num_q_heads * head_dim
+        kv_dim = attn.num_kv_heads * head_dim
+        self.q_proj_ctx = Linear(
+            config = config,
+            key = f"{key}.self_attn.q_proj_ctx",
+            in_features = hidden_size,
+            out_features = q_dim,
+            qmap = "block.attn",
+            out_dtype = torch.float,
+        )
+        self.k_proj_ctx = Linear(
+            config = config,
+            key = f"{key}.self_attn.k_proj_ctx",
+            in_features = hidden_size,
+            out_features = kv_dim,
+            qmap = "block.attn",
+            out_dtype = torch.float,
+        )
+        self.v_proj_ctx = Linear(
+            config = config,
+            key = f"{key}.self_attn.v_proj_ctx",
+            in_features = hidden_size,
+            out_features = kv_dim,
+            qmap = "block.attn",
+            out_dtype = torch.float,
+        )
+        self.k_norm_ctx = RMSNorm(
+            config = config,
+            key = f"{key}.self_attn.k_norm_ctx",
+            rms_norm_eps = rms_norm_eps,
+        )
+        for m in (self.q_proj_ctx, self.k_proj_ctx, self.v_proj_ctx, self.k_norm_ctx):
+            self.register_submodule(m)
+
+
+class Inkling2MTPMarkovHead(Module):
+    """
+    rnn_hidden markov head (pack: markov_head.rnn_proj.{trellis,suh,svh,mul1} + .bias,
+    markov_head.hidden_out.{trellis,suh,svh,mul1} + .bias, markov_head.markov_w1.weight,
+    markov_head.dflare_norm.weight). rnn consumes the FULL concatenation
+    cat([state(rank), markov_w1[prev](rank), hidden_i(hidden), f_rnn(?)]); a column-split is
+    algebraically identical (parent F6). Out width = 3 * rank (gate | cand | latent, confirmed
+    by rnn_proj.bias length when C3 reads the header).
+    TODO(C3): exact in_features (f_rnn width) and Linear bias wiring (rnn_proj.bias /
+    hidden_out.bias) verified against the pack; wrong in_features fails loudly at load, not
+    silently.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        key: str,
+        hidden_size: int,
+        markov_rank: int,
+        rms_norm_eps: float,
+    ):
+        super().__init__(config, key, None)
+        self.module_name = "Inkling2MTPMarkovHead"
+        self.hidden_size = hidden_size
+        self.markov_rank = markov_rank
+        self.rnn_proj = Linear(
+            config = config,
+            key = f"{key}.rnn_proj",
+            in_features = 3 * markov_rank + hidden_size,
+            out_features = 3 * markov_rank,
+            qmap = "block.attn",
+            out_dtype = torch.float,
+        )
+        self.hidden_out = Linear(
+            config = config,
+            key = f"{key}.hidden_out",
+            in_features = hidden_size,
+            out_features = markov_rank,
+            qmap = "block.attn",
+            out_dtype = torch.float,
+        )
+        self.dflare_norm = RMSNorm(
+            config = config,
+            key = f"{key}.dflare_norm",
+            rms_norm_eps = rms_norm_eps,
+        )
+        for m in (self.rnn_proj, self.hidden_out, self.dflare_norm):
+            self.register_submodule(m)
+        self.markov_w1 = None
+
+
+    @override
+    def load(self, device: torch.device, **kwargs):
+        super().load(device, **kwargs)
+        self.markov_w1 = self.config.stc.get_tensor(
+            f"{self.key}.markov_w1.weight", device, optional = False,
+            allow_bf16 = True, no_defer = True
+        ).float()
+
+
+    @override
+    def unload(self):
+        self.markov_w1 = None
+        super().unload()
+
+
+    @override
+    def get_tensors(self):
+        t = super().get_tensors()
+        if self.markov_w1 is not None:
+            t[f"{self.key}.markov_w1.weight"] = self.markov_w1
         return t
 
 
-class Inkling2MTPInputLayer(Module):
-    # [c1-flag: simplified dflare injection: block forward adds rms(mix(anchor_taps), dflare_L)
-    # broadcast over block rows inside each TransformerBlock via a params hook; full
-    # per-position fusion arrives with the C2 refinement — C1 ships the plain block first.]
+    @override
+    def forward(self, x: torch.Tensor, params: dict, out_dtype = None) -> torch.Tensor:
+        # Passthrough: consumed through member modules from the sampling loop (C3)
+        return x
 
-    # Class-level so instances built without __init__ (tests) still carry it
-    mask_embedding = None
+
+class Inkling2MTPInputLayer(Module):
+    """
+    Block-token stream builder + raw root-tensor owner (fuse_weight 4x4 tap mixer, mask_embed
+    placeholder rows). The dflare tap-mix itself is applied per block by the C2 forward; this
+    module owns the tensors and grows the seed column into the block embedding.
+    """
 
     def __init__(
         self,
@@ -294,51 +422,73 @@ class Inkling2MTPInputLayer(Module):
         rms_norm_eps: float,
         block_size: int,
         key_mask_embedding: str,
-        qmap: str | None = None,
         out_dtype: torch.dtype | None = torch.float,
     ):
         super().__init__(config, key, None)
         self.module_name = "Inkling2MTPInputLayer"
-        self.qmap = qmap
         self.hidden_size = hidden_size
         self.out_dtype = out_dtype
         self.block_size = block_size
         self.rms_norm_eps = rms_norm_eps
         self.key_mask_embedding = key_mask_embedding
         self.attached_model = None
+        self.fuse_weight = None
+        self.mask_embed = None
         self.caps.update({"x_cpu": True})
 
-    def optimizer_targets(self):
-        raise NotImplementedError()
 
     @override
-    def load(self, device, **kwargs):
-        super().load(device, **kwargs)
-        self.mask_embedding = self.config.stc.get_tensor(
-            self.key_mask_embedding, device, allow_bf16 = True, no_defer = True)
+    def optimizer_targets(self):
+        return []
+
+
+    @override
+    def load(self, device: torch.device, **kwargs):
+        self.device = device
+        self.fuse_weight = self.config.stc.get_tensor(
+            "fuse_weight", device, optional = False, allow_bf16 = True, no_defer = True
+        ).float()
+        self.mask_embed = self.config.stc.get_tensor(
+            self.key_mask_embedding, device, optional = False, allow_bf16 = True, no_defer = True
+        ).float()
+
 
     @override
     def unload(self):
-        self.mask_embedding = None
-        super().unload()
+        self.fuse_weight = None
+        self.mask_embed = None
+
+
+    @override
+    def get_tensors(self):
+        t = {}
+        if self.fuse_weight is not None:
+            t["fuse_weight"] = self.fuse_weight
+        if self.mask_embed is not None:
+            t[self.key_mask_embedding] = self.mask_embed
+        return t
+
 
     def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
         return x
 
-    def forward(self, x: torch.Tensor, params: dict, out_dtype = None):
-        # x: seed column only (b,1). Grow to (b, block_size): [anchor, mask*(block-1)],
-        # embed via the ATTACHED target's embedding module, rms the anchor row with the target
-        # embed_norm, overlay mask rows from this pack's mask_embed table.
+
+    @override
+    def forward(self, x: torch.Tensor, params: dict, out_dtype = None) -> torch.Tensor:
+        # x: seed column only (b,1) under the dflash round contract. Grow to (b, block_size) and
+        # embed through the ATTACHED target's input module - Inkling2InputRead owns the embed and
+        # its embed-side norm (cpp:777/:1052-1069; no embed norm in mtp.safetensors). Mask rows
+        # 1..block_size-1 are then overwritten from this pack's mask_embed.
+        # TODO(C2): confirm target.modules[0] is the embed reader and norm-inclusive for a bare
+        # token id; verify against Inkling2InputRead.forward.
         bsz = x.shape[0]
-        pad = torch.zeros((bsz, self.block_size - 1), dtype = torch.long, device = x.device)
+        pad = torch.full((bsz, self.block_size - 1), 0, dtype = torch.long, device = x.device)
         x = torch.cat((x, pad), dim = -1)
         target = self.attached_model()
-        emb = target.modules[0].forward(x, params)          # model.llm.embed
-        anchor = target.modules[1].forward(emb[:, :1, :], params)  # model.llm.embed_norm
-        emb = torch.cat((anchor.to(emb.dtype), emb[:, 1:, :]), dim = 1)
-        rows = self.block_size - 1
-        me = self.mask_embedding
+        emb = target.modules[0].forward(x, params)
+        me = self.mask_embed
         if me.dim() == 1:
-            me = me.view(-1, self.hidden_size)
-        emb[:, 1:1 + min(rows, me.shape[0]), :] = me[:rows].to(emb.dtype)
+            me = me.view(1, -1)
+        emb = emb.clone()
+        emb[:, 1:, :] = me[:1].to(emb.dtype)   # single mask row broadcast to rows 1..7
         return emb.to(self.out_dtype)
