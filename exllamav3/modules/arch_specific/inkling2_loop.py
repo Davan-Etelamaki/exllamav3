@@ -1501,6 +1501,12 @@ class InklingLayer(Module):
         flow = flow_of(params)
         inst = params.get("layer_instance") or 0
         dtype = x.dtype
+        # Draft-model tap: the shared export_state_layers path keys on layer_idx with instance 0,
+        # which a loop model's later-pass taps cannot reach - a drafter that taps a specific
+        # (layer_idx, instance) pair sets export_state_layer_instances instead (see
+        # Inkling2MTPModel.draft_verifier_params, threaded through model_ls._load_autosplit)
+        export_inst = params.get("export_state_layer_instances")
+        export_state = export_inst is not None and (self.layer_idx, inst) in export_inst
 
         if self.is_loop and self.layer_idx == self.loop_start and inst > 0:
             x = flow["pre_hidden"]
