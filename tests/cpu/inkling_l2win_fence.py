@@ -209,6 +209,24 @@ try:
           f"num_bytes={row_b * 8}" in [c for c in acalls if c.startswith("cudaStreamSetAttribute")][-1],
           [c for c in acalls if c.startswith("cudaStreamSetAttribute")][-1])
 
+    # ---- the field sequence: 24 layers arm the same window on one device, then a round asks for it.
+    #      Added after the on-card failure (dot26 boot 190495): 24 "armed" lines, 24 rounds refused
+    #      with "device carve declined", zero windows set — the arm reset the carve per layer while
+    #      the caller trusted the bytes its first arm had been handed.
+    rres, rcalls, _, _ = run_scenario(binary, "rearm_layers")
+    check("[1ac] 24 same-shape arms keep the carve and the round gets its window",
+          int(rres["layers_zeroed"]) == 0 and int(rres["carve"]) == CEILING
+          and int(rres["stream_rc"]) > 0 and rres.get("refusal", "") == "",
+          f"layers_zeroed={rres.get('layers_zeroed')} rc={rres.get('stream_rc')} "
+          f"refusal={rres.get('refusal')!r}")
+    check("[1ad] those 24 arms cost exactly ONE cudaDeviceSetLimit (counted before the deliberate "
+          "re-arm below)",
+          rres.get("setlimit_after_24") == "1",
+          f"setlimit_after_24={rres.get('setlimit_after_24')}")
+    check("[1ae] a re-arm with different shapes re-carves instead of trusting the old window",
+          int(rres["carve_rearm"]) == CEILING and rres.get("setlimit") == "2",
+          f"carve_rearm={rres.get('carve_rearm')} setlimit={rres.get('setlimit')}")
+
     # ---- a smaller card: clamp through the real call site
     sres2, scalls2, _, _ = run_scenario(binary, "arm_ok", f"l2={32 << 20}")
     check("[1u] on a 32 MiB-L2 card the carve clamps to the card, SetLimit still succeeds",
@@ -254,9 +272,11 @@ fn_body = body[1].split("\n}")[0] if len(body) == 2 else ""
 check("[2a] DevCtx exposes the carve and takes it through exl3_l2win_ctx_carve exactly once",
       len(body) == 2 and fn_body.count("exl3_l2win_ctx_carve") == 1,
       f"{fn_body.count('exl3_l2win_ctx_carve')} call(s) in the accessor")
-check("[2b] the carve is cached per device (one SetLimit per context)",
-      len(body) == 2 and "if (!l2win_carve[device])" in body[1].split("\n}")[0],
-      "cached" if len(body) == 2 and "if (!l2win_carve[device])" in body[1].split("\n}")[0] else "-")
+check("[2b] the accessor reads the owner every call (a second cache here went stale on-card)",
+      len(body) == 2
+      and "l2win_carve[device] = exl3_l2win_ctx_carve(device)" in body[1].split("\n}")[0]
+      and "if (!l2win_carve[device])" not in body[1].split("\n}")[0],
+      "owner-read" if len(body) == 2 else "-")
 prep = devctx.split("void prepare_ctx(int device)", 1)
 check("[2c] prepare_ctx takes the carve once, at context creation",
       len(prep) == 2 and prep[1].split("\n}")[0].count("get_l2win_carve") == 1,
@@ -563,6 +583,28 @@ def prepare_ctx_call_dropped(muts):
         text = text.replace(old, "", 1)
     prep = text.split("void prepare_ctx(int device)", 1)
     return len(prep) != 2 or prep[1].split("\n}")[0].count("get_l2win_carve") != 1
+
+
+def rearm_drops_carve(muts):
+    """Plant the lost idempotence guard: every layer's arm resets the carve again. The check that
+    must trip is the one that survives the on-card fault — a round that gets no window."""
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix = "l2win-mut-"))
+    try:
+        src = prepare_tree(tmp, muts)
+        binp = tmp / "probe"
+        if build(src, binp).returncode != 0:
+            return True
+        res, _, _, _ = run_scenario(binp, "rearm_layers")
+        return res.get("setlimit_after_24") != "1" or int(res.get("layers_zeroed", 0)) != 0 \
+            or res.get("refusal", "") != ""
+    finally:
+        shutil.rmtree(tmp, ignore_errors = True)
+
+
+tripped("per-layer re-arm drops the carve again (the dot26 fault returns)",
+        (("    if (st.armed && st.shapes.h == shapes.h && st.shapes.kvh == shapes.kvh &&",
+          "    if (false && st.armed && st.shapes.h == shapes.h && st.shapes.kvh == shapes.kvh &&"),),
+        rearm_drops_carve)
 
 
 tripped("carve call dropped from prepare_ctx",

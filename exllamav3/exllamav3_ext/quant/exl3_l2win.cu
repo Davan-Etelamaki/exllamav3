@@ -48,6 +48,16 @@ void exl3_l2win_arm(int device, const L2WinShapes& shapes)
 {
     std::lock_guard<std::mutex> lock(g_l2win_mtx);
     L2WinState& st = g_l2win[device];
+    // A model arms once per attention layer, so the same shapes arrive 24 times for one device.
+    // Re-recording identical shapes must NOT drop the carve: an earlier revision reset carve/carve_tried
+    // on every call, so layer 1's carve was erased by layer 2's arm while the caller still read the
+    // bytes it had been promised, and every decode round on the card answered
+    // "INKLING-L2WIN DECLINED L## stream window: device carve declined" (dot26, 2026-11-27, boot
+    // 190495: 24 armed lines, 24 declined rounds, zero windows set). A genuine re-arm with different
+    // shapes still resets, because that is the case where the old window no longer fits the model.
+    if (st.armed && st.shapes.h == shapes.h && st.shapes.kvh == shapes.kvh &&
+        st.shapes.d == shapes.d && st.shapes.rel_extent == shapes.rel_extent)
+        return;
     st.armed = true;
     st.shapes = shapes;
     st.carve_tried = false;           // a re-arm (different shapes) re-carves

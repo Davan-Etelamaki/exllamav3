@@ -78,8 +78,11 @@ int DevCtx::get_smem_request(int device)
 size_t DevCtx::get_l2win_carve(int device)
 {
     std::lock_guard<std::mutex> lock(mtx);
-    if (!l2win_carve[device])
-        l2win_carve[device] = exl3_l2win_ctx_carve(device);
+    // One owner for the carve. The l2win state memoizes a single SetLimit per device and clears that
+    // memo when a genuine re-arm changes the shapes; caching a second copy here let layer 2's re-arm
+    // zero the live carve while this cache kept answering "carved", so every decode round on the card
+    // declined (dot26 boot 190495, 2026-11-27: 24 armed lines, zero windows). Read from the owner.
+    l2win_carve[device] = exl3_l2win_ctx_carve(device);
     return l2win_carve[device];
 }
 

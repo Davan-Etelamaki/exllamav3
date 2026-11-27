@@ -75,6 +75,44 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (scene == "rearm_layers")
+    {
+        // The field sequence, layer for layer: a model arms the SAME window once per attention
+        // layer (24 times on the served pack) before any decode round runs. An earlier revision
+        // reset the carve on every arm while the caller kept the bytes it had already been
+        // promised, so the card printed 24 "armed" lines and then refused every round with
+        // "device carve declined" (dot26 boot 190495, 2026-11-27). The window must survive the
+        // re-arms, and a genuinely different shape must still re-carve.
+        exl3_l2win_arm(0, shapes);
+        size_t first = exl3_l2win_ctx_carve(0);
+        int layers_zeroed = 0;
+        for (int layer = 1; layer < 24; layer++)
+        {
+            exl3_l2win_arm(0, shapes);
+            if (exl3_l2win_ctx_carve(0) == 0)
+                layers_zeroed++;
+        }
+        shim_register(g_base, g_span);
+        int64_t rc = exl3_l2win_stream(0, (uintptr_t) STREAM, g_base, g_rows);
+        const char* refusal_after_round = exl3_l2win_refusal(0);
+        char saved[160];
+        std::snprintf(saved, sizeof(saved), "%s", refusal_after_round);
+        // Counted HERE, before the deliberate different-shape re-arm below: 24 arms of one model must
+        // cost exactly one cudaDeviceSetLimit. That count is the discriminator for the reset-on-every-
+        // arm defect — without the idempotence guard each layer's arm clears carve_tried and the next
+        // carve request goes back to the driver, so a served boot would spend 24 SetLimit calls.
+        const int setlimit_after_24 = shim_call_count("cudaDeviceSetLimit");
+        const L2WinShapes other { g_h, g_kvh * 2, g_d, g_rel };
+        exl3_l2win_arm(0, other);
+        size_t after_diff = exl3_l2win_ctx_carve(0);
+        std::printf("RESULT carve=%zu layers_zeroed=%d stream_rc=%lld refusal=%s "
+                    "carve_rearm=%zu setlimit=%d setlimit_after_24=%d setattr=%d\n",
+                    first, layers_zeroed, (long long) rc, saved, after_diff,
+                    shim_call_count("cudaDeviceSetLimit"), setlimit_after_24,
+                    shim_call_count("cudaStreamSetAttribute"));
+        return 0;
+    }
+
     if (scene == "va_crossing")
     {
         // The window's tail walks past the end of the live allocation: the span is registered only
