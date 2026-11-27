@@ -46,6 +46,18 @@ class InferParams:
     # the card before True means anything (tests/cpu/inkling_attn_graph_fence.py pins the seams)
     inkling_attn_graph: bool = False
 
+    # Key-tiled online-softmax prefill attention (Inkling 2): _attend_one splits the KEY axis as
+    # well as the query axis and folds the running max/sum with a per-chunk fp32 K cast, so no
+    # (h, S, S) fp32 scores/bias plane is ever materialised — the sink seeds the online-softmax
+    # init (m = sink, l = 1, acc = 0) instead of the (S+1) concat, contributing one denominator
+    # term and nothing to the numerator (exact, not approximate). False (default) is the control
+    # arm — the current query-tiled body, bit-identical to the served path — and the switch the
+    # A/B turns on, the same checked-per-call seam inkling_attn_graph is. Rescaling reorders the
+    # exp summation, so True is numerically-equivalent (<=1e-4 abs), NOT bit-identical; the
+    # per-chunk K cast keeps the stack's chunked-cast peak (tests/kernels/attention/
+    # test_keytile_online_softmax_fence.py pins the equivalence, the byte bound, and the rescale)
+    inkling_attn_keytile: bool = False
+
     def __init__(self):
         # With the int8 GEMV mode (on by default), separate int8 GEMV calls beat the fused MGEMM
         # only when a single matrix is wide enough to fill the GPU on its own (and K is within the

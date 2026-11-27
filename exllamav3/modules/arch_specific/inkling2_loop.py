@@ -840,6 +840,35 @@ class InklingAttention(Module):
             cap = max(cap, 32)
         return min(int(T), cap)
 
+    def _attend_keytile_cols(self, S, rows, d, itemsize):
+        """Largest key-column block whose dominant fp32 temporaries — the (h, rows, cols)
+        relative bias, the (kvh, grp*rows, cols) scores, and the per-chunk (kvh, d, cols) fp32
+        K cast — together fit the per-call byte budget.
+
+        The query-tile dial (_attend_one_tile) bounds rows, but the scores/bias plane grows
+        with the KEY axis too, so a long-S prefill keeps an (h, rows, S) slab no matter how
+        small rows gets — the same O(S) peak _attend_one pays. Column tiling bounds the part
+        the row dial cannot reach. The per-column cost carries BOTH the row-dependent terms
+        (bias + scores, 2*h*rows*itemsize) and the row-INDEPENDENT fp32 K cast (kvh*d*itemsize);
+        the keytile branch's byte model omitted the cast, which is the term that dominates the
+        peak while rows stays small (the defect this merge does not carry). Floored at rel_extent
+        so one chunk still covers a full relative window; capped at S so a short cache is a single
+        chunk (launch-neutral, identical to the control arm's iteration count)."""
+        S = int(S)
+        rows = max(1, int(rows))
+        budget = getattr(self, "attend_tile_bytes", _ATTEND_TILE_BYTES)
+        if torch.cuda.is_available():
+            free = int(torch.cuda.mem_get_info()[0])
+            budget = min(budget, max(8 * 1024 * 1024, free // 2))
+        h = self.num_kv_heads * self.num_kv_groups
+        kvh = self.num_kv_heads
+        per_col = 2 * h * rows * itemsize + kvh * d * itemsize   # bias+scores (row-scaled) + K cast (row-free)
+        if not per_col:
+            return S
+        cols = budget // per_col
+        cols = max(self.rel_extent, cols)                        # floor: one full relative window
+        return min(S, max(1, cols))
+
     def _attend_one(self, q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid = None):
         # single sequence: q (h,T,d) half; k/v (S_,kvh,d) half; rel_small (h,T,extent) fp32;
         # sink (T,h) fp32; q_pos (T,), kv_pos (S_,) int on device;
@@ -921,6 +950,73 @@ class InklingAttention(Module):
         attn = torch.cat(outs, dim = 2).reshape(h, T, d)
         return attn
 
+    def _attend_one_keytile(self, q, k, v, rel_small, sink, q_pos, kv_pos, kv_valid = None):
+        # Key-tiled online-softmax sibling of _attend_one, behind infer_params.inkling_attn_keytile.
+        # Same signature and shapes as _attend_one (each caller swaps only the method name), so the
+        # switch is a checked-per-call method choice, exactly as inkling_attn_graph selects arms.
+        # Tiles the KEY axis as well as the query axis and folds a running max/sum with a PER-CHUNK
+        # fp32 K cast (Strata's ink_attn.cuh formulation):
+        #     m' = max(m, max_cols(sc));  a = exp(m - m');
+        #     l = l*a + sum(exp(sc - m'));  acc = acc*a + exp(sc - m') @ V
+        # dividing once at the end. The sink seeds the init (m = sink, l = 1, acc = 0), which is
+        # exact rather than approximate: exp(sink - m) = 1 folds the sink into the denominator as
+        # one term and leaves the numerator untouched, so the (S+1) concat disappears. Mathematically
+        # the same value as the single pass, NOT bit-identical: rescaling reorders the summation of
+        # exp terms, so low mantissa bits differ (the fence asserts <=1e-4 abs, not equality). A row
+        # whose keys are all masked keeps m = sink, l = 1 and returns zeros, as _attend_one does.
+        # The stack's two peak fixes are KEPT, not regressed: grp folds into the row axis on both
+        # sides so matmul broadcasts nothing and clones neither K nor V (the branch's expand of vx
+        # to (kvh,grp,S,d) is gone), and kxf is cast per key chunk off the hoisted fp16 view rather
+        # than hoisting a full-S fp32 slab (the branch's ~1 GiB @262k hoist is gone). kv_valid folds
+        # into the causal refusal exactly as _attend_one does.
+        h, T, d = q.shape
+        S = k.shape[0]
+        grp = self.num_kv_groups
+        kvh = self.num_kv_heads
+        kxf = k.transpose(0, 1).transpose(1, 2)                            # (kvh,d,S) fp16 view, no cast
+        vx = v.transpose(0, 1)                                            # (kvh,S,d), NOT expanded
+        q4 = q.view(kvh, grp, T, d).float()                               # heads grouped by kv head
+        rows = self._attend_one_tile(S, T, 4)
+        cols = self._attend_keytile_cols(S, rows, d, 4)
+        outs = []
+        for qs in range(0, T, rows):
+            qe = min(qs + rows, T)
+            tt = qe - qs
+            snk = sink[qs:qe].T.view(kvh, grp, tt).float()                # (kvh,grp,tt)
+            m = snk.clone()                                               # running max, sink-seeded
+            l = torch.ones_like(m)                                        # denominator, sink term = 1
+            acc = torch.zeros(kvh, grp, tt, d, device = q.device, dtype = torch.float32)
+            q4t = q4[:, :, qs:qe].reshape(kvh, grp * tt, d)
+            for ks in range(0, S, cols):
+                ke = min(ks + cols, S)
+                cc = ke - ks
+                dist = q_pos[qs:qe, None] - kv_pos[None, ks:ke]            # (tt, cc)
+                causal = dist >= 0
+                if kv_valid is not None:
+                    # padded ring columns join the causal refusal; all-True when every column is
+                    # real (global path, exact-fit sliding), so it cannot change a value.
+                    causal = causal & kv_valid[None, ks:ke]
+                bias = rel_small[:, qs:qe, :].gather(                     # (h, tt, cc)
+                    -1, dist.clamp(0, self.rel_extent - 1).unsqueeze(0).expand(h, tt, cc))
+                bias = torch.where((causal & (dist < self.rel_extent)).unsqueeze(0),
+                                   bias, torch.zeros_like(bias))
+                sc = torch.matmul(q4t, kxf[:, :, ks:ke].float()).view(kvh, grp, tt, cc)
+                sc = sc * self.scaling + bias.view(kvh, grp, tt, cc)
+                sc = sc.masked_fill(~causal[None, None, :, :], float("-inf"))
+                m_new = torch.maximum(m, sc.amax(dim = -1))               # (kvh,grp,tt)
+                live = torch.isfinite(m_new)                              # sink-only rows stay finite
+                alpha = torch.where(live, torch.exp(m - m_new), torch.ones_like(m))
+                p = torch.where(live[..., None], torch.exp(sc - m_new[..., None]),
+                                torch.zeros_like(sc))
+                l = l * alpha + p.sum(dim = -1)
+                acc = acc * alpha[..., None] + torch.matmul(
+                    p.to(v.dtype).reshape(kvh, grp * tt, cc), vx[:, ks:ke, :]
+                ).view(kvh, grp, tt, d)                                   # (kvh,grp,tt,d)
+                m = m_new
+            outs.append((acc / l.clamp(min = 1e-30)[..., None]).to(v.dtype))   # (kvh,grp,tt,d)
+        attn = torch.cat(outs, dim = 2).reshape(h, T, d)
+        return attn
+
     def forward_attn(self, h_q, h_k, h_v, params):
         b, t, _ = h_q.shape
         pos_row = self._pos_row(params, b, t)
@@ -943,11 +1039,14 @@ class InklingAttention(Module):
             cache.update_layer_direct(self.layer_idx, cache_seqlens, block_table, kh, vh, t, inst)
             kv_cat_k, kv_cat_v, kv_lens = self._gather_global(
                 cache, cache_seqlens, block_table, inst, kh, vh, t, params)
+            # Checked per call: keytile swaps the attend method, the OFF arm is the served body
+            attend = (self._attend_one_keytile
+                      if self.config.infer_params.inkling_attn_keytile else self._attend_one)
             outs = []
             for bi in range(b):
                 S = kv_lens[bi]
                 kv_pos = torch.arange(S, device = q.device)
-                o = self._attend_one(
+                o = attend(
                     q[bi], kv_cat_k[bi][:S], kv_cat_v[bi][:S], rel_small[bi], sink[bi], pos_row[bi],
                     kv_pos)
                 outs.append(o.transpose(0, 1))                            # (T,h,d)
@@ -1042,6 +1141,9 @@ class InklingAttention(Module):
     def _sliding_attend(self, inp, kr, vr, kv_pos, kv_valid, rb, t, extents):
         kv_k = torch.cat([kr, inp["kh"]], dim = 1).to(torch.half)
         kv_v = torch.cat([vr, inp["vh"]], dim = 1).to(torch.half)
+        # Checked per call, matching the global arm and inkling_attn_graph's seam style
+        attend = (self._attend_one_keytile
+                  if self.config.infer_params.inkling_attn_keytile else self._attend_one)
         outs = []
         for bi in range(rb):
             if extents is None:
@@ -1051,7 +1153,7 @@ class InklingAttention(Module):
                 # mask, the shapes and the bits are the pre-capture path's
                 S = extents[bi]
                 k, v, pos, valid = kv_k[bi][:S], kv_v[bi][:S], kv_pos[bi][:S], kv_valid[bi][:S]
-            outs.append(self._attend_one(
+            outs.append(attend(
                 inp["q"][bi], k, v, inp["rel_small"][bi], inp["sink"][bi], inp["pos_row"][bi],
                 pos, valid).transpose(0, 1))                             # (T,h,d)
         return torch.stack(outs).reshape(rb, t, -1).contiguous()
