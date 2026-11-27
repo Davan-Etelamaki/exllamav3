@@ -393,6 +393,10 @@ class Inkling2MTPMarkovHead(Module):
         super().unload()
 
 
+    def optimizer_targets(self):
+        raise NotImplementedError()
+
+
     @override
     def get_tensors(self):
         t = super().get_tensors()
