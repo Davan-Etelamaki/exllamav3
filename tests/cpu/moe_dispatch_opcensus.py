@@ -87,6 +87,7 @@ def build(source_text, capturing = False):
     ns = {"torch": torch, "moe_coop_plan": plan, "override": override,
           "logger": types.SimpleNamespace(warning = lambda *_: None, info = lambda *_: None),
           "_capturing": lambda: capturing,
+          "_MOE_FUSE_WINDOW": 2048,        # the fused-swiglu window the tree's eager arm reads
           "host_values": lambda t, key: t,                       # eager semantics on CPU
           "stage_host": lambda v, dev, key, dt: torch.tensor(list(v), dtype = dt),
           "get_for_device": lambda p, k, d: None}
@@ -153,7 +154,7 @@ def row(label, c, groups, unit = "token"):
 
 print("\n== measured: ops issued per MoE-layer execution (mock expert interior = 1 matmul/proj) ==")
 row("decode rows=1 (t=1, host round — the served path)", DEC_HOST, n_dec, "token")
-row("prefill rows=2048, device-grouping arm (cf0df7fa)", PRE_DEV, n_dev, "chunk")
+row("prefill rows=2048, device-grouping + fused-swiglu arm", PRE_DEV, n_dev, "chunk")
 row("prefill rows=2048, host round (reference)", PRE_HOST, n_pre, "chunk")
 delta = PRE_DEV.kernel_class - PRE_HOST.kernel_class
 print(f"\ndevice arm's own cost at prefill shape: {delta:+d} kernel-class ops per MoE layer "
@@ -182,7 +183,8 @@ for rows in (1, 8, 32, 33, 2048):
     print(f"  refusal(rows={rows:5d}, cuda+fp16+ext present) → "
           f"{'ADMITTED' if r is None else r}")
 
-print("\n== priced proposal (NOT landed): absorb the MoE torch glue the census §CH names ==")
+print("\n== fused tier AS LANDED on dsh-devdispatch: absorbs the MoE torch glue §CH names; the "
+      "fused=False arm below is the excised per-group reference ==")
 # §CH: at::native eager glue is 49.70 % of GPU time and cudaLaunchKernel 10,377,201 calls are
 # 64.0 % of host API time. Most of the MoE dispatch's cost is NOT the expert GEMMs — it is the
 # per-group elementwise swiglu and its casts, which are row-independent and can therefore run

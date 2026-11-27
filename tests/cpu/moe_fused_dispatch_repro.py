@@ -68,6 +68,8 @@ if "class InklingMoE" not in _TEXT:
           f"venv's installed exllamav3 1.6.7 has no Inkling module; the served install is on dot26)")
     raise SystemExit(2)
 SHA1 = hashlib.sha1(LOOP.read_bytes()).hexdigest()
+TREE_SRC = ROOT / "exllamav3/modules/arch_specific/inkling2_loop.py"
+TREE_SHA1 = hashlib.sha1(TREE_SRC.read_bytes()).hexdigest()
 
 ROWS = 2048                     # one prefill chunk (chunk_size); the shape §CH profiled
 PACK_E, PACK_TOPK, PACK_H, PACK_I = 128, 8, 2304, 1152
@@ -142,8 +144,9 @@ def override(fn):
     return fn
 
 
-def served_forward():
-    tree = ast.parse(LOOP.read_text(encoding = "utf8"))
+def served_forward(source = None):
+    src = pathlib.Path(source) if source else LOOP
+    tree = ast.parse(src.read_text(encoding = "utf8"))
     moe = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "InklingMoE"][0]
     fwd = [n for n in moe.body if isinstance(n, ast.FunctionDef) and n.name == "forward"][0]
     node = copy.deepcopy(fwd)
@@ -151,11 +154,12 @@ def served_forward():
     ns = {"torch": torch, "moe_coop_plan": plan, "override": override,
           "logger": types.SimpleNamespace(warning = lambda *_: None, info = lambda *_: None),
           "_capturing": lambda: False,
+          "_MOE_FUSE_WINDOW": 2048,        # the fused-swiglu window the tree's forward reads
           "host_values": lambda t, key: t,
           "stage_host": lambda v, dev, key, dt: torch.tensor(list(v), dtype = dt),
           "get_for_device": lambda p, k, d: None}
     exec(compile(ast.fix_missing_locations(ast.Module(body = [node], type_ignores = [])),
-                 str(LOOP), "exec"), ns)
+                 str(src), "exec"), ns)
     return ns["forward"]
 
 
@@ -343,13 +347,20 @@ stub_p, H_p = make_stub([])
 y_all = per_entry_down(stub_p, torch.randn(1, ROWS, H_p,
                                            generator = torch.Generator().manual_seed(9)).half())
 FLOOR, out_floor, _, _, _ = run(lambda s, x, m: arm_floor(s, x, m, y_all))
+FUSED_MODE = out_fused = None
+if TREE_SRC.resolve() != LOOP.resolve():
+    # §CP's law-31 shape: the denominator comes from the INSTALLED artifact, the arm under test
+    # is the tree's own landed dispatch.
+    FUSED_MODE, out_fused, _, _, _ = run(lambda s, x, m: served_forward(TREE_SRC)(s, x, {}))
 
 print(f"baseline source: {LOOP} (sha1 {SHA1[:12]})")
 print(f"shape: rows={ROWS} (one {ROWS}-token prefill chunk), experts {PACK_E}, top_k {PACK_TOPK}; "
       f"ext ops recorded with production K/N (2304/1152)")
 print(f"\nEAGER baseline (same run): {EAGER.total} dispatcher ops per executed MoE layer-pass "
       f"| GLUED {GLUED.total} | GROUPED (python skeleton) {GROUPED.total} "
-      f"| FLOOR (model: expert loop inside the kernel) {FLOOR.total}")
+      f"| FLOOR (model: expert loop inside the kernel) {FLOOR.total} "
+      f"| FUSED (tree dispatch, sha1 {TREE_SHA1[:12]}) "
+      f"{FUSED_MODE.total if FUSED_MODE else 'same source as baseline'}")
 fam_e, fam_g = EAGER.by_family(), GROUPED.by_family()
 print("\nfamily                eager   glued  grouped   ratio(grouped/eager)   flag")
 for f in sorted(set(fam_e) | set(fam_g), key = lambda k: -fam_e.get(k, 0)):
@@ -363,7 +374,8 @@ check("the baseline is a same-run eager trace, not a remembered constant",
       EAGER.total > 0 and EAGER2.total == EAGER.total,
       f"repeat trace {EAGER2.total} vs {EAGER.total}")
 check(f"GROUPED (python skeleton) ≤ eager/10 ({bar:.1f} ops) — the §CJ merge bar, computed from "
-      "this run; RED here today because the fused tier has not landed",
+      "this run; RED by design until the expert loop lives inside one grouped launch (the "
+      "ext/wheel step), python cannot close it",
       GROUPED.total <= bar, f"grouped={GROUPED.total}")
 check("GLUED alone does NOT reach the bar (so the bar really bills the grouped tier, not glue)",
       GLUED.total > bar, f"glued={GLUED.total}")
@@ -374,6 +386,16 @@ check("the floor model reproduces the served result within fp32 accumulation noi
       "replaces per-group index_add_ — an accumulation-ORDER decision, not a bit-identity claim)",
       floor_d <= 1e-4 * out_eager.abs().max().item(),
       f"max|Δ| {floor_d:.3e} against |out|max {out_eager.abs().max().item():.1f}")
+if FUSED_MODE is not None:
+    check(f"FUSED — the tree's landed dispatch ≤ installed-eager/10 ({bar:.1f} ops): the "
+          f"merge-governing number. What landed in python is the swiglu + cast hoist (the §CH "
+          f"at::native glue family); the ops that remain are the per-group cat/gather/down + "
+          f"combine, which only the grouped-expert kernel (ext/wheel) can absorb",
+          FUSED_MODE.total <= bar,
+          f"fused={FUSED_MODE.total} (tree sha1 {TREE_SHA1[:12]}) vs eager(baseline)={EAGER.total}")
+    check("the tree's dispatch reproduces the installed artifact's output bit-for-bit",
+          torch.equal(out_fused, out_eager),
+          f"max|Δ|={(out_fused - out_eager).abs().max().item():.3e}")
 check("the arms keep the math: glued and grouped outputs are bit-identical to the served path",
       torch.equal(out_glued, out_eager) and torch.equal(out_grouped, out_eager),
       f"glued Δ {(out_glued - out_eager).abs().max().item():.3e} "

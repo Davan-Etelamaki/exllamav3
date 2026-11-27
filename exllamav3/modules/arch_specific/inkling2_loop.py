@@ -2022,6 +2022,9 @@ class InklingOutputRead(InklingBlockRead):
 _MOE_EXPERTX_RECENSUS = 64        # MoE forwards between full residence censuses
 _MOE_EXPERTX_LOG_EVERY = 2048     # MoE forwards between summary lines per layer
 _MOE_EXPERTX_TENSORS = ("trellis", "suh", "svh")   # what a routed expert's GEMMs read
+_MOE_FUSE_WINDOW = 2048   # entries per fused-swiglu pass: bounds the fp32 temporaries of the
+# fused dispatch (at the pack's inter 1152 that is 2 × 2048 × 1152 × 4 B = 18 MiB, not the
+# 144 MiB an unbounded pass would ask for on a card whose OOM granule is 20 MiB at ~2 MiB free)
 
 
 def _fresh_expertx_ledger() -> dict:
@@ -2417,6 +2420,7 @@ class InklingMoE(Module):
         #     recorded: boundaries frozen from the capture round would otherwise meet a fresh
         #     argsort on replay and hand tokens to the wrong expert.
         if t > 1 and not _capturing():
+            device_grouped = True
             order_all = torch.argsort(sel_flat, stable = True)
             counts = torch.bincount(sel_flat, minlength = self.num_routed_experts)
             chosen = torch.nonzero(counts).flatten()
@@ -2424,6 +2428,7 @@ class InklingMoE(Module):
             bounds = host_values(torch.stack([chosen, ends], 0), ("inkling2", "moe_bounds"))
             groups = list(zip(bounds[0].tolist(), bounds[1].tolist()))
         else:
+            device_grouped = False
             sel_cpu = host_values(sel_flat, ("inkling2", "moe_sel")).tolist()
             order = sorted(range(len(sel_cpu)), key = lambda i: sel_cpu[i])
             # Diet (2026-11-26): one upload of the whole sorted order, groups become device
@@ -2441,6 +2446,50 @@ class InklingMoE(Module):
                 groups.append((e, m))
                 n = m
         tokens_all = torch.div(order_all, self.top_k, rounding_mode = "floor")
+        if device_grouped:
+            # FUSED SWIGLU — the §CI worklist's first item, taken inside this lane. The swiglu
+            # chain is row-independent, so it runs a bounded number of times over ALL entries
+            # instead of once per expert group: the per-group elementwise + casts (§CH: the
+            # at::native glue family, 49.70 % of GPU time) collapse from 8·groups to
+            # 8·ceil(entries/_MOE_FUSE_WINDOW) + 2 cats. The expert GEMMs stay per-group —
+            # putting them inside one launch is the grouped-kernel wheel step (§CJ's floor model,
+            # 22 ops vs today's ~250), not a python step.
+            # Bit-identical by construction: same values, same per-element operations, same group
+            # order, same per-group index_add_ combine; tests/cpu/inkling_moe_fusedglue_fence.py
+            # executes both arms and checks that, the window edges, and a planted wrong softcap.
+            gs, us = [], []
+            start = 0
+            for e, end in groups:
+                xs = flat.index_select(0, tokens_all[start:end])
+                gs.append(self.experts_g[e].forward(xs, params))
+                us.append(self.experts_u[e].forward(xs, params))
+                start = end
+            g_all = torch.cat(gs, 0)
+            u_all = torch.cat(us, 0)
+            n_entries = g_all.shape[0]
+            # Activation dtype = torch.half, the same cast the per-expert seam applies
+            # (`act.to(torch.half)` below). Taking g_all.dtype instead would keep fp32
+            # activations whenever a projection returns wider, and the down-projection input
+            # would no longer be the tensor today's path feeds.
+            act_all = torch.empty((n_entries, g_all.shape[-1]), dtype = torch.half,
+                                  device = x.device)
+            lo = 0
+            while lo < n_entries:
+                hi = min(lo + _MOE_FUSE_WINDOW, n_entries)
+                gw = g_all[lo:hi].float()
+                uw = u_all[lo:hi].float()
+                aw = torch.tanh(gw / self.gate_softcap) * self.gate_softcap
+                aw = aw * torch.sigmoid(gw)
+                aw = aw * (torch.tanh(uw / self.up_softcap) * self.up_softcap)
+                act_all[lo:hi] = aw.to(torch.half)
+                lo = hi
+            start = 0
+            for e, end in groups:
+                y = self.experts_d[e].forward(act_all[start:end], params)
+                out.index_add_(0, tokens_all[start:end],
+                               y.float() * w_flat.index_select(0, order_all[start:end]).unsqueeze(-1))
+                start = end
+            return out.view(b, t, h)
         start = 0
         for e, end in groups:
             entries = order_all[start:end]
