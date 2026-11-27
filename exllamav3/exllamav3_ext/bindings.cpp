@@ -3,6 +3,7 @@
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <ATen/cuda/CUDAContext.h>        // current stream handle, for the persisting-L2 window
 
 #include "stloader.h"
 #include "cuda_host.h"
@@ -33,6 +34,7 @@
 #include "quant/exl3_kernel_map.cuh"
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
+#include "quant/exl3_l2win.cuh"
 #include "quant/exl3_moe.cuh"
 #include "quant/exl3_moe_coop.cuh"
 
@@ -194,6 +196,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
     m.def("g_get_smem_max", &g_get_smem_max, "g_get_smem_max");
+    // Persisting-L2 window (infer_params.inkling_attn_l2win). arm: records the served shapes and
+    // takes the device carve through DevCtx, returning the bytes the device accepted (0 = declined,
+    // reason via exl3_l2win_refusal). stream: steers the CURRENT CUDA stream's accesses over the
+    // given row span onto that carve. Torch owns stream creation, so a Python caller cannot hand a
+    // cudaStream_t to a binding; the current stream of the calling thread is the handle the decode
+    // attention actually runs on, including inside `with torch.cuda.stream(s)` and a graph capture.
+    m.def("exl3_l2win_arm", [](int64_t device, int64_t h, int64_t kvh, int64_t d, int64_t rel_extent)
+    {
+        exl3_l2win_arm((int) device, L2WinShapes { (int) h, (int) kvh, (int) d, (int) rel_extent });
+        return (int64_t) DevCtx::instance().get_l2win_carve((int) device);
+    }, "exl3_l2win_arm", py::arg("device"), py::arg("h"), py::arg("kvh"), py::arg("d"), py::arg("rel_extent"));
+    m.def("exl3_l2win_stream", [](int64_t device, int64_t hot_base, int64_t rows)
+    {
+        return exl3_l2win_stream((int) device,
+                                 (uintptr_t) at::cuda::getCurrentCUDAStream().stream(),
+                                 (uintptr_t) hot_base, (int) rows);
+    }, "exl3_l2win_stream", py::arg("device"), py::arg("hot_base"), py::arg("rows"));
+    m.def("exl3_l2win_refusal", [](int64_t device)
+    {
+        return std::string(exl3_l2win_refusal((int) device));
+    }, "exl3_l2win_refusal", py::arg("device"));
+    m.def("g_get_l2win_carve", &g_get_l2win_carve, "g_get_l2win_carve");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
     m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
     m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");

@@ -902,6 +902,12 @@ class InklingAttention(Module):
         self._attn_graph_failed = None
         self._attn_graph_logged = set()
         self._attn_margin_wait = 0      # rounds to skip the VRAM probe after a margin refusal
+        # Persisting-L2 window state (infer_params.inkling_attn_l2win, off by default): armed means
+        # this layer's carve is in place; refused means a call came back declined and the layer stops
+        # asking, so a card that cannot honour the window pays one probe, not one per round.
+        self._l2win_armed = False
+        self._l2win_refused = False
+        self._l2win_dev_idx = 0
 
     @override
     def optimizer_targets(self):
@@ -910,6 +916,10 @@ class InklingAttention(Module):
     @override
     def load(self, device, **kwargs):
         super().load(device, **kwargs)
+        # The carve is a per-device limit against the context, so it is taken while the device is
+        # being set up, not on the first decode round that would want it. Gate OFF: no ext call.
+        if self.config.infer_params.inkling_attn_l2win:
+            self._l2win_arm(device)
         for cl in self.cache_layers:
             cl.alloc(device)
         self.q_scale = self.config.stc.get_tensor(self.k_q_scale, device, optional = False, allow_bf16 = True, no_defer = True).float()
@@ -928,6 +938,45 @@ class InklingAttention(Module):
         self._attn_graph_failed = None
         self._attn_margin_wait = 0
         super().unload()
+
+    def _l2win_arm(self, device):
+        """Take this device's persisting-L2 carve for the row span this layer's decode rounds ask
+        for. The bytes come from the served shapes (heads, kv heads, head dim, relative extent), so
+        the window follows the model instead of a remembered constant. A zero return is a refusal the
+        extension already gave a reason for; the layer then stops asking and every round keeps
+        ordinary L2 behaviour."""
+        dev = device if isinstance(device, torch.device) else torch.device(device)
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        self._l2win_dev_idx = idx
+        carve = ext.exl3_l2win_arm(idx, self.num_q_heads, self.num_kv_heads, self.head_dim,
+                                   self.rel_extent)
+        self._l2win_armed = bool(carve > 0)
+        if self._l2win_armed:
+            logger.warning(f"INKLING-L2WIN armed L{self.layer_idx:02d} device={idx} "
+                           f"carve={carve / 2 ** 20:.1f} MiB shapes=h{self.num_q_heads}/"
+                           f"kvh{self.num_kv_heads}/d{self.head_dim}/rel{self.rel_extent}")
+        else:
+            self._l2win_refused = True
+            logger.warning(f"INKLING-L2WIN DECLINED L{self.layer_idx:02d} device={idx}: "
+                           f"{ext.exl3_l2win_refusal(idx)}")
+
+    def _l2win_round(self, hot, rows):
+        """Steer this round's attention stream onto the carved slice, over the hot row span. Checked
+        per call, like the attend arms: with the gate off the extension is never touched, so the
+        served path issues neither cudaDeviceSetLimit nor cudaStreamSetAttribute. Torch owns stream
+        creation, so the handle is the current stream of this thread — which is the stream the round
+        really runs on, including inside a warm-up side stream or a graph capture."""
+        if (not self.config.infer_params.inkling_attn_l2win
+                or self._l2win_refused or hot is None or rows <= 0):
+            return
+        if not self._l2win_armed:
+            self._l2win_arm(self.device)          # gate flipped after load: arm once, lazily
+            if self._l2win_refused:
+                return
+        if ext.exl3_l2win_stream(self._l2win_dev_idx, hot.data_ptr(), int(rows)) < 0:
+            self._l2win_refused = True
+            logger.warning(f"INKLING-L2WIN DECLINED L{self.layer_idx:02d} stream window: "
+                           f"{ext.exl3_l2win_refusal(self._l2win_dev_idx)}")
 
     @override
     def get_tensors(self):
@@ -1370,6 +1419,7 @@ class InklingAttention(Module):
             ip = self.config.infer_params
             attend = (self._attend_one_biasfuse if ip.inkling_attn_biasfuse
                       else self._attend_one_keytile if ip.inkling_attn_keytile else self._attend_one)
+            self._l2win_round(q, b)                 # gate off: returns without touching the extension
             outs = []
             for bi in range(b):
                 S = kv_lens[bi]
@@ -1516,6 +1566,7 @@ class InklingAttention(Module):
         ip = self.config.infer_params
         attend = (self._attend_one_biasfuse if ip.inkling_attn_biasfuse
                   else self._attend_one_keytile if ip.inkling_attn_keytile else self._attend_one)
+        self._l2win_round(inp["q"], rb)             # the padded rows the round really runs
         outs = []
         for bi in range(rb):
             if extents is None:

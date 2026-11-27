@@ -98,6 +98,25 @@ class InferParams:
     # census and the fp16-PV regression.
     inkling_attn_biasfuse: bool = False
 
+    # Persisting-L2 window over the decode row span (Inkling 2): carve a slice of the GPU's L2 with
+    # cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize) — once per device, at context creation —
+    # and steer one CUDA stream's accesses inside a computed VA range onto that slice with
+    # cudaStreamSetAttribute(accessPolicyWindow): hitProp=Persisting for the rows a decode step
+    # revisits (q/k/v/o projections, its norm/router/PLE rows and the relative-bias band, sized from
+    # the served h/kvh/d/rel_extent, never a remembered constant) and missProp=Streaming, which is
+    # evict-first, for everything else — so the ~32 MB of routed-expert weight reads per decode token
+    # stream through L2 instead of evicting the rows that stay hot. Split by reuse class, as the
+    # same-card Xolotl comparator does; the experts ride the default stream and lose by omission.
+    # The window is a hint, so a card or an address that cannot honour it is refused with an
+    # INKLING-L2WIN DECLINED line and the round runs with ordinary L2 behaviour — never a crash.
+    # False (default) is the served path byte-for-byte: the policy stays unarmed, so neither CUDA
+    # call is issued and no attribute is even queried. Arm per layer at load, apply per decode round
+    # on whatever stream the attention runs on (torch owns stream creation; the current stream is the
+    # handle). tests/cpu/inkling_l2win_fence.py executes the CUDA translation unit against a
+    # recording shim: it pins the call order, the carve clamp, the shape-derived window length and
+    # both refusal paths. The throughput claim is on-card pending.
+    inkling_attn_l2win: bool = False
+
     # Routed-expert WEIGHT RESIDENCE ledger for the Inkling 2 MoE block: True makes
     # InklingMoE.forward census, every _MOE_EXPERTX_RECENSUS forwards, which device each routed
     # expert's weight tensors (trellis/suh/svh) live on and whether their addresses moved without

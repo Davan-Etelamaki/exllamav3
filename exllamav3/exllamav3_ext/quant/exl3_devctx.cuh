@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <tuple>
 #include <mutex>
 #include "../arch.cuh"
@@ -38,6 +39,7 @@ private:
     int num_sms[MAX_DEVICES] = {};
     int cc[MAX_DEVICES] = {};
     int smem_max[MAX_DEVICES] = {};
+    size_t l2win_carve[MAX_DEVICES] = {};
     void* locks[MAX_DEVICES] = {};
     void* ws[MAX_DEVICES] = {};
     std::mutex mtx;
@@ -52,6 +54,12 @@ public:
     // What an EXL3 kernel may actually request: the above, capped at the SMEM_MAX the kernels
     // are written against. Use this for cudaFuncSetAttribute and launch parameters.
     int get_smem_request(int device);
+    // Bytes of L2 this device has carved for persisting accesses (quant/exl3_l2win.cu): 0 when the
+    // inkling_attn_l2win gate is off or the device refused the carve. Held here because the carve is
+    // a per-device limit set once against the context, like the lock buffer and the workspace; the
+    // window that uses it is per-stream and lives with the caller. A zero is cached as "not yet",
+    // so a device armed after its context was prepared still gets its carve on the next call.
+    size_t get_l2win_carve(int device);
     void* get_ws(int device);
     int* get_locks(int device);
 
@@ -64,5 +72,6 @@ private:
 int g_get_cc(int device);
 int g_get_num_sms(int device);
 int g_get_smem_max(int device);
+size_t g_get_l2win_carve(int device);
 
 void prepare_ctx(int device);
