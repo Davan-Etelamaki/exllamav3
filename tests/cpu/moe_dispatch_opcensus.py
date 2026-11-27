@@ -124,6 +124,9 @@ def build(source_text, capturing = False):
         experts_g = experts_g, experts_u = experts_u, experts_d = experts_d,
         _coop_refuse_reason = "census: coop tier not exercised here",
         _coop_decode = lambda flat_, sel_, w_: None,
+        # The real InklingMoE always carries the grouped tier; this census measures the eager
+        # dispatch chain, so the grouped arm DECLINES here (mirrors _coop_decode)
+        _grouped_moe = lambda f_, s_, w_, p_, t_: None, _grouped_refuse_reason = None,
         _expertx = None, _expertx_note = lambda: None)
     return ns["forward"], stub, calls
 

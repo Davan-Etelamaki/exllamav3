@@ -323,6 +323,9 @@ def world(flag, source = None):
         experts_d = [Lin(I, H, 700 + e) for e in range(NE)],
         _coop_refuse_reason = None,
         _coop_decode = lambda flat_, sel_, w_: calls.append("coop") or None,
+        # The real InklingMoE always carries the grouped tier; this fence prices the
+        # residence ledger, so the grouped arm DECLINES here (mirrors _coop_decode)
+        _grouped_moe = lambda f_, s_, w_, p_, t_: None, _grouped_refuse_reason = None,
         _expertx = {"forwards": 3, "censuses": 1, "moves": 0, "fingerprint": (), "census": {}},
         _expertx_note = lambda: calls.append("expertx"))
     return stub, ns["forward"], calls

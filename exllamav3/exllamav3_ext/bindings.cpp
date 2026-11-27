@@ -38,6 +38,7 @@
 #include "inkling/fa_prefill_torch.cuh"
 #include "quant/exl3_moe.cuh"
 #include "quant/exl3_moe_coop.cuh"
+#include "moe_group/moe_group_ext.cuh"      // INKLING-MOE-GROUPED: two-launch multi-token tier
 
 #include "generator/strings.h"
 #include "generator/staging.h"
@@ -359,6 +360,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
+    // INKLING-MOE-GROUPED: the two grouped launches + their refusal reason (Inkling 2 MoE,
+    // eager multi-token regime; infer_params.inkling_moe_grouped_ext defaults OFF)
+    m.def("exl3_moe_group_gu", &moe_group::exl3_moe_group_gu, "exl3_moe_group_gu");
+    m.def("exl3_moe_group_down", &moe_group::exl3_moe_group_down, "exl3_moe_group_down");
+    m.def("exl3_moe_group_reason", &moe_group::exl3_moe_group_reason, "exl3_moe_group_reason");
 
     m.def("bighead_attn", &bighead_attn, "bighead_attn");
     m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");

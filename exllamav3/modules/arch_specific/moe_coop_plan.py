@@ -33,6 +33,69 @@ CALL_ARGS = (
 )
 
 
+# ---- grouped multi-token tier (infer_params.inkling_moe_grouped_ext, default OFF) ----------
+# The eager MULTI-TOKEN regime (t > 1, not capturing) never reaches coop: rows above the
+# decode ladder run the python dispatch, whose per-group gather/gate/up/down fan-out is the
+# §CH at::native glue family. The grouped tier collapses that fan-out into TWO launches
+# (gu with the fused softcap-swiglu epilogue, then down) whose rows come from the device
+# order_all — the same stable ascending-expert order the python loop sorts into — so no host
+# roundtrip and no per-group aten op survives. Geometry mirrors #define MOE_GROUPED_* in
+# exllamav3_ext/moe_group/moe_group_ext.cuh; tests/cpu/inkling_moe_grouped_fence.py re-parses
+# the header and pins these equal (the same drift discipline MOE_COOP_ACT_SOFTCAP uses).
+GROUPED_BUCKETS = (64, 128, 256, 512, 1024, 2048)   # workspace rows ladder; 2048 = chunk_size
+# mirrors constexpr int MOE_GROUPED_MAX_ROWS = 2048 (moe_group_ext.cuh) — fence re-parses
+MOE_GROUPED_MAX_ROWS = 2048
+# Table stacking order inside the single int64 `tables` tensor: [9, num_experts] row-major,
+# the same nine lists _coop_ptr_lists builds, in sorted-name order. Fenced against the
+# header's MoEGroupedTables::slot() enumeration by the grouped fence.
+TABLE_ORDER = ("d_suh", "d_svh", "d_trellis", "g_suh", "g_svh", "g_trellis",
+               "u_suh", "u_svh", "u_trellis")
+# Positional argument names of the two grouped pybind entries, IN ORDER (arity is fenced
+# against moe_group_ext.cuh): a signature change on either side trips the fence instead of
+# silently shifting a pointer table into the gate-cap slot.
+GU_CALL_ARGS = ("x", "order_all", "counts", "tables", "K", "mcg", "mul1",
+                "act", "gate_cap", "up_cap")
+DOWN_CALL_ARGS = ("act", "entries", "order_all", "counts", "tables", "K", "mcg", "mul1", "y")
+
+
+def grouped_padded_rows(rows: int) -> int | None:
+    """Bucket the grouped workspace takes for a live row count (the padded-bucket rule the
+    coop arena established, over GROUPED_BUCKETS). None above the ladder: the grouped tier
+    refuses, the python dispatch keeps that shape."""
+    for bucket in GROUPED_BUCKETS:
+        if rows <= bucket:
+            return bucket
+    return None
+
+
+def grouped_refusal(rows: int, top_k: int, t: int, is_cuda: bool, x_half: bool,
+                    capturing: bool, ext_has_fns: bool) -> str | None:
+    """Why the grouped tier must not run for this call, or None when it may. Every leg is
+    cheap and host-side. REGIME SEAM: t == 1 (decode — coop owns rows <= 32) and CUDA-graph
+    capture keep today's chain verbatim; a capture must keep baking the routing it recorded.
+    The row cap is the workspace's, not the math's: rows above the ladder keep the eager
+    python dispatch instead of forcing a gigabyte-scale arena."""
+    if t <= 1:
+        return "t == 1 decode keeps its verbatim arm (rows <= 32 belong to the coop tier)"
+    if not is_cuda:
+        return "x is not a CUDA tensor"
+    if not x_half:
+        return "x is not fp16"
+    if capturing:
+        return "CUDA graph capture keeps the recorded routing (regime seam)"
+    if not ext_has_fns:
+        return "the built extension has no exl3_moe_group_gu/exl3_moe_group_down entries"
+    if grouped_padded_rows(rows) is None:
+        return f"{rows} rows is above the grouped ladder {GROUPED_BUCKETS} (keep eager chain)"
+    return None
+
+
+def grouped_eligible(rows: int, top_k: int, t: int, is_cuda: bool, x_half: bool,
+                     capturing: bool, ext_has_fns: bool) -> bool:
+    """Boolean front of grouped_refusal() — the hard preconditions, everything host-side."""
+    return grouped_refusal(rows, top_k, t, is_cuda, x_half, capturing, ext_has_fns) is None
+
+
 def ctr_len(slots_max: int, bsz_max: int, I: int, Ho: int) -> int:
     """Mirror of inline exl3_moe_coop_ctr_len (exl3_moe_coop.cuh): completion counters
     + run table. Int division matches the C++ ints (I, Ho are multiples of 128)."""
@@ -120,7 +183,7 @@ def eligible(rows: int, top_k: int, is_cuda: bool, x_half: bool,
     return refusal(rows, top_k, is_cuda, x_half, ext_has_fn) is None
 
 
-def build_call_args(values: dict) -> tuple:
-    """Assemble the positional tuple for exl3_moe_coop in CALL_ARGS order. Raises on a
-    missing key so wiring mistakes land loudly instead of defaulting."""
-    return tuple(values[name] for name in CALL_ARGS)
+def build_call_args(values: dict, args = CALL_ARGS) -> tuple:
+    """Assemble the positional tuple for an ext entry in `args` order (default: the coop
+    CALL_ARGS). Raises on a missing key so wiring mistakes land loudly instead of defaulting."""
+    return tuple(values[name] for name in args)

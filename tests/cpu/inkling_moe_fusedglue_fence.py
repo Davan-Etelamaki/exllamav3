@@ -129,6 +129,9 @@ def world(source_text, capture = False, window = 4096):
         router_w = torch.eye(E, H), router_bias = torch.zeros(E),
         experts_g = experts_g, experts_u = experts_u, experts_d = experts_d,
         _coop_refuse_reason = None, _coop_decode = lambda f, s, w: None,
+        # The real InklingMoE always carries the grouped tier; this fence prices the fused
+        # swiglu window, so the grouped arm DECLINES here (mirrors _coop_decode)
+        _grouped_moe = lambda f, s, w, p, t: None, _grouped_refuse_reason = None,
         _expertx = None, _expertx_note = lambda: None)
     return ns["forward"], stub, hits
 
