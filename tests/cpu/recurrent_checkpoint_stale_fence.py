@@ -15,6 +15,18 @@ checkpoint written against a DIFFERENT recurrent-layer registry is a cache MISS
       to the free_list when state construction fails;
   [4] both job.py consumers treat None as the replay-from-zero miss: allocate_pages
       falls back to new_recurrent_state(), and the rewind path resets replay_from to 0.
+Evidence pair (law 31; Launchers cc_f14_slothole_arm.py, dot26 installed bytes; rc is 0 on
+BOTH halves — quote the TOKEN, never the rc):
+  RED   wheel 018d2702524ac (short_conv ffd28f50, cache f5caccba):
+        VERDICT_SLOTHOLE hole CONFIRMED (compatible+missing-slot reaches unstash uncaught)
+  GREEN wheel 3c449ee1 (short_conv 71038765, cache f5caccba — completeness gate aboard,
+        quarantine not yet):
+        VERDICT_SLOTHOLE hole REFUTED + BH1-in-caught-stale + dirty=False
+        (gate containment in force; quarantine half NOT installed — cache.py lacks clear_slot)
+  GREEN+quarantine, tip 459ae4d7 and later (--fixed):
+        VERDICT_SLOTHOLE hole REFUTED + BH1-in-caught-stale + dirty=False +
+        QUARANTINE-IN-FORCE (gate miss; mid-copy fault returns the slot zeroed)
+
 Run:  CUDA_VISIBLE_DEVICES= env -u PYTHONHOME -u PYTHONPATH -u LD_LIBRARY_PATH \\
       PYTHONPATH=. ~/.venvs/tabby-exl3/bin/python tests/cpu/recurrent_checkpoint_stale_fence.py
 """
