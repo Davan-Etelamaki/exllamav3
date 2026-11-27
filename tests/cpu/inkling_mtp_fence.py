@@ -166,6 +166,12 @@ check("exit anchor is batch-safe: row-0 broadcast when the stored batch mismatch
       "if f_rnn.shape[0] != bsz:" in msrc and "f_rnn = f_rnn[0:1].expand(bsz, -1, -1)" in msrc)
 check("seed-row fallback arm exists for the pre-anchor round",
       "state[:, 0:1, :].half()" in msrc)
+check("per-round window cap published through draft_confidence_len (generator.py:1617, dsv4 precedent)",
+      'params["draft_confidence_len"] = int(alive.sum(dim = -1).max().item())' in msrc)
+# CONTROL 6e: dropping the cap reinstates unconditional full-window proposals (the 3% dilution)
+mut6e = msrc.replace('params["draft_confidence_len"] = int(alive.sum(dim = -1).max().item())', "pass")
+check("CONTROL: removing the window cap trips the draft_confidence_len arm",
+      'params["draft_confidence_len"]' not in mut6e)
 # CONTROL 6d-a: dropping the half cast on the tap mix reintroduces the fault-12 kHalf refusal
 mut6da = msrc.replace("self._mix_taps(3, self._anchor_taps).half()",
                       "self._mix_taps(3, self._anchor_taps)")

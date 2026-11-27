@@ -368,6 +368,12 @@ class Inkling2MTPModel(Model):
         # Constant-confidence truncation: everything after the first sub-tau draft is dropped
         alive = torch.cumprod((conf >= 0.35).float(), dim = -1)
         params["draft_conf"] = conf * alive
+        # Sanctioned per-round window cap the dflash path applies WITHOUT the online
+        # calibrator (generator.py:1617; deepseek_v4_mtp.py:369 precedent): propose only
+        # the slots that cleared tau, longest row wins, 0 sends no draft at all. The
+        # calibrator's bin_width of 1.0 cannot resolve conf in (0,1], so its online path
+        # is the wrong instrument for this score scale.
+        params["draft_confidence_len"] = int(alive.sum(dim = -1).max().item())
         for b in range(bsz):
             keep = int(alive[b].sum().item())
             ids[b, keep + 1:] = ids[b, keep]
