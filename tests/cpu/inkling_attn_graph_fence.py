@@ -360,7 +360,8 @@ print("[6] no pageable H2D, no host read-back inside the captured body")
 GRAPH_BODY = [TOP_FN["ring_geometry"], METHODS["InklingConvs"]["ring_read"],
               METHODS["InklingAttention"]["_sliding_body"],
               METHODS["InklingAttention"]["_sliding_attend"]]
-CAPTURED = GRAPH_BODY + [METHODS["InklingAttention"]["_sliding_capture"]]
+CAPTURED = GRAPH_BODY + [METHODS["InklingAttention"]["_sliding_capture"],
+                         METHODS["InklingAttention"]["_attn_round"]]
 captured_src = "\n".join(flat(n) for n in CAPTURED)
 body_src = "\n".join(flat(n) for n in GRAPH_BODY)
 check("captured region builds no pageable host tensor",
@@ -414,7 +415,7 @@ planted_unload = unload_src.replace("self._attn_ledger.clear_resident()", "pass"
 check("CONTROL: an unload that keeps the graphs trips the arm",
       planted_unload != unload_src and "clear_resident" not in planted_unload)
 check("stats are exposed for the A/B (a zero delta must be explainable)",
-      "runner" in flat(METHODS["InklingAttention"]["attn_graph_stats"]))
+      "_slot_stats" in flat(METHODS["InklingAttention"]["attn_graph_stats"]))
 
 print("[8] admission: frequency filter + LRU eviction, executed on the served ledger")
 Ledger = NS_GEOM["AttnGraphLedger"]
@@ -422,8 +423,8 @@ HOT, COLD_A, COLD_B, COLD_C = (1, 1024, 0x10), (4, 4096, 0x10), (8, 2048, 0x10),
 
 
 def mkslot(replay):
-    return {"in": {}, "runner": types.SimpleNamespace(
-        stats = {"capture": 1, "replay": replay, "eager": 0}, disabled_reason = None)}
+    return {"in": {}, "graph": None, "out": None, "failed": None,
+            "stats": {"capture": 1, "replay": replay, "eager": 0}}
 
 
 led = Ledger(cap = 2, min_hits = 3)
@@ -535,14 +536,186 @@ parked = SUM_NS["_attn_summary_line"](types.SimpleNamespace(
 check("a parked layer says why in the same line", parked.endswith("failed=OutOfMemoryError"),
       parked[-40:])
 svc = src(LOOP)
-for marker in ("ATTN-GRAPH capture L", "ATTN-GRAPH capture-failed L", "ATTN-GRAPH summary L",
-               "sliding-graph arm off —"):
+for marker in ("ATTN-GRAPH capture L", "ATTN-GRAPH capture-oom", "ATTN-GRAPH capture-failed",
+               "ATTN-GRAPH summary L", "sliding-graph arm off —"):
     check(f"marker present in the served source: {marker}", marker in svc)
+check("the failure lines carry the layer index and the key, so a degraded layer is identifiable",
+      "L{self.layer_idx:02d} key=rows{key[0]}/cols{key[1]}"
+      in flat(METHODS["InklingAttention"]["_attn_round"]))
 check("the summary is not printed per step", NS_GEOM["_ATTN_GRAPH_LOG_EVERY"] >= 1024,
       str(NS_GEOM["_ATTN_GRAPH_LOG_EVERY"]))
 planted_line = line.replace("replays=1200", "replays=0")
 check("CONTROL: a summary that reports zero replays would fail the field check it exists for",
       planted_line != line and "replays=1200" not in planted_line)
+
+print("[10] capture fits a near-full card: VRAM margin gate + ledger-local OOM containment")
+
+BOOK = {"free": 8 * 2 ** 30}                      # mutated per case: what the driver reports
+
+
+class _FakeOOM(Exception):
+    pass
+
+
+class _Stream:
+    def wait_stream(self, other):
+        pass
+
+
+class _Ctx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _GraphHolder:
+    def __init__(self, book):
+        self.book = book
+
+    def replay(self):
+        self.book["replays"] = self.book.get("replays", 0) + 1
+
+
+class _CaptureCtx:
+    def __init__(self, book, boom):
+        self.book, self.boom = book, boom
+
+    def __enter__(self):
+        self.book["captures"] = self.book.get("captures", 0) + 1
+        if self.boom is not None:
+            raise self.boom
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def fake_torch(boom = None):
+    cuda = types.SimpleNamespace(
+        Stream = lambda: _Stream(), current_stream = lambda: _Stream(),
+        stream = lambda s: _Ctx(), CUDAGraph = lambda: _GraphHolder(BOOK),
+        graph = lambda g, **kw: _CaptureCtx(BOOK, boom),
+        is_available = lambda: True, synchronize = lambda: None,
+        empty_cache = lambda: BOOK.__setitem__("emptied", BOOK.get("emptied", 0) + 1),
+        mem_get_info = lambda dev = None: (BOOK.get("free", 0), 24 * 2 ** 30),
+        OutOfMemoryError = _FakeOOM)
+    return types.SimpleNamespace(cuda = cuda, device = torch.device)
+
+
+class _Quiet:
+    def warning(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+
+NS_VRAM = run_src(CONSTS + [TOP_FN["attn_pool_bytes"], TOP_FN["attn_vram_margin_ok"],
+                            TOP_FN["is_oom_error"]],
+                  {"torch": fake_torch(), "F": torch.nn.functional, "_os": os})
+NEED = NS_VRAM["attn_pool_bytes"](1, 1024, 8, 128, 24)
+check("pool estimate is the config.py formula, recomputed independently here",
+      NEED == 3 * 1 * 1024 * 8 * 128 * 2 + 2 * 24 * 1 * 1024 * 4, f"{NEED} bytes")
+check("the margin factor is 2x the estimate", NS_VRAM["_ATTN_GRAPH_MARGIN_FACTOR"] == 2,
+      str(NS_VRAM["_ATTN_GRAPH_MARGIN_FACTOR"]))
+SLACK = NS_VRAM["_ATTN_GRAPH_CAPTURE_SLACK"]
+check("the margin carries slack for the capture forward's own temporaries (measured 20 MiB)",
+      SLACK >= 20 * 2 ** 20, f"{SLACK / 2 ** 20:.0f} MiB")
+BOOK["free"] = 13 * 2 ** 20                        # dot26 2026-11-28 fleet state: ~13 MiB free
+refused, free_seen, reserve = NS_VRAM["attn_vram_margin_ok"]("cuda:0", NEED)
+check("gate refuses the served card's 13 MiB of free memory",
+      refused is False and reserve == 2 * NEED + SLACK,
+      f"ok={refused} free={free_seen} reserve={reserve}")
+check("CONTROL: with no margin at all (1x, no slack) that card would be admitted — the margin "
+      "is what refuses it", NS_VRAM["attn_vram_margin_ok"]("cuda:0", NEED, 1, 0)[0] and not refused)
+BOOK["free"] = 2 * NEED + SLACK
+at_boundary = NS_VRAM["attn_vram_margin_ok"]("cuda:0", NEED)[0]
+BOOK["free"] = 2 * NEED + SLACK - 1
+under_boundary = NS_VRAM["attn_vram_margin_ok"]("cuda:0", NEED)[0]
+check("boundary: exactly 2x+slack passes, one byte less refuses",
+      at_boundary and not under_boundary)
+BOOK["free"] = 8 * 2 ** 30
+check("gate passes when the card has room", NS_VRAM["attn_vram_margin_ok"]("cuda:0", NEED)[0])
+check("a CPU device is never falsely refused (the gate is a CUDA probe)",
+      NS_VRAM["attn_vram_margin_ok"]("cpu", NEED) == (True, -1, 0))
+check("is_oom_error catches both spellings of an allocator failure",
+      NS_VRAM["is_oom_error"](_FakeOOM("x")) and NS_VRAM["is_oom_error"](
+          RuntimeError("CUDA out of memory. Tried to allocate 20.00 MiB"))
+      and not NS_VRAM["is_oom_error"](RuntimeError("cuStreamCaptureBegin failed")))
+slid = flat(METHODS["InklingAttention"]["_sliding_capture"])
+check("the gate sits at the capture-decision site and declines as vram-margin",
+      "attn_vram_margin_ok(self.device, need)" in slid and '"vram-margin"' in slid
+      and "attn_pool_bytes(key[0], key[1], self.num_kv_heads, self.head_dim," in slid)
+check("the refusal is counted on the decline channel, and the layer waits before probing again",
+      '_record_decline("vram-margin"' in slid and "_attn_margin_wait" in slid)
+check("the served default cap is 1 graph per layer (the pool math the card affords)",
+      re.search(r"inkling_attn_graph_max_graphs:\s*int\s*=\s*1(\s|$)", param_src) is not None)
+check("the layer no longer delegates capture to the shared whole-forward runner",
+      "from ...generator.fwd_graph import ForwardGraphRunner" not in src(LOOP)
+      and "_attn_round(slot, key, body, params)" in slid)
+
+
+def run_rounds(boom):
+    """Drive the SERVED _attn_round: capture round, then a replay round (or the fallow round
+    after a parked capture). BOOK counts what the fake CUDA saw."""
+    for key in ("captures", "replays", "emptied", "body"):
+        BOOK.pop(key, None)
+    ns = {"torch": fake_torch(boom), "logger": _Quiet()}
+    run_src([n for n in CONSTS if getattr(n.targets[0], "id", "") == "_ATTN_GRAPH_WARMUPS"]
+            + [TOP_FN["is_oom_error"], METHODS["InklingAttention"]["_attn_round"]], ns)
+    led = Ledger(cap = 1, min_hits = 1)
+    key = (1, 1024, 0x10)
+    slot = {"in": {}, "graph": None, "out": None, "failed": None,
+            "stats": {"capture": 0, "replay": 0, "eager": 0}}
+    led.admit(key, slot)
+    declines = []
+    stub = types.SimpleNamespace(layer_idx = 8, _attn_graph_failed = None, _attn_ledger = led,
+                                 _record_decline = lambda token, detail = "": declines.append(token))
+    marker = torch.zeros(3)
+
+    def body(params):
+        BOOK["body"] = BOOK.get("body", 0) + 1
+        return marker
+
+    first = ns["_attn_round"](stub, slot, key, body, {"dev_cache": {"x": 1}})
+    second = ns["_attn_round"](stub, slot, key, body, {})
+    return {"slot": slot, "stub": stub, "led": led, "declines": declines, "first": first,
+            "second": second, "marker": marker, "body": lambda: BOOK.get("body", 0)}
+
+
+try:
+    oom = run_rounds(_FakeOOM("CUDA out of memory: Tried to allocate 20.00 MiB"))
+    raised = None
+except Exception as exc:                        # noqa: BLE001 - the point is that this stays empty
+    oom, raised = None, exc
+check("an OOM inside the capture does not escape the layer", raised is None, str(raised))
+check("the OOM round returns the eager result, so the token still completes",
+      oom["first"] is oom["marker"] and oom["second"] is oom["marker"])
+check("the layer is marked degraded and its slot leaves the resident set (pool returned)",
+      oom["slot"]["failed"].startswith("capture out of memory")
+      and oom["stub"]._attn_graph_failed == oom["slot"]["failed"]
+      and not oom["led"].resident and oom["slot"]["graph"] is None)
+check("the partial pool is released (empty_cache) and the decline is telemetry, not a traceback",
+      BOOK.get("emptied", 0) >= 1 and oom["declines"] == ["capture-oom"]
+      and oom["slot"]["stats"]["eager"] == 2 and oom["body"]() == 4,
+      f"emptied={BOOK.get('emptied')} declines={oom['declines']} body_calls={oom['body']()}")
+from exllamav3.generator.fwd_graph import ForwardGraphRunner
+
+whole_forward = ForwardGraphRunner()
+check("the whole-forward runner was never invoked and its process-wide disable stays None",
+      whole_forward.disabled_reason is None and whole_forward.stats["capture"] == 0)
+ok_case = run_rounds(None)
+check("a capture that fits replays: 2 warmups + capture + eager, then a replay round on the graph",
+      ok_case["slot"]["graph"] is not None and BOOK.get("captures") == 1
+      and BOOK.get("replays") == 1 and ok_case["body"]() == 4
+      and ok_case["slot"]["stats"]["replay"] == 1
+      and bool(torch.equal(ok_case["second"], ok_case["slot"]["out"])))
+other = run_rounds(RuntimeError("cuStreamCaptureBegin failed"))
+check("a non-OOM capture failure degrades the same way but reports capture-failed",
+      other["declines"] == ["capture-failed"]
+      and other["stub"]._attn_graph_failed.startswith("RuntimeError:"))
 
 print()
 if fails:
@@ -552,4 +725,4 @@ if fails:
     sys.exit(1)
 print("VERDICT: inkling sliding-graph pilot fence GREEN "
       f"(index identity + numerics worst maxabs {maxabs_worst:.3e}; key, admission, eviction, "
-      f"telemetry and seams intact)")
+      f"telemetry, VRAM margin gate, OOM containment and seams intact)")
