@@ -248,7 +248,8 @@ print(f"INKLING MOE GROUPED FENCE — served source sha1 {SHA1}, poison={OPTS.po
 
 poisons = ()
 if OPTS.poison == "division":
-    poisons = (('rounding_mode = "floor"', 'rounding_mode = "trunc" if False else "ceil"'),)
+    poisons = (("torch.div(order_all, self.top_k, rounding_mode = \"floor\")",
+                "torch.div(order_all, self.top_k - 1, rounding_mode = \"floor\")"),)
 elif OPTS.poison == "softcap":
     poisons = (("gate_cap = self.gate_softcap", "gate_cap = self.up_softcap"),)
 # "shift" poisons the SHIM's fill, not the served source — the launch semantics themselves
@@ -317,7 +318,7 @@ if OPTS.poison == "division":
         caught = not torch.equal(out_bad, out_eager)
         check("[F-division] wrong token division changes the output (equivalence is load-bearing)",
               caught, f"differed={caught}")
-    except AssertionError as e:
+    except (AssertionError, RuntimeError) as e:
         check("[F-division] wrong token division caught", True, str(e)[:80])
 elif OPTS.poison == "shift":
     out_bad, _ = run_arm(Shim(None, poison = "shift"), knob = True, x = x)
@@ -337,10 +338,12 @@ else:
     bad_div = None
     try:
         out_bad, _ = run_arm(Shim(None), knob = True, x = x,
-                             poisons = (('rounding_mode = "floor"',
-                                         'rounding_mode = "trunc" if False else "ceil"'),))
+                             poisons = (("torch.div(order_all, self.top_k, "
+                                         "rounding_mode = \"floor\")",
+                                         "torch.div(order_all, self.top_k - 1, "
+                                         "rounding_mode = \"floor\")"),))
         bad_div = not torch.equal(out_bad, out_eager)
-    except AssertionError:
+    except (AssertionError, RuntimeError):
         bad_div = True
     check("[F] planted division defect caught", bad_div is True)
     out_bad = run_arm(Shim(None, poison = "shift"), knob = True, x = x)[0]
