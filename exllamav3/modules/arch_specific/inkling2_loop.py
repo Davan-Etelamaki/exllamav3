@@ -1302,21 +1302,20 @@ class InklingMoE(Module):
         # (census deferred item A: device routing tables + a grouped expert tier own that next).
         sel_cpu = host_values(sel_flat, ("inkling2", "moe_sel")).tolist()
         order = sorted(range(len(sel_cpu)), key = lambda i: sel_cpu[i])
+        # Diet (2026-11-26): one upload of the whole sorted order, groups become device
+        # views. Decode never reaches this path (_coop_decode returns above), so no
+        # recorded graph depends on per-group source addresses; the eager group order is
+        # identical by construction, so index_add_ accumulates bitwise the same.
+        order_all = stage_host(order, x.device, ("inkling2", "moe_order_all"), torch.long)
+        tokens_all = torch.div(order_all, self.top_k, rounding_mode = "floor")
         n = 0
-        gi = 0
         while n < len(order):
             e = sel_cpu[order[n]]
             m = n
             while m < len(order) and sel_cpu[order[m]] == e:
                 m += 1
-            # One pinned slot per group: while capturing, every group's upload reads its own
-            # address, so the recorded graph cannot have two launches sharing one source that the
-            # next group's fill overwrites. Slot index is stable across rounds, which is what makes
-            # the recorded addresses meaningful on replay.
-            entries = stage_host(order[n:m], x.device, ("inkling2", "moe_entries", gi),
-                                 torch.long)
-            gi += 1
-            tokens = torch.div(entries, self.top_k, rounding_mode = "floor")
+            entries = order_all[n:m]
+            tokens = tokens_all[n:m]
             n = m
             xs = flat.index_select(0, tokens)
             g = self.experts_g[e].forward(xs, params).float()

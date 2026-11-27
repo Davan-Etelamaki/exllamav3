@@ -54,7 +54,9 @@ SERVED_FILE = os.path.join(
 SERVED_ANCHORS = (
     'sel_cpu = host_values(sel_flat, ("inkling2", "moe_sel")).tolist()',
     'order = sorted(range(len(sel_cpu)), key = lambda i: sel_cpu[i])',
-    "tokens = torch.div(entries, self.top_k, rounding_mode = \"floor\")",
+    'order_all = stage_host(order, x.device, ("inkling2", "moe_order_all"), torch.long)',
+    "tokens_all = torch.div(order_all, self.top_k, rounding_mode = \"floor\")",
+    "entries = order_all[n:m]",
     "act = torch.tanh(g / self.gate_softcap) * self.gate_softcap",
     "out.index_add_(0, tokens, y.float() * w_flat.index_select(0, entries).unsqueeze(-1))",
 )
@@ -149,7 +151,7 @@ def main():
         for ln in lines:
             print(ln)
         test_served_dispatch_markers_present()
-        print("served-dispatch markers present: 5/5 anchors in inkling2_loop.py")
+        print("served-dispatch markers present: 6/6 anchors in inkling2_loop.py")
         print("FENCE 1 GREEN")
     except AssertionError as exc:
         print(f"FENCE 1 RED: {exc}")
