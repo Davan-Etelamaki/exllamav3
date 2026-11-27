@@ -84,6 +84,7 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    exl3_device_banner();     // INKLING-DEVICEPROP: once per process, at module init, before any model load
     // Optional kernel families; Python checks these before taking a path that needs them. hgemm_f16acc is left
     // out of ROCm builds (util/cuda_flags.py, HIP_EXCLUDED_SOURCES) with its bindings below: it serves GeForce
     // parts, whose fp32-accumulate MMA runs at half rate, while RDNA's hgemm goes through the WMMA GEMM
