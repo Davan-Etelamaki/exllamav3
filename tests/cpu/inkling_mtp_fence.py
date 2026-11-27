@@ -9,7 +9,10 @@ Pins the contract the MTP wheel boots on:
   [3] the loop-instance export APPEND in modules/arch_specific/inkling2_loop.py
       halves and clamps to the fp16 range like modules/transformer.py does;
   [4] markov fold keeps TORCH order (lm_head @ hidden_out), NO transpose — the
-      exact inversion Xolotl's cpp warns about (:428-431).
+      exact inversion Xolotl's cpp warns about (:428-431);
+  [5] block submodules match the pack census: k/v_proj_ctx + k_norm_ctx present,
+      self.q_proj_ctx absent (load faults without it); markov head implements
+      optimizer_targets (Module abstract).
 Controls: each arm has a planted mutation proven to make the arm fail.
 Run:  CUDA_VISIBLE_DEVICES= env -u PYTHONHOME -u PYTHONPATH -u LD_LIBRARY_PATH \\
       PYTHONPATH=. ~/.venvs/tabby-exl3/bin/python tests/cpu/inkling_mtp_fence.py
@@ -103,11 +106,33 @@ check("flat draft-stack layer map override (boot-crash fix)",
 check("CONTROL: naive lm_head-side fold string present (anchor for fold math)",
       "fold_w" in msrc)
 
+print("== [5] pack-keyed submodules (boot fault pins) ==")
+blk = next(n for n in ast.walk(tree)
+           if isinstance(n, ast.ClassDef) and n.name == "Inkling2MTPBlock")
+bsrc = ast.unparse(blk).replace("'", '"')
+check("block carries k_proj_ctx + v_proj_ctx + k_norm_ctx",
+      all(s in bsrc for s in ("k_proj_ctx", "v_proj_ctx", "k_norm_ctx")))
+check("block carries NO q_proj_ctx (absent from mtp.safetensors; cpp:7)",
+      "self.q_proj_ctx" not in msrc)
+# CONTROL 5: a planted q_proj_ctx submodule must trip the arm
+mut5 = msrc.replace("self.k_proj_ctx = Linear(",
+                    "self.q_proj_ctx = None\n        self.k_proj_ctx = Linear(", 1)
+check("CONTROL: planting self.q_proj_ctx trips the no-q_ctx arm",
+      "self.q_proj_ctx" in mut5)
+mh = next(n for n in ast.walk(ast.parse(msrc))
+          if isinstance(n, ast.ClassDef) and n.name == "Inkling2MTPMarkovHead")
+mhsrc = ast.unparse(mh)
+check("markov head implements optimizer_targets (abstract-method fault pin)",
+      "def optimizer_targets" in mhsrc)
+# CONTROL 6: strip the method -> fault 2 (abstract instantiation) would return
+check("CONTROL: optimizer_targets excision trips its arm",
+      "def optimizer_targets" not in mhsrc.replace("def optimizer_targets", "pass  #", 1))
+
 print()
 if fails:
     print(f"INKLING MTP FENCE RED: {len(fails)} failed")
     for f in fails:
         print("  -", f)
     sys.exit(1)
-print("INKLING MTP FENCE GREEN: registration, caps, append discipline, fold contract; "
-      "4 planted controls proven to fire.")
+print("INKLING MTP FENCE GREEN: registration, caps, append discipline, fold contract, "
+      "pack-keyed submodules; 6 planted controls proven to fire.")

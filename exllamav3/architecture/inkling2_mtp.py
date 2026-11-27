@@ -39,7 +39,7 @@ from ..util.tensor import get_for_device
 #  - "norm.weight" in this pack is the DRAFTER'S FINAL norm before the borrowed lm_head
 #    (cpp:363 output_norm), NOT an embed norm.
 #  - Context rings (cross-round): per drafter layer L the target taps project through
-#    layers.L.self_attn.{q,k,v}_proj_ctx (+ k_norm_ctx) and the k/v rows are written into L's
+#    layers.L.self_attn.{k,v}_proj_ctx (+ k_norm_ctx) and the k/v rows are written into L's
 #    cache like dflash_laguna.update_kv_from_target (rope at cache_seqlens offset, k_norm_ctx).
 #  - Exit: fuse row 3 (+ markov_head.dflare_norm) feeds the rnn markov head (full-cat rnn_proj,
 #    gate/cand/latent thirds, state = gate*old + (1-gate)*cand); logits = 30*tanh((base_lm +
@@ -236,9 +236,8 @@ class Inkling2MTPModel(Model):
         block forward then attends these rows as its context - the taps enter the draft sequence
         through the ring, which persists across rounds.
 
-        Deviation flag: q_proj_ctx is not written anywhere; the oracle's ctx attention consumes
-        the ring K/V only (laguna-parity). If C3 telemetry shows the block's q should mix into
-        the ring query side, revisit.
+        Ring K/V only (laguna-parity): the query side runs the block's normal q_proj —
+        mtp.safetensors carries no q_proj_ctx (pack census + oracle cpp:7).
         """
         if lengths is not None:
             max_length = max(lengths)
@@ -378,7 +377,9 @@ class Inkling2MTPBlock(TransformerBlock):
     """
     One drafter block. Adds what TransformerBlock has no slot for: dflare_norm (the post tap-mix
     norm feeding the block, cpp:631-640 - applied by the C2 block forward ahead of attn_norm) and
-    the context-ring projections q/k/v_proj_ctx (+ k_norm_ctx) owned by update_kv_from_target.
+    the context-ring projections k/v_proj_ctx (+ k_norm_ctx) owned by update_kv_from_target.
+    Pack census 2026-11-26: mtp.safetensors carries NO q_proj_ctx (oracle cpp:7 confirms
+    k/v ctx only) - a q_proj_ctx Linear here fails load with "No tensors found".
     Registered as submodules so they load and compile with the block; the inherited forward is
     the usual norm-attn-mlp residual over whatever input the mix hands it.
     """
@@ -410,16 +411,7 @@ class Inkling2MTPBlock(TransformerBlock):
         )
         self.dflare_norm = dflare_norm
         self.register_submodule(self.dflare_norm)
-        q_dim = attn.num_q_heads * head_dim
         kv_dim = attn.num_kv_heads * head_dim
-        self.q_proj_ctx = Linear(
-            config = config,
-            key = f"{key}.self_attn.q_proj_ctx",
-            in_features = hidden_size,
-            out_features = q_dim,
-            qmap = "block.attn",
-            out_dtype = torch.float,
-        )
         self.k_proj_ctx = Linear(
             config = config,
             key = f"{key}.self_attn.k_proj_ctx",
@@ -441,7 +433,7 @@ class Inkling2MTPBlock(TransformerBlock):
             key = f"{key}.self_attn.k_norm_ctx",
             rms_norm_eps = rms_norm_eps,
         )
-        for m in (self.q_proj_ctx, self.k_proj_ctx, self.v_proj_ctx, self.k_norm_ctx):
+        for m in (self.k_proj_ctx, self.v_proj_ctx, self.k_norm_ctx):
             self.register_submodule(m)
 
 
