@@ -260,14 +260,16 @@ class Inkling2MTPModel(Model):
             attn = block.attn
             mix = self._mix_taps(L, target_hidden)
             mix = block.dflare_norm.forward(mix, params, out_dtype = torch.half)
-            k = block.k_proj_ctx.forward(mix, params)
-            v = block.v_proj_ctx.forward(mix, params)
+            k = block.k_proj_ctx.forward(mix, params, out_dtype = torch.half)
+            v = block.v_proj_ctx.forward(mix, params, out_dtype = torch.half)
             bsz, seqlen, _ = k.shape
             k = k.view(bsz, seqlen, attn.num_kv_heads, attn.head_dim)
             v = v.view(bsz, seqlen, attn.num_kv_heads, attn.head_dim)
             block_table = get_for_device(params, "block_table", device)
             cache_seqlens = get_for_device(params, "cache_seqlens", device)
-            # rope at per-row cache offsets, k_norm_ctx as the pre-rope norm (laguna call shape)
+            # rope at per-row cache offsets, k_norm_ctx as the pre-rope norm (laguna call shape);
+            # the ext.rope kernel demands kHalf for q/k (rope.py:537), so the ctx projections
+            # deliver half at the forward boundary, as dflash_laguna.py:250-251 does
             k, _ = attn.rope.apply(
                 k, None, 0, cache_seqlens, None, True,
                 block.k_norm_ctx.weight, None, block.k_norm_ctx.rms_norm_eps,

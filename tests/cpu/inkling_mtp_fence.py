@@ -128,6 +128,14 @@ mh = next(n for n in ast.walk(ast.parse(msrc))
 mhsrc = ast.unparse(mh)
 check("markov head implements optimizer_targets (abstract-method fault pin)",
       "def optimizer_targets" in mhsrc)
+check("ctx projections deliver half at the rope boundary (ext.rope demands kHalf)",
+      "k_proj_ctx.forward(mix, params, out_dtype = torch.half)" in msrc
+      and "v_proj_ctx.forward(mix, params, out_dtype = torch.half)" in msrc)
+# CONTROL 6b: reverting the ctx boundary to fp32 must trip (runtime kHalf fault returns)
+mut6b = msrc.replace("k_proj_ctx.forward(mix, params, out_dtype = torch.half)",
+                     "k_proj_ctx.forward(mix, params)")
+check("CONTROL: dropping half at the ctx boundary trips the kHalf arm",
+      "k_proj_ctx.forward(mix, params, out_dtype = torch.half)" not in mut6b)
 # CONTROL 6: strip the method -> fault 2 (abstract instantiation) would return
 check("CONTROL: optimizer_targets excision trips its arm",
       "def optimizer_targets" not in mhsrc.replace("def optimizer_targets", "pass  #", 1))
@@ -139,4 +147,4 @@ if fails:
         print("  -", f)
     sys.exit(1)
 print("INKLING MTP FENCE GREEN: registration, caps, append discipline, fold contract, "
-      "pack-keyed submodules; 6 planted controls proven to fire.")
+      "pack-keyed submodules, kHalf ctx boundary; 8 planted controls proven to fire.")
