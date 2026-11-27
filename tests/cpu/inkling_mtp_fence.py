@@ -136,6 +136,22 @@ mut6b = msrc.replace("k_proj_ctx.forward(mix, params, out_dtype = torch.half)",
                      "k_proj_ctx.forward(mix, params)")
 check("CONTROL: dropping half at the ctx boundary trips the kHalf arm",
       "k_proj_ctx.forward(mix, params, out_dtype = torch.half)" not in mut6b)
+print("== [6] markov head shapes + functional fold (quantized Linear has no .weight) ==")
+check("rnn_proj in_features = 2*rank + 2*hidden (= pack suh 5120)",
+      "in_features = 2 * markov_rank + 2 * hidden_size" in msrc)
+check("hidden_out is rank -> hidden (suh 256 -> svh 2304; cpp torch [2304][256])",
+      "in_features = markov_rank,\n            out_features = hidden_size" in msrc)
+check("no .weight attribute reads on quantized Linears (fold is functional)",
+      "lw = lm.weight" not in msrc and "hw = rnn.hidden_out.weight" not in msrc)
+check("fold composes via lm(x + hidden_out(latent) + hidden_bias) one pass",
+      "hidden_out.forward(latent.unsqueeze(1)" in msrc and "h_eff = hi + fold_h.squeeze(1)" in msrc)
+check("confidence = reciprocal softmax mass, not max logit (cpp se/cum rule)",
+      "torch.clamp(sexp, min = 1.0)" in msrc)
+# CONTROL 7: a .weight fold reintroduced would AttributeError on the quantized lm head
+mut7 = msrc.replace("h_eff = hi + fold_h.squeeze(1)",
+                    "lw = lm.weight\n            h_eff = hi + fold_h.squeeze(1)")
+check("CONTROL: reintroducing a lm.weight read trips the no-quantized-weight arm",
+      "lw = lm.weight" in mut7)
 # CONTROL 6: strip the method -> fault 2 (abstract instantiation) would return
 check("CONTROL: optimizer_targets excision trips its arm",
       "def optimizer_targets" not in mhsrc.replace("def optimizer_targets", "pass  #", 1))
@@ -147,4 +163,4 @@ if fails:
         print("  -", f)
     sys.exit(1)
 print("INKLING MTP FENCE GREEN: registration, caps, append discipline, fold contract, "
-      "pack-keyed submodules, kHalf ctx boundary; 8 planted controls proven to fire.")
+      "pack-keyed submodules, kHalf ctx boundary, markov shapes + functional fold; 9 planted controls proven to fire.")

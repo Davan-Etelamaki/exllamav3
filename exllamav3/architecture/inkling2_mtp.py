@@ -73,6 +73,7 @@ class Inkling2MTPModel(Model):
         self.block_size = int(m["block_size"])
         self.n_taps = len(m["target_layer_ids"])
         self.markov_rank = int(m["markov_rank"])
+        self.hidden_size = h
         # The drafter ropes with its own theta (1e6), not the target's
         self.rope_settings = config.read_rope_settings_default(
             RopeStyle.NEOX,
@@ -313,36 +314,21 @@ class Inkling2MTPModel(Model):
         else:
             f_rnn = torch.zeros((bsz, 1, self.input_layer.hidden_size), device = device)
 
-        # fold_w in TORCH ORDER: hidden_out.weight (rank, hidden) composed with the target's
-        # lm_head into (rank, vocab); orientation resolved once from the storage shapes
-        lw = lm.weight
-        hw = rnn.hidden_out.weight
-        if hw.shape[1] == lw.shape[0]:
-            fold_w = hw.mm(lw)                    # lm stored (hidden, vocab): pure torch order
-        elif hw.shape[1] == lw.shape[1]:
-            fold_w = hw.mm(lw.t())                 # lm stored (vocab, hidden): documented
-        else:
-            raise RuntimeError(
-                f"Inkling2MTP: cannot compose fold_w from hidden_out {tuple(hw.shape)} and lm_head {tuple(lw.shape)}")
-        if fold_w.shape[-1] != vocab:
-            fold_w = fold_w.t()
-
-        mw1 = rnn.markov_w1                          # bigram table (rank, rank) or (vocab, rank)
+        # NO .weight access: the quantized Linear holds trellis/suh/svh/mul1 only. The cpp's
+        # load-time fusion fold_w = unembed @ hidden_out.weight (cpp:531, applied at :895)
+        # composes FUNCTIONALLY instead - see the loop: one lm pass over (hidden_i + fold_h).
+        mw1 = rnn.markov_w1                          # bigram row table (vocab_padded, rank)
         markov_state = torch.zeros((bsz, rank), device = device)
         prev = params.get("inkling_seed_ids")
         prev = prev[:, 0] if prev is not None and prev.dim() > 1 else (prev if prev is not None else torch.zeros(bsz, dtype = torch.long, device = device))
         prev = prev.to(device).long().clamp(0, mw1.shape[0] - 1)
-        if mw1.shape[1] != rank and mw1.shape[0] == rank:
-            mw1 = mw1.t()
 
         ids = torch.zeros((bsz, blk), dtype = torch.long, device = device)
         ids[:, 0] = prev
         conf = torch.zeros((bsz, blk - 1), device = device)
         for i in range(blk - 1):
             hi = state[:, i, :].float()
-            base = lm.forward(lm.prepare_for_device(state[:, i, :], params), params)
-            base = base[..., :vocab].float()
-            prev_emb = mw1[prev][:, :rank] if mw1.shape[0] != rank else mw1[prev]
+            prev_emb = mw1[prev]                      # (b, rank) row, cpp get_rows(w1, prev)
             rnn_in = torch.cat(
                 [markov_state, prev_emb, hi, f_rnn[:, 0, :]], dim = -1)
             raw = rnn.rnn_proj.forward(rnn_in, params).float()
@@ -352,12 +338,20 @@ class Inkling2MTPModel(Model):
             cand = torch.tanh(raw[:, rank:2 * rank])
             latent = torch.tanh(raw[:, 2 * rank:3 * rank])
             markov_state = gate * markov_state + (1.0 - gate) * cand
-            bias = (latent + (prev_emb @ mw1[:, :rank] if prev_emb.shape[-1] == rank else 0.0)).mm(fold_w)
-            if rnn.hidden_bias is not None and rnn.hidden_bias.numel() == vocab:
-                bias = bias + rnn.hidden_bias
-            logits = 30.0 * torch.tanh((base + bias) / 30.0)
-            c, p = torch.max(logits, dim = -1)
-            conf[:, i] = c
+            # base + fold_w@latent + fold_b in ONE lm pass: lm(x + ho(latent) + ho_bias)
+            # == base + (unembed@ho)@latent + unembed@ho_bias (associativity; cpp:848-849)
+            fold_h = rnn.hidden_out.forward(latent.unsqueeze(1), params, out_dtype = torch.float)
+            if rnn.hidden_bias is not None and rnn.hidden_bias.numel() == self.hidden_size:
+                fold_h = fold_h + rnn.hidden_bias
+            h_eff = hi + fold_h.squeeze(1)
+            logits = lm.forward(lm.prepare_for_device(h_eff, params), params).float()
+            logits = logits[..., :vocab]
+            logits = 30.0 * torch.tanh(logits / 30.0)          # softcap, cpp:850
+            mx, p = torch.max(logits, dim = -1)
+            # oracle confidence = reciprocal softmax mass (cpp se = sum(exp(t - max)),
+            # cum *= 1/max(1, se), stop below tau) - NOT the max logit
+            sexp = torch.sum(torch.exp(logits - mx.unsqueeze(-1)), dim = -1)
+            conf[:, i] = 1.0 / torch.clamp(sexp, min = 1.0)
             ids[:, i + 1] = p
             prev = p
         # Constant-confidence truncation: everything after the first sub-tau draft is dropped
@@ -446,15 +440,11 @@ class Inkling2MTPBlock(TransformerBlock):
 
 class Inkling2MTPMarkovHead(Module):
     """
-    rnn_hidden markov head (pack: markov_head.rnn_proj.{trellis,suh,svh,mul1} + .bias,
-    markov_head.hidden_out.{trellis,suh,svh,mul1} + .bias, markov_head.markov_w1.weight,
-    markov_head.dflare_norm.weight). rnn consumes the FULL concatenation
-    cat([state(rank), markov_w1[prev](rank), hidden_i(hidden), f_rnn(?)]); a column-split is
-    algebraically identical (parent F6). Out width = 3 * rank (gate | cand | latent, confirmed
-    by rnn_proj.bias length when C3 reads the header).
-    TODO(C3): exact in_features (f_rnn width) and Linear bias wiring (rnn_proj.bias /
-    hidden_out.bias) verified against the pack; wrong in_features fails loudly at load, not
-    silently.
+    rnn_hidden markov head (pack census 2026-11-26: rnn_proj in 5120 -> out 768 + bias 768;
+    hidden_out in rank(256) -> out hidden(2304) + bias 2304 - cpp:134 "torch [2304][256]
+    order"; markov_w1 (vocab_padded, rank) plain bf16; dflare_norm). rnn consumes the FULL
+    concatenation cat([state(rank), markov_w1[prev](rank), hidden_i(hidden), f_rnn(hidden)])
+    = 2*rank + 2*hidden = 5120 = pack suh. Out 3*rank = gate | cand | latent (cpp:823 J=768).
     """
 
     def __init__(
@@ -472,7 +462,7 @@ class Inkling2MTPMarkovHead(Module):
         self.rnn_proj = Linear(
             config = config,
             key = f"{key}.rnn_proj",
-            in_features = 3 * markov_rank + hidden_size,
+            in_features = 2 * markov_rank + 2 * hidden_size,
             out_features = 3 * markov_rank,
             qmap = "block.attn",
             out_dtype = torch.float,
@@ -480,8 +470,8 @@ class Inkling2MTPMarkovHead(Module):
         self.hidden_out = Linear(
             config = config,
             key = f"{key}.hidden_out",
-            in_features = hidden_size,
-            out_features = markov_rank,
+            in_features = markov_rank,
+            out_features = hidden_size,
             qmap = "block.attn",
             out_dtype = torch.float,
         )
